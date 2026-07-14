@@ -2,6 +2,7 @@
 package io.hindsight.reader;
 
 import java.io.IOException;
+import java.util.List;
 
 /**
  * Renders encoded value slots to display text per FORMAT.md §12: INLINE values
@@ -72,12 +73,20 @@ public final class ValueRenderer {
         };
     }
 
-    /** {@code SimpleClassName#id}; class from OBJECT_FIRST_SEEN, {@code ?} if unknown. */
+    /**
+     * {@code SimpleClassName#id}; class from OBJECT_FIRST_SEEN, {@code ?} if unknown.
+     * Enums render as their constant ({@code ResponseCodeEnum.OK}) — the constant IS the
+     * identity of a singleton; the numeric id would be noise.
+     */
     public String renderObjectId(final long objectId) {
         if (objectId == 0) {
             return "null";
         }
         String cls = recording.objectClassName(objectId);
+        String display = recording.objectDisplayName(objectId);
+        if (display != null) {
+            return (cls == null ? "?" : Format.simpleName(cls)) + "." + display;
+        }
         return (cls == null ? "?" : Format.simpleName(cls)) + "#" + objectId;
     }
 
@@ -95,28 +104,81 @@ public final class ValueRenderer {
     }
 
     /**
-     * Renders a SNAPSHOT record's payload as {@code SimpleClassName#id {field=value, …}}.
-     * Nested strings carry no per-field truncation flag (§3), so no ellipsis inside.
+     * Renders a SNAPSHOT record's payload per its §3 form: fields as
+     * {@code {field=value, …}}, maps as {@code {K -> V, …}}, sets as {@code {V1, V2, …}},
+     * lists as {@code (e1, e2, …)}, arrays as {@code [v1, v2, …]}. A container larger than
+     * the captured entry cap appends {@code …+N more}. Nested strings carry no per-field
+     * truncation flag (§3), so no ellipsis inside values.
      */
     public String renderSnapshot(final Rec r) {
         StringBuilder b = new StringBuilder();
-        b.append(renderObjectId(r.target())).append(" {");
+        b.append(renderObjectId(r.target())).append(' ');
         try {
             Recording.Snapshot snap = recording.snapshotAt(r.tid(), r.after());
-            boolean first = true;
-            for (Recording.SnapField f : snap.fields()) {
-                if (!first) {
-                    b.append(", ");
+            final char open;
+            final char close;
+            switch (snap.form()) {
+                case Format.FORM_LIST -> {
+                    open = '(';
+                    close = ')';
                 }
-                first = false;
-                String name = recording.symbolText(f.nameSym());
-                b.append(name == null ? "?sym" + f.nameSym() : name)
-                        .append('=')
-                        .append(render(f.kind(), f.tag(), f.value(), r.tid(), false));
+                case Format.FORM_ARRAY -> {
+                    open = '[';
+                    close = ']';
+                }
+                default -> {
+                    open = '{';
+                    close = '}';
+                }
             }
+            b.append(open);
+            List<Recording.SnapField> entries = snap.fields();
+            long rendered;
+            if (snap.form() == Format.FORM_FIELDS) {
+                for (int i = 0; i < entries.size(); i++) {
+                    appendSep(b, i > 0);
+                    Recording.SnapField f = entries.get(i);
+                    String name = recording.symbolText(f.nameSym());
+                    b.append(name == null ? "?sym" + f.nameSym() : name)
+                            .append('=')
+                            .append(render(f.kind(), f.tag(), f.value(), r.tid(), false));
+                }
+                rendered = entries.size();
+            } else if (snap.form() == Format.FORM_MAP) {
+                for (int i = 0; i + 1 < entries.size(); i += 2) {
+                    appendSep(b, i > 0);
+                    b.append(render(entries.get(i).kind(), entries.get(i).tag(), entries.get(i).value(), r.tid(), false))
+                            .append(" -> ")
+                            .append(render(
+                                    entries.get(i + 1).kind(),
+                                    entries.get(i + 1).tag(),
+                                    entries.get(i + 1).value(),
+                                    r.tid(),
+                                    false));
+                }
+                rendered = entries.size() / 2;
+            } else {
+                for (int i = 0; i < entries.size(); i++) {
+                    appendSep(b, i > 0);
+                    Recording.SnapField f = entries.get(i);
+                    b.append(render(f.kind(), f.tag(), f.value(), r.tid(), false));
+                }
+                rendered = entries.size();
+            }
+            if (snap.totalSize() > rendered) {
+                appendSep(b, rendered > 0);
+                b.append("…+").append(snap.totalSize() - rendered).append(" more");
+            }
+            b.append(close);
         } catch (IOException e) {
             b.append("<bad snapshot: ").append(e.getMessage()).append('>');
         }
-        return b.append('}').toString();
+        return b.toString();
+    }
+
+    private static void appendSep(final StringBuilder b, final boolean needed) {
+        if (needed) {
+            b.append(", ");
+        }
     }
 }

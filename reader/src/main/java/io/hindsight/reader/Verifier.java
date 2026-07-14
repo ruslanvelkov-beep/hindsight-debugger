@@ -176,7 +176,7 @@ final class Verifier {
     private void checkSnapshotPayload(final Rec r, final byte[] payload, final long entryOffset) {
         final Recording.Snapshot snap;
         try {
-            snap = Recording.parseSnapshot(payload);
+            snap = Recording.parseSnapshot(payload, recording.schemaVersion());
         } catch (IOException e) {
             violation(r, e.getMessage());
             return;
@@ -185,7 +185,7 @@ final class Verifier {
             violation(r, "snapshot references unknown class symbol " + snap.classSym());
         }
         for (Recording.SnapField f : snap.fields()) {
-            if (recording.symbol(f.nameSym()) == null) {
+            if (f.nameSym() >= 0 && recording.symbol(f.nameSym()) == null) {
                 violation(r, "snapshot field references unknown name symbol " + f.nameSym());
             }
             if (!Format.tagKnown(f.tag())) {

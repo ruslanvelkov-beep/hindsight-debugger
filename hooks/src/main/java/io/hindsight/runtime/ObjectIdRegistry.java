@@ -67,7 +67,7 @@ public final class ObjectIdRegistry {
         final Long id = MAP.computeIfAbsent(new IdentityKey(o), k -> {
             final long newId = NEXT_ID.getAndIncrement();
             if (emitter != null) {
-                emitter.notePendingFirstSeen(newId, o.getClass()); // reserves the seq; no I/O
+                emitter.notePendingFirstSeen(newId, o); // reserves the seq; no I/O
             }
             return newId;
         });

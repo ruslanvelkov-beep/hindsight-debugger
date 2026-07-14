@@ -61,6 +61,12 @@ public final class Format {
     public static final int TAG_VOID = 12;
 
     // ---- blob entry kinds (§3) ----
+    public static final int FORM_FIELDS = 0;
+    public static final int FORM_MAP = 1;
+    public static final int FORM_SET = 2;
+    public static final int FORM_LIST = 3;
+    public static final int FORM_ARRAY = 4;
+
     public static final int BLOB_UTF8 = 1;
     public static final int BLOB_SNAPSHOT = 2;
 
@@ -97,10 +103,38 @@ public final class Format {
         return (tag >= 0 && tag <= 10) || tag == TAG_VOID;
     }
 
-    /** {@code com.foo.Outer$Inner} → {@code Inner}; used for compact value rendering. */
+    /**
+     * {@code com.foo.Outer$Inner} → {@code Inner}; JVM array binary names decode to Java
+     * syntax ({@code [B} → {@code byte[]}, {@code [Lcom.x.Foo;} → {@code Foo[]}). Used for
+     * compact value rendering.
+     */
     public static String simpleName(final String binaryName) {
         if (binaryName == null || binaryName.isEmpty()) {
             return "?";
+        }
+        if (binaryName.charAt(0) == '[') {
+            int dims = 0;
+            while (dims < binaryName.length() && binaryName.charAt(dims) == '[') {
+                dims++;
+            }
+            if (dims >= binaryName.length()) {
+                return binaryName;
+            }
+            String element = switch (binaryName.charAt(dims)) {
+                case 'B' -> "byte";
+                case 'C' -> "char";
+                case 'D' -> "double";
+                case 'F' -> "float";
+                case 'I' -> "int";
+                case 'J' -> "long";
+                case 'S' -> "short";
+                case 'Z' -> "boolean";
+                case 'L' -> binaryName.endsWith(";")
+                        ? simpleName(binaryName.substring(dims + 1, binaryName.length() - 1))
+                        : binaryName.substring(dims);
+                default -> binaryName.substring(dims);
+            };
+            return element + "[]".repeat(dims);
         }
         int cut = Math.max(binaryName.lastIndexOf('.'), binaryName.lastIndexOf('$'));
         return cut >= 0 && cut < binaryName.length() - 1 ? binaryName.substring(cut + 1) : binaryName;

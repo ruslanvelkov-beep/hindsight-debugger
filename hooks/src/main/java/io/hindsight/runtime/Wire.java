@@ -72,8 +72,16 @@ public final class Wire {
     public static final int BLOB_KIND_SNAPSHOT = 2;
     public static final int BLOB_HEADER_SIZE = 6; // magic(1) + kind(1) + len(4)
 
-    /** Max instance fields captured by one snapshot payload (§3). */
+    /** Max instance fields / elements / map entries captured by one snapshot payload (§3). */
     public static final int SNAPSHOT_MAX_FIELDS = 64;
+
+    // ---------- snapshot payload forms (§3, schema 2) ----------
+
+    public static final int SNAPSHOT_FORM_FIELDS = 0;
+    public static final int SNAPSHOT_FORM_MAP = 1;
+    public static final int SNAPSHOT_FORM_SET = 2;
+    public static final int SNAPSHOT_FORM_LIST = 3;
+    public static final int SNAPSHOT_FORM_ARRAY = 4;
 
     /** A further TIME_SYNC is emitted every this many records of a thread (§2.1). */
     public static final int TIME_SYNC_INTERVAL = 65_536;

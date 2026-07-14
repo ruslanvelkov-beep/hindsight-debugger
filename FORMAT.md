@@ -54,7 +54,7 @@ Fixed 40-byte records, record `i` at byte offset `i × 40`. No file header.
 | `0x03` | `METHOD_EXIT` | method site | `this` id for constructors, else 0 | — | — | encoded return value; throwable object id when `EXCEPTIONAL` |
 | `0x10` | `FIELD_WRITE` | field-write site | owner object id (0 for statics) | before-slot runtime tag (ref-typed fields only, else 0) | encoded old value | encoded new value |
 | `0x20` | `LOCAL_WRITE` | local-write site | — | slot (capped 255) | — | encoded new value |
-| `0x60` | `OBJECT_FIRST_SEEN` | **rt-symbol id** of the object's runtime class | new object id | — | — | — |
+| `0x60` | `OBJECT_FIRST_SEEN` | **rt-symbol id** of the object's runtime class (enums: the *declaring* enum class) | new object id | — | — | enums: display-name blob offset (`AFTER_KIND=BLOB`, tag `STRING`, UTF8 constant name); else 0 |
 | `0x61` | `SNAPSHOT` | 0 | object id | — | — | blob offset of snapshot payload (`AFTER_KIND=BLOB`) |
 | `0x70` | `THREAD_START` | **rt-symbol id** of thread name | — | — | — | Java thread id (`Thread.getId()`) |
 | `0x72` | `TIME_SYNC` | 0 | — | — | — | `System.currentTimeMillis()` |
@@ -123,12 +123,18 @@ payload: len bytes
 
 `UTF8` payload: raw UTF-8 bytes (already truncated).
 
-`SNAPSHOT` payload (1-level shallow dump):
+`SNAPSHOT` payload (1-level shallow dump, schema 2):
 
 ```
 classSym  : 4 bytes  — rt-symbol id of runtime class
-fieldCount: 2 bytes  — max 64 fields; instance fields only, superclass fields included
-                       (subclass-first order), statics excluded
+form      : 1 byte   — 0 FIELDS, 1 MAP, 2 SET, 3 LIST, 4 ARRAY
+```
+
+Form `FIELDS` (plain objects):
+
+```
+fieldCount: 2 bytes  — max 64 fields; accessible instance fields only, superclass
+                       fields included (subclass-first order), statics excluded
 per field:
   nameSym : 4 bytes  — rt-symbol id (kind FIELDNAME)
   tag     : 1 byte   — §2.3
@@ -136,6 +142,24 @@ per field:
   value   : 8 bytes  — per §2.4; BLOB kind points at a UTF8 entry written earlier in
                        this same blob file
 ```
+
+Forms `MAP`/`SET`/`LIST`/`ARRAY` (unfolded containers — `java.base` implementations
+and arrays only; a custom collection's iterator may run arbitrary application code and
+is dumped as FIELDS instead):
+
+```
+totalSize : 4 bytes  — the container's size at dump time
+count     : 2 bytes  — entries actually captured (max 64)
+per entry (MAP: key entry then value entry, 2 per count; others: 1 per count):
+  tag     : 1 byte   — §2.3
+  kind    : 1 byte   — §2.2 KIND encoding
+  value   : 8 bytes  — per §2.4
+```
+
+Schema 1 payloads have no `form` byte and are always FIELDS-shaped. A class with no
+accessible instance fields produces NO snapshot record at all (an empty dump carries
+no information). Enums are never snapshotted — their constant name travels in their
+`OBJECT_FIRST_SEEN` record (§6).
 
 ## 4. Symbols — `symbols.tsv`, `rt-symbols.tsv`
 
@@ -183,14 +207,31 @@ like the consensus node; revisit if plugin-style loaders enter scope.
 - On first registration the registering thread emits `OBJECT_FIRST_SEEN` (with the
   runtime class rt-symbol) before the referencing record.
 - `String` and boxed primitives are never registered — always by value (§2.4).
+- Enums ARE registered (they can own mutable state and be `this`), but their
+  `OBJECT_FIRST_SEEN` carries the constant name as a display-name blob (§2.1) and they
+  are never snapshotted; readers render them as `ClassName.CONSTANT`.
 
 ## 7. Snapshots
 
-With probability `1/snapshotEvery` per **object-id resolution** (cheap counter +
-xorshift, per-thread), the worker emits a `SNAPSHOT` of that object: reflective 1-level
-dump per §3. Reflection failures (inaccessible module, hidden class) silently skip.
-`snapshotEvery=0` disables. Snapshot values never recurse: nested refs become object
-ids, nested strings become UTF8 blob entries, everything else per §2.4.
+Two triggers, same payload (reflective 1-level dump per §3):
+
+1. **First sight** (`snapshotFirstSeen`, default on): every object receives a baseline
+   `SNAPSHOT` immediately after its `OBJECT_FIRST_SEEN` — the state from which later
+   recorded field writes evolve the object. Depth-1 containment: objects first seen as
+   *nested references inside* a snapshot get ids and `OBJECT_FIRST_SEEN` records but no
+   snapshot of their own (no transitive graph dumps). Arrays are never snapshotted
+   (no fields; contents are out of v1 scope).
+2. **Sampling refresh** (`snapshotEvery`): with probability `1/snapshotEvery` per
+   object-id resolution (cheap counter + xorshift, per-thread), the worker re-snapshots
+   the resolved object — refreshing long-lived objects whose state drifted via
+   uninstrumented code. `snapshotEvery=0` disables.
+
+Payload shape by object kind — plain objects dump fields; `java.base` maps, sets,
+lists/collections and all arrays are UNFOLDED into their elements (§3 forms); enums are
+never snapshotted (§6). Classes with no accessible fields produce no snapshot record.
+Reflection failures (inaccessible module, hidden class) silently skip. Snapshot values
+never recurse: nested refs become object ids, nested strings become UTF8 blob entries,
+everything else per §2.4.
 
 ## 8. Hook API (bootstrap classpath, package `io.hindsight.hooks`)
 
@@ -242,8 +283,8 @@ calls `startRecording()` and records that very ENTER (the trigger invocation is 
 first business record). `autostart=true` bypasses the trigger.
 
 `RuntimeConfig` (plain fields, constructed by the agent, hooks-module class):
-`Path outDir; int maxString; int snapshotEvery; int recordBufKB; int blobBufKB;
-long maxTotalMB; boolean autostart; int sweepMillis;`
+`Path outDir; int maxString; int snapshotEvery; boolean snapshotFirstSeen;
+int recordBufKB; int blobBufKB; long maxTotalMB; boolean autostart; int sweepMillis;`
 
 ## 9. Runtime architecture requirements
 
@@ -281,7 +322,8 @@ list-valued keys use `|` between elements. Keys:
 | `autostart` | `true` | start recording at premain |
 | `trigger` | none | `binary.class.Name#methodName` — first entry starts recording (implies `autostart=false` unless given) |
 | `maxString` | `512` | max recorded string length (chars) |
-| `snapshotEvery` | `8192` | §7; `0` = off |
+| `snapshotEvery` | `8192` | §7 sampling refresh; `0` = off |
+| `snapshotFirstSeen` | `true` | §7 baseline snapshot of every object at first sight |
 | `recordBufKB` | `256` | per-thread record chunk |
 | `blobBufKB` | `128` | per-thread blob chunk |
 | `maxTotalMB` | `204800` | recording size cap |
@@ -360,5 +402,6 @@ must be skipped: storing an uninitialized `this` is a verify error.)
 
 ## 13. Versioning
 
-`manifest.properties` keys: `schema=1`, `recorder=<project version>`, `jvm`, `pid`,
-`startEpochMillis`, `args`. Readers refuse unknown major schema.
+`manifest.properties` keys: `schema=2`, `recorder=<project version>`, `jvm`, `pid`,
+`startEpochMillis`, `args`. Readers refuse unknown major schema; this reader accepts
+1 (no snapshot `form` byte, no first-seen display names) and 2.

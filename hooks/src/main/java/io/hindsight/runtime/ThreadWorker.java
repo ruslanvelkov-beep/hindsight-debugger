@@ -213,39 +213,89 @@ public final class ThreadWorker {
 
     // ---- pending OBJECT_FIRST_SEEN reservations (§6): seq claimed under the registry bin
     // ---- lock (cheap), bytes + symbol interning materialised outside it (may block on I/O).
-    private final long[] pendingFsIds = new long[4];
-    private final long[] pendingFsSeqs = new long[4];
-    private final Class<?>[] pendingFsClasses = new Class<?>[4];
+    private long[] pendingFsIds = new long[4];
+    private long[] pendingFsSeqs = new long[4];
+    private Object[] pendingFsObjects = new Object[4];
     private int pendingFsCount;
 
     /**
      * Called by {@link ObjectIdRegistry} from inside its map-bin lock: reserves the record's
      * {@code seq} (strictly lower than any later reference, §2.1) without doing any I/O.
-     * Always invoked on this worker's own thread (the registering thread).
+     * Always invoked on this worker's own thread (the registering thread). The strong
+     * reference to the object is short-lived: it is cleared by the drain that immediately
+     * follows on the same thread.
      */
-    synchronized void notePendingFirstSeen(long id, Class<?> runtimeClass) {
-        if (pendingFsCount < pendingFsIds.length) {
-            pendingFsIds[pendingFsCount] = id;
-            pendingFsSeqs[pendingFsCount] = rt.nextSeq();
-            pendingFsClasses[pendingFsCount] = runtimeClass;
-            pendingFsCount++;
-        } else {
-            // Structurally unreachable depth; emit inline rather than lose the record.
-            emitObjectFirstSeenAt(rt.nextSeq(), id, runtimeClass);
+    synchronized void notePendingFirstSeen(long id, Object obj) {
+        if (pendingFsCount == pendingFsIds.length) {
+            // First-sight snapshots can register many nested objects before the outer drain
+            // loop consumes them — grow rather than drop.
+            pendingFsIds = java.util.Arrays.copyOf(pendingFsIds, pendingFsCount * 2);
+            pendingFsSeqs = java.util.Arrays.copyOf(pendingFsSeqs, pendingFsCount * 2);
+            pendingFsObjects = java.util.Arrays.copyOf(pendingFsObjects, pendingFsCount * 2);
         }
+        pendingFsIds[pendingFsCount] = id;
+        pendingFsSeqs[pendingFsCount] = rt.nextSeq();
+        pendingFsObjects[pendingFsCount] = obj;
+        pendingFsCount++;
     }
 
-    /** Materialises reserved first-seen records; called right after the bin lock is released. */
+    /**
+     * Materialises reserved first-seen records; called right after the bin lock is released.
+     *
+     * <p>Reentrant by design: the §7 first-sight snapshot emitted here resolves nested field
+     * references, each of which notes-and-drains its own first-seen through this same method
+     * (with the snapshot suppressed by {@code inSnapshot} — depth-1 containment). Entries are
+     * therefore <em>popped before processing</em>, so a nested drain only ever sees its own
+     * additions, and FIFO order keeps per-thread-file records in ascending seq order.
+     */
     synchronized void drainPendingFirstSeen() {
-        for (int i = 0; i < pendingFsCount; i++) {
-            emitObjectFirstSeenAt(pendingFsSeqs[i], pendingFsIds[i], pendingFsClasses[i]);
-            pendingFsClasses[i] = null;
+        while (pendingFsCount > 0) {
+            final long seq = pendingFsSeqs[0];
+            final long id = pendingFsIds[0];
+            final Object obj = pendingFsObjects[0];
+            pendingFsCount--;
+            System.arraycopy(pendingFsSeqs, 1, pendingFsSeqs, 0, pendingFsCount);
+            System.arraycopy(pendingFsIds, 1, pendingFsIds, 0, pendingFsCount);
+            System.arraycopy(pendingFsObjects, 1, pendingFsObjects, 0, pendingFsCount);
+            pendingFsObjects[pendingFsCount] = null;
+            emitObjectFirstSeenAt(seq, id, obj);
+            if (rt.snapshotFirstSeen && !inSnapshot) {
+                // §7: baseline snapshot at first sight; later field writes evolve it.
+                inSnapshot = true;
+                try {
+                    emitSnapshot(obj, id);
+                    lastBaselineId = id; // suppress an immediate duplicate sampler snapshot
+                } catch (Throwable t) {
+                    HindsightRuntime.reportInternalError("first-seen-snapshot", t);
+                } finally {
+                    inSnapshot = false;
+                }
+            }
         }
-        pendingFsCount = 0;
     }
 
-    private void emitObjectFirstSeenAt(long seq, long id, Class<?> runtimeClass) {
-        final int classSym = rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, runtimeClass.getName());
+    /**
+     * OBJECT_FIRST_SEEN with the §2.1 extras: enums carry their constant name as a display-name
+     * blob in the {@code after} slot (the readable identity of a singleton is its constant, not
+     * a numeric id), and their class symbol is the declaring enum class — constant-specific
+     * bodies compile to anonymous subclasses whose names ({@code Foo$1}) help nobody.
+     */
+    private void emitObjectFirstSeenAt(long seq, long id, Object obj) {
+        if (obj instanceof Enum<?> e) {
+            final int classSym =
+                    rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, e.getDeclaringClass().getName());
+            final byte[] name = e.name().getBytes(StandardCharsets.UTF_8);
+            final long offset = writeBlobEntry(Wire.BLOB_KIND_UTF8, name, name.length);
+            if (offset >= 0) {
+                emitWithSeq(seq, Wire.TYPE_OBJECT_FIRST_SEEN,
+                        Wire.KIND_BLOB << Wire.AFTER_KIND_SHIFT, Wire.TAG_STRING, 0,
+                        classSym, id, 0, offset);
+                return;
+            }
+            emitWithSeq(seq, Wire.TYPE_OBJECT_FIRST_SEEN, 0, Wire.TAG_REF, 0, classSym, id, 0, 0);
+            return;
+        }
+        final int classSym = rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, obj.getClass().getName());
         emitWithSeq(seq, Wire.TYPE_OBJECT_FIRST_SEEN, 0, Wire.TAG_REF, 0, classSym, id, 0, 0);
     }
 
@@ -338,19 +388,28 @@ public final class ThreadWorker {
      */
     private long resolveObjectId(Object o) {
         final long id = ObjectIdRegistry.idFor(o, this);
+        // If idFor's drain just emitted this object's first-sight baseline, a sampler
+        // snapshot on the same resolution would be an immediate byte-equivalent duplicate.
+        final boolean justBaselined = id != 0 && id == lastBaselineId;
+        lastBaselineId = 0;
         if (id != 0 && rt.snapshotEvery > 0 && !inSnapshot && --snapshotCountdown <= 0) {
             rearmSnapshotCountdown();
-            inSnapshot = true; // nested resolutions inside the dump must not snapshot again
-            try {
-                emitSnapshot(o, id);
-            } catch (Throwable t) {
-                HindsightRuntime.reportInternalError("snapshot", t);
-            } finally {
-                inSnapshot = false;
+            if (!justBaselined) {
+                inSnapshot = true; // nested resolutions inside the dump must not snapshot again
+                try {
+                    emitSnapshot(o, id);
+                } catch (Throwable t) {
+                    HindsightRuntime.reportInternalError("snapshot", t);
+                } finally {
+                    inSnapshot = false;
+                }
             }
         }
         return id;
     }
+
+    /** Object id whose first-sight baseline the drain emitted last; consumed by the sampler. */
+    private long lastBaselineId;
 
     private void rearmSnapshotCountdown() {
         long x = xorshiftState;
@@ -367,43 +426,153 @@ public final class ThreadWorker {
     // Snapshots (§3 payload, §7 policy)
     // =====================================================================================
 
+    /**
+     * §7 payload dispatch: arrays and {@code java.base} maps/collections are unfolded into
+     * their elements — the interesting state of a {@code HashMap} is its entries, not its
+     * bucket table. Unfolding is restricted to {@code java.base} implementations because a
+     * custom collection's iterator can run arbitrary application code (lazy loads, disk I/O —
+     * e.g. VirtualMap) that must never fire from inside a recording hook. Enums get no
+     * snapshot at all: their identity is the constant name already carried by their
+     * OBJECT_FIRST_SEEN record.
+     */
     private void emitSnapshot(Object o, long id) {
         final Class<?> cls = o.getClass();
-        final Field[] fields = new Field[Wire.SNAPSHOT_MAX_FIELDS];
-        int n = 0;
-        // Instance fields only, superclass fields included, subclass-first order (§3).
-        for (Class<?> c = cls; c != null && c != Object.class && n < fields.length; c = c.getSuperclass()) {
-            final Field[] declared;
-            try {
-                declared = c.getDeclaredFields();
-            } catch (Throwable t) {
-                break; // hidden class / hostile SecurityManager: take what we have
-            }
-            for (final Field f : declared) {
-                if (n >= fields.length) {
-                    break;
+        if (o instanceof Enum<?>) {
+            return;
+        }
+        if (cls.isArray()) {
+            emitUnfoldedSnapshot(o, id, cls, Wire.SNAPSHOT_FORM_ARRAY);
+        } else if (o instanceof java.util.Map && isJavaBase(cls)) {
+            emitUnfoldedSnapshot(o, id, cls, Wire.SNAPSHOT_FORM_MAP);
+        } else if (o instanceof java.util.Collection && isJavaBase(cls)) {
+            emitUnfoldedSnapshot(o, id, cls,
+                    o instanceof java.util.Set ? Wire.SNAPSHOT_FORM_SET : Wire.SNAPSHOT_FORM_LIST);
+        } else {
+            emitFieldSnapshot(o, id, cls);
+        }
+    }
+
+    private static boolean isJavaBase(Class<?> cls) {
+        return cls.getModule() == Object.class.getModule();
+    }
+
+    /** Unfolded §3 payload (forms MAP/SET/LIST/ARRAY): totalSize, then up to 64 elements. */
+    private void emitUnfoldedSnapshot(Object o, long id, Class<?> cls, int form) {
+        final int cap = Wire.SNAPSHOT_MAX_FIELDS;
+        final int entryBytes = form == Wire.SNAPSHOT_FORM_MAP ? 20 : 10;
+        final ByteBuffer payload =
+                ByteBuffer.allocate(11 + cap * entryBytes).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, cls.getName()));
+        payload.put((byte) form);
+        int included = 0;
+        // Iteration reads another thread's possibly-mutating structure: exceptions
+        // (ConcurrentModification and friends) keep whatever was collected so far.
+        try {
+            if (form == Wire.SNAPSHOT_FORM_ARRAY) {
+                final int total = java.lang.reflect.Array.getLength(o);
+                payload.putInt(total);
+                payload.putShort((short) 0); // patched below
+                for (int i = 0; i < total && included < cap; i++) {
+                    encodeRef(java.lang.reflect.Array.get(o, i));
+                    putSnapshotEntry(payload);
+                    included++;
                 }
-                if (!Modifier.isStatic(f.getModifiers())) {
-                    fields[n++] = f;
+            } else if (form == Wire.SNAPSHOT_FORM_MAP) {
+                final java.util.Map<?, ?> m = (java.util.Map<?, ?>) o;
+                payload.putInt(m.size());
+                payload.putShort((short) 0);
+                for (final java.util.Map.Entry<?, ?> e : m.entrySet()) {
+                    if (included >= cap) {
+                        break;
+                    }
+                    encodeRef(e.getKey());
+                    putSnapshotEntry(payload);
+                    encodeRef(e.getValue());
+                    putSnapshotEntry(payload);
+                    included++;
+                }
+            } else {
+                final java.util.Collection<?> c = (java.util.Collection<?>) o;
+                payload.putInt(c.size());
+                payload.putShort((short) 0);
+                for (final Object e : c) {
+                    if (included >= cap) {
+                        break;
+                    }
+                    encodeRef(e);
+                    putSnapshotEntry(payload);
+                    included++;
                 }
             }
+        } catch (Throwable t) {
+            // keep the elements collected before the failure
+        }
+        payload.putShort(9, (short) included); // classSym(4) + form(1) + totalSize(4)
+        final long offset = writeBlobEntry(Wire.BLOB_KIND_SNAPSHOT, payload.array(), payload.position());
+        if (offset >= 0) {
+            emit(Wire.TYPE_SNAPSHOT, Wire.KIND_BLOB << Wire.AFTER_KIND_SHIFT, 0, 0, 0, id, 0, offset);
+        }
+    }
+
+    /** One 10-byte element entry from the {@code enc*} scratch (§3). */
+    private void putSnapshotEntry(ByteBuffer payload) {
+        payload.put((byte) encTag);
+        payload.put((byte) encKind);
+        payload.putLong(encSlot);
+    }
+
+    /**
+     * Per-class snapshot plan, resolved once: the accessible instance fields (subclass-first,
+     * superclasses included, capped at {@link Wire#SNAPSHOT_MAX_FIELDS}). Reflection —
+     * {@code getDeclaredFields} allocating fresh {@code Field} copies, {@code trySetAccessible}
+     * re-running the module access check — is far too expensive to repeat per <em>object</em>
+     * during the post-trigger first-sight burst; caching per class makes emission a plain
+     * {@code Field.get} loop. An empty plan (JPMS-closed or field-less class) means "emit no
+     * snapshot at all": an empty {@code {}} record carries zero information.
+     */
+    private static final ClassValue<Field[]> SNAPSHOT_PLANS = new ClassValue<>() {
+        @Override
+        protected Field[] computeValue(Class<?> cls) {
+            final Field[] fields = new Field[Wire.SNAPSHOT_MAX_FIELDS];
+            int n = 0;
+            for (Class<?> c = cls; c != null && c != Object.class && n < fields.length; c = c.getSuperclass()) {
+                final Field[] declared;
+                try {
+                    declared = c.getDeclaredFields();
+                } catch (Throwable t) {
+                    break; // hidden class / hostile SecurityManager: take what we have
+                }
+                for (final Field f : declared) {
+                    if (n >= fields.length) {
+                        break;
+                    }
+                    boolean accessible;
+                    try {
+                        accessible = !Modifier.isStatic(f.getModifiers()) && f.trySetAccessible();
+                    } catch (Throwable t) {
+                        accessible = false;
+                    }
+                    if (accessible) {
+                        fields[n++] = f;
+                    }
+                }
+            }
+            return java.util.Arrays.copyOf(fields, n);
+        }
+    };
+
+    private void emitFieldSnapshot(Object o, long id, Class<?> cls) {
+        final Field[] plan = SNAPSHOT_PLANS.get(cls);
+        if (plan.length == 0) {
+            return; // nothing accessible to dump — an empty snapshot carries no information
         }
         final ByteBuffer payload =
-                ByteBuffer.allocate(6 + 14 * n).order(ByteOrder.LITTLE_ENDIAN);
+                ByteBuffer.allocate(7 + 14 * plan.length).order(ByteOrder.LITTLE_ENDIAN);
         payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, cls.getName()));
+        payload.put((byte) Wire.SNAPSHOT_FORM_FIELDS);
         payload.putShort((short) 0); // fieldCount patched below once skips are known
         int included = 0;
-        for (int i = 0; i < n; i++) {
-            final Field f = fields[i];
-            boolean accessible;
-            try {
-                accessible = f.trySetAccessible();
-            } catch (Throwable t) {
-                accessible = false;
-            }
-            if (!accessible) {
-                continue; // §7: reflection failures silently skip
-            }
+        for (final Field f : plan) {
             final Object v;
             try {
                 v = f.get(o);
@@ -430,7 +599,7 @@ public final class ThreadWorker {
             payload.putLong(bits);
             included++;
         }
-        payload.putShort(4, (short) included);
+        payload.putShort(5, (short) included); // classSym(4) + form(1)
         final long offset = writeBlobEntry(Wire.BLOB_KIND_SNAPSHOT, payload.array(), payload.position());
         if (offset >= 0) {
             emit(Wire.TYPE_SNAPSHOT, Wire.KIND_BLOB << Wire.AFTER_KIND_SHIFT, 0, 0, 0, id, 0, offset);

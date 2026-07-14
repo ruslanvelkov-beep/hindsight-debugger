@@ -91,6 +91,9 @@ public final class AgentConfig {
     /** Shallow-snapshot sampling divisor; 0 disables (§7). */
     public final int snapshotEvery;
 
+    /** Baseline snapshot of every object at first sight (§7). */
+    public final boolean snapshotFirstSeen;
+
     /** Per-thread record chunk size in KiB. */
     public final int recordBufKB;
 
@@ -117,6 +120,7 @@ public final class AgentConfig {
             String triggerMethod,
             int maxString,
             int snapshotEvery,
+            boolean snapshotFirstSeen,
             int recordBufKB,
             int blobBufKB,
             long maxTotalMB,
@@ -132,6 +136,7 @@ public final class AgentConfig {
         this.triggerMethod = triggerMethod;
         this.maxString = maxString;
         this.snapshotEvery = snapshotEvery;
+        this.snapshotFirstSeen = snapshotFirstSeen;
         this.recordBufKB = recordBufKB;
         this.blobBufKB = blobBufKB;
         this.maxTotalMB = maxTotalMB;
@@ -198,6 +203,7 @@ public final class AgentConfig {
 
         final int maxString = parseInt(remove(pairs, "maxString", "512"), "maxString", 0);
         final int snapshotEvery = parseInt(remove(pairs, "snapshotEvery", "8192"), "snapshotEvery", 0);
+        final boolean snapshotFirstSeen = parseBoolean(remove(pairs, "snapshotFirstSeen", "true"), "snapshotFirstSeen");
         final int recordBufKB = parseInt(remove(pairs, "recordBufKB", "256"), "recordBufKB", 1);
         final int blobBufKB = parseInt(remove(pairs, "blobBufKB", "128"), "blobBufKB", 1);
         final long maxTotalMB = parseLong(remove(pairs, "maxTotalMB", "204800"), "maxTotalMB", 0);
@@ -218,6 +224,7 @@ public final class AgentConfig {
                 triggerMethod,
                 maxString,
                 snapshotEvery,
+                snapshotFirstSeen,
                 recordBufKB,
                 blobBufKB,
                 maxTotalMB,

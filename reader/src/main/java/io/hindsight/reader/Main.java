@@ -241,10 +241,7 @@ public final class Main {
                 String var = s == null ? "?site" + r.location() : orUnknown(rec.symbolText(s.memberSym()));
                 yield "local " + var + " = " + vr.render(r, false) + (s == null ? "" : sourceRef(rec, s));
             }
-            case Format.OBJECT_FIRST_SEEN -> {
-                String cls = rec.symbolText(r.location());
-                yield "new " + Format.simpleName(orUnknown(cls)) + "#" + r.target();
-            }
+            case Format.OBJECT_FIRST_SEEN -> "first-seen " + vr.renderObjectId(r.target());
             case Format.SNAPSHOT -> "snapshot " + vr.renderSnapshot(r);
             case Format.THREAD_START ->
                     "thread start \"" + orUnknown(rec.symbolText(r.location())) + "\" javaTid=" + r.after();

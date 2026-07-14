@@ -24,6 +24,13 @@ public final class RuntimeConfig {
     /** Emit a shallow snapshot roughly once per this many object-id resolutions; 0 = off (§7). */
     public int snapshotEvery = 8192;
 
+    /**
+     * Emit a shallow snapshot of every object the first time it is seen (§7) — the baseline
+     * from which later field writes evolve the object's reconstructable state. Depth-1:
+     * objects first seen as nested references inside a snapshot get no snapshot of their own.
+     */
+    public boolean snapshotFirstSeen = true;
+
     /** Per-thread record chunk size in KiB (§9). */
     public int recordBufKB = 256;
 

@@ -213,6 +213,7 @@ public final class HindsightRuntime {
         final ChunkWriter writer;
         final int maxString;
         final int snapshotEvery;
+        final boolean snapshotFirstSeen;
 
         /** Global monotonic sequence, starts at 1 (§2); one getAndIncrement per record. */
         final AtomicLong seq = new AtomicLong(1);
@@ -230,6 +231,7 @@ public final class HindsightRuntime {
         Instance(RuntimeConfig cfg) throws IOException {
             this.maxString = Math.max(0, cfg.maxString);
             this.snapshotEvery = Math.max(0, cfg.snapshotEvery);
+            this.snapshotFirstSeen = cfg.snapshotFirstSeen;
             this.dir = resolveRecordingDir(cfg.outDir.toAbsolutePath());
             writeManifest(dir, cfg, System.currentTimeMillis());
             this.symbols = new RuntimeSymbols(dir);
@@ -410,7 +412,7 @@ public final class HindsightRuntime {
 
     private static void writeManifest(Path dir, RuntimeConfig cfg, long startEpochMillis) throws IOException {
         final Properties p = new Properties();
-        p.setProperty("schema", "1");
+        p.setProperty("schema", "2");
         final Package pkg = HindsightRuntime.class.getPackage();
         final String version = pkg == null ? null : pkg.getImplementationVersion();
         p.setProperty("recorder", version != null ? version : "0.0.1-SNAPSHOT");
@@ -421,6 +423,7 @@ public final class HindsightRuntime {
         p.setProperty("args", "outDir=" + cfg.outDir
                 + ",maxString=" + cfg.maxString
                 + ",snapshotEvery=" + cfg.snapshotEvery
+                + ",snapshotFirstSeen=" + cfg.snapshotFirstSeen
                 + ",recordBufKB=" + cfg.recordBufKB
                 + ",blobBufKB=" + cfg.blobBufKB
                 + ",maxTotalMB=" + cfg.maxTotalMB

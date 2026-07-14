@@ -57,11 +57,16 @@ public final class Recording implements AutoCloseable {
     /** One decoded blob entry (§3). */
     public record BlobEntry(int kind, byte[] payload) {}
 
-    /** One field of a decoded SNAPSHOT payload (§3). */
+    /** One entry of a decoded SNAPSHOT payload (§3); {@code nameSym} is -1 for elements. */
     public record SnapField(int nameSym, int tag, int kind, long value) {}
 
-    /** A decoded SNAPSHOT payload (§3): runtime class + 1-level field values. */
-    public record Snapshot(int classSym, List<SnapField> fields) {}
+    /**
+     * A decoded SNAPSHOT payload (§3): runtime class, payload form (§3 schema 2 — fields,
+     * or an unfolded map/set/list/array), the container's total size (equal to the entry
+     * count for form FIELDS), and the 1-level entries. For form MAP the entries alternate
+     * key, value, key, value…
+     */
+    public record Snapshot(int classSym, int form, long totalSize, List<SnapField> fields) {}
 
     private final Path dir;
     private final Properties manifest = new Properties();
@@ -72,6 +77,8 @@ public final class Recording implements AutoCloseable {
     private final boolean truncatedMarker;
     private final String truncationReason;
     private Map<Long, Integer> objectClassByIdCache;
+    private Map<Long, String> objectDisplayNameByIdCache;
+    private int schemaVersion = 2; // manifest-less directories get the current writer's schema
 
     /** Per-thread file pair, mapped lazily so huge recordings open instantly. */
     private final class ThreadFiles {
@@ -152,9 +159,12 @@ public final class Recording implements AutoCloseable {
     public static Recording open(final Path dir) throws IOException {
         Recording r = new Recording(dir);
         String schema = r.manifest.getProperty("schema");
-        if (schema != null && !"1".equals(schema.trim())) {
+        if (schema != null) {
+            r.schemaVersion = "1".equals(schema.trim()) ? 1 : 2;
+        }
+        if (schema != null && !"1".equals(schema.trim()) && !"2".equals(schema.trim())) {
             r.close();
-            throw new IOException("unsupported schema version '" + schema + "' (reader supports 1)");
+            throw new IOException("unsupported schema version '" + schema + "' (reader supports 1-2)");
         }
         return r;
     }
@@ -410,26 +420,53 @@ public final class Recording implements AutoCloseable {
             throw new IOException("expected SNAPSHOT blob at offset " + offset + " in "
                     + Format.blobFileName(tid) + " but found kind " + e.kind());
         }
-        return parseSnapshot(e.payload());
+        return parseSnapshot(e.payload(), schemaVersion);
     }
 
-    /** Decodes a raw SNAPSHOT payload (§3): classSym, fieldCount, then per-field rows. */
-    public static Snapshot parseSnapshot(final byte[] payload) throws IOException {
+    /**
+     * Decodes a raw SNAPSHOT payload (§3). Schema 1 payloads are fields-only (classSym,
+     * fieldCount, per-field rows); schema 2 adds a form byte after classSym, and unfolded
+     * forms (map/set/list/array) carry totalSize + name-less element entries — 20 bytes per
+     * map entry (key then value), 10 per element otherwise.
+     */
+    public static Snapshot parseSnapshot(final byte[] payload, final int schemaVersion) throws IOException {
         java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
         try {
             int classSym = b.getInt();
-            int fieldCount = b.getShort() & 0xFFFF;
-            if (fieldCount > 64) {
-                throw new IOException("snapshot fieldCount " + fieldCount + " exceeds spec max 64");
+            int form = schemaVersion >= 2 ? b.get() & 0xFF : Format.FORM_FIELDS;
+            if (form > Format.FORM_ARRAY) {
+                throw new IOException("snapshot has unknown form " + form);
             }
-            List<SnapField> fields = new ArrayList<>(fieldCount);
-            for (int i = 0; i < fieldCount; i++) {
-                fields.add(new SnapField(b.getInt(), b.get() & 0xFF, b.get() & 0xFF, b.getLong()));
+            if (form == Format.FORM_FIELDS) {
+                int fieldCount = b.getShort() & 0xFFFF;
+                if (fieldCount > 64) {
+                    throw new IOException("snapshot fieldCount " + fieldCount + " exceeds spec max 64");
+                }
+                List<SnapField> fields = new ArrayList<>(fieldCount);
+                for (int i = 0; i < fieldCount; i++) {
+                    fields.add(new SnapField(b.getInt(), b.get() & 0xFF, b.get() & 0xFF, b.getLong()));
+                }
+                return new Snapshot(classSym, form, fieldCount, List.copyOf(fields));
             }
-            return new Snapshot(classSym, List.copyOf(fields));
+            long totalSize = b.getInt() & 0xFFFF_FFFFL;
+            int count = b.getShort() & 0xFFFF;
+            if (count > 64) {
+                throw new IOException("snapshot element count " + count + " exceeds spec max 64");
+            }
+            int entries = form == Format.FORM_MAP ? count * 2 : count;
+            List<SnapField> fields = new ArrayList<>(entries);
+            for (int i = 0; i < entries; i++) {
+                fields.add(new SnapField(-1, b.get() & 0xFF, b.get() & 0xFF, b.getLong()));
+            }
+            return new Snapshot(classSym, form, totalSize, List.copyOf(fields));
         } catch (java.nio.BufferUnderflowException e) {
             throw new IOException("snapshot payload truncated (" + payload.length + " bytes)");
         }
+    }
+
+    /** The recording's declared schema version (§13); manifest-less directories read as 2. */
+    public int schemaVersion() {
+        return schemaVersion;
     }
 
     // ---- object identity ----
@@ -441,14 +478,24 @@ public final class Recording implements AutoCloseable {
      * anyway, so this costs at most one extra pass).
      */
     public String objectClassName(final long objectId) {
-        Map<Long, Integer> m = objectClassMap();
-        Integer sym = m.get(objectId);
+        objectClassMap();
+        Integer sym = objectClassByIdCache.get(objectId);
         return sym == null ? null : symbolText(sym);
+    }
+
+    /**
+     * Display name of an object id — the constant name for enums (carried as a blob in the
+     * {@code after} slot of OBJECT_FIRST_SEEN, §2.1 schema 2) — or {@code null}.
+     */
+    public String objectDisplayName(final long objectId) {
+        objectClassMap();
+        return objectDisplayNameByIdCache.get(objectId);
     }
 
     private synchronized Map<Long, Integer> objectClassMap() {
         if (objectClassByIdCache == null) {
             Map<Long, Integer> m = new HashMap<>();
+            Map<Long, String> names = new HashMap<>();
             try {
                 for (int tid : threadIds()) {
                     long n = recordCount(tid);
@@ -456,12 +503,20 @@ public final class Recording implements AutoCloseable {
                         Rec r = recordAt(tid, i);
                         if (r.type() == Format.OBJECT_FIRST_SEEN) {
                             m.putIfAbsent(r.target(), r.location());
+                            if (r.afterKind() == Format.KIND_BLOB) {
+                                try {
+                                    names.putIfAbsent(r.target(), utf8At(tid, r.after()));
+                                } catch (IOException e) {
+                                    // dangling display-name blob (truncated tail): id-only rendering
+                                }
+                            }
                         }
                     }
                 }
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+            objectDisplayNameByIdCache = names;
             objectClassByIdCache = m;
         }
         return objectClassByIdCache;
