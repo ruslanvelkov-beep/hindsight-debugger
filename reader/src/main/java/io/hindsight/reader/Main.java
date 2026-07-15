@@ -13,10 +13,10 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * CLI entry point (FORMAT.md §12): {@code dump}, {@code stats}, {@code verify}.
- * Exit codes: 0 = success, 1 = verify found violations, 2 = usage error (also
- * used for an unreadable/unsupported recording — the invocation, not the data
- * contents, was unusable).
+ * CLI entry point (FORMAT.md §12): {@code dump}, {@code stats}, {@code verify},
+ * {@code find}. Exit codes: 0 = success, 1 = verify found violations, 2 = usage
+ * error (also used for an unreadable/unsupported recording — the invocation, not
+ * the data contents, was unusable).
  *
  * <p>All work happens in {@link #run}, which never calls {@code System.exit}
  * and writes to injected streams — tests drive the real CLI surface without
@@ -45,6 +45,7 @@ public final class Main {
         try {
             opts = parseOpts(args, switch (cmd) {
                 case "dump" -> List.of("--dir", "--thread", "--limit", "--from-seq", "--method", "--depth-max");
+                case "find" -> List.of("--dir", "--object", "--limit");
                 case "stats", "verify" -> List.of("--dir");
                 default -> null;
             });
@@ -61,6 +62,7 @@ public final class Main {
         try (Recording rec = Recording.open(Path.of(dirOpt))) {
             return switch (cmd) {
                 case "dump" -> dump(rec, opts, out, err);
+                case "find" -> find(rec, opts, out, err);
                 case "stats" -> stats(rec, out);
                 case "verify" -> verify(rec, out);
                 default -> usage(err, null); // unreachable
@@ -110,6 +112,7 @@ public final class Main {
         err.println("""
                 usage: hindsight-reader <subcommand> [options]
                   dump   --dir D [--thread N] [--limit N] [--from-seq S] [--method SUBSTR] [--depth-max N]
+                  find   --dir D --object ID [--limit N]   (ID: bare number or Class#id)
                   stats  --dir D
                   verify --dir D
                 exit codes: 0 ok, 1 verify violations, 2 usage""");
@@ -252,6 +255,137 @@ public final class Main {
 
     private static String orUnknown(final String s) {
         return s == null ? "?" : s;
+    }
+
+    // ---- find ----
+
+    /**
+     * Locates everything about one object id in a single raw pass: its
+     * {@code OBJECT_FIRST_SEEN}, any {@code SNAPSHOT}s (rendered — this is the
+     * direct answer to "does a snapshot exist and what's in it"), and a count +
+     * capped sample of the records that reference the id (as {@code this}/owner,
+     * or as a before/after value slot). Only the object's own snapshots and the
+     * sample lines are rendered, so the scan stays a field-comparison sweep —
+     * sub-second even on multi-million-record recordings.
+     *
+     * <p>Record-level references only: an id that appears solely as a nested
+     * value inside another object's snapshot payload (a blob) is not counted,
+     * since that would require decoding every snapshot.
+     */
+    private static int find(final Recording rec, final Map<String, String> opts,
+            final PrintStream out, final PrintStream err) throws IOException {
+        String objOpt = opts.get("--object");
+        if (objOpt == null) {
+            return usage(err, "find requires --object ID");
+        }
+        long objectId;
+        try {
+            objectId = parseObjectId(objOpt);
+        } catch (NumberFormatException e) {
+            return usage(err, "bad --object ID: '" + objOpt + "' (want a number or Class#id)");
+        }
+        if (objectId <= 0) {
+            return usage(err, "--object ID must be a positive object id, got " + objectId);
+        }
+        long showLimit = longOpt(opts, "--limit", 20);
+        surfaceTruncation(rec, out);
+        ValueRenderer vr = new ValueRenderer(rec);
+
+        Rec firstSeen = null;
+        List<Rec> snapshots = new ArrayList<>();
+        long asTarget = 0;
+        long asBefore = 0;
+        long asAfter = 0;
+        long firstRefSeq = Long.MAX_VALUE;
+        long lastRefSeq = Long.MIN_VALUE;
+        List<Rec> sample = new ArrayList<>();
+
+        RecordCursor cur = rec.cursor();
+        while (cur.hasNext()) {
+            Rec r = cur.next();
+            if (r.type() == Format.OBJECT_FIRST_SEEN && r.target() == objectId) {
+                if (firstSeen == null) {
+                    firstSeen = r;
+                }
+                continue;
+            }
+            if (r.type() == Format.SNAPSHOT && r.target() == objectId) {
+                snapshots.add(r);
+                continue;
+            }
+            boolean t = r.target() == objectId;
+            boolean b = r.beforeKind() == Format.KIND_OBJECT_ID && r.before() == objectId;
+            boolean a = r.afterKind() == Format.KIND_OBJECT_ID && r.after() == objectId;
+            if (!t && !b && !a) {
+                continue;
+            }
+            if (t) {
+                asTarget++;
+            }
+            if (b) {
+                asBefore++;
+            }
+            if (a) {
+                asAfter++;
+            }
+            firstRefSeq = Math.min(firstRefSeq, r.seq());
+            lastRefSeq = Math.max(lastRefSeq, r.seq());
+            if (sample.size() < showLimit) {
+                sample.add(r);
+            }
+        }
+
+        // Derive the class/enum-name from the first-seen record we already have, so a pure
+        // existence check needn't trigger the objectClassName cache's separate full scan.
+        String cls = null;
+        String display = null;
+        if (firstSeen != null) {
+            cls = rec.symbolText(firstSeen.location());
+            if (firstSeen.afterKind() == Format.KIND_BLOB) {
+                try {
+                    display = rec.utf8At(firstSeen.tid(), firstSeen.after());
+                } catch (IOException e) {
+                    display = null; // dangling display-name blob (truncated tail)
+                }
+            }
+        }
+        out.println("object #" + objectId
+                + (cls == null ? "" : "  (" + cls + (display == null ? "" : "." + display) + ")"));
+        if (firstSeen == null) {
+            out.println("  first-seen: none (id never registered — check for a truncated tail)");
+        } else {
+            out.println("  first-seen: seq " + firstSeen.seq() + " t" + firstSeen.tid());
+        }
+        if (snapshots.isEmpty()) {
+            out.println("  snapshots:  none");
+        } else {
+            out.println("  snapshots:  " + snapshots.size());
+            for (Rec s : snapshots) {
+                out.println("    [seq " + s.seq() + " t" + s.tid() + "] snapshot " + vr.renderSnapshot(s));
+            }
+        }
+        long refs = asTarget + asBefore + asAfter;
+        if (refs == 0) {
+            out.println("  references: none");
+        } else {
+            out.println("  references: " + refs + "  (this/owner " + asTarget
+                    + ", value-before " + asBefore + ", value-after " + asAfter + ")"
+                    + "  seq " + firstRefSeq + ".." + lastRefSeq);
+            if (!sample.isEmpty()) {
+                out.println("  first " + sample.size() + " reference record(s):");
+                for (Rec r : sample) {
+                    out.println("    [seq " + r.seq() + " t" + r.tid() + "] " + describe(rec, vr, r));
+                }
+            }
+        }
+        return 0;
+    }
+
+    /** Accepts a bare object id ({@code 27080}) or the {@code Class#id} form dump prints. */
+    private static long parseObjectId(final String raw) {
+        int hash = raw.lastIndexOf('#');
+        String num = hash >= 0 ? raw.substring(hash + 1) : raw;
+        return Long.parseLong(num.trim());
     }
 
     // ---- stats ----

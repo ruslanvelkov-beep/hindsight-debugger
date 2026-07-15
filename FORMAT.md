@@ -390,6 +390,11 @@ must be skipped: storing an uninitialized `this` is a verify error.)
   - `dump --dir D [--thread N] [--limit N] [--from-seq S] [--method SUBSTR] [--depth-max N]`
     → indented call tree, one line per record, e.g.
     `[seq 12360 t3] Account#123.balance: 1000 -> 900 (TransferService.java:88)`
+  - `find --dir D --object ID [--limit N]` (ID: bare number or `Class#id`) → single raw
+    pass locating one object id: its `OBJECT_FIRST_SEEN`, any `SNAPSHOT`s (rendered), and
+    a count + capped sample of records referencing it (as `this`/owner, or a before/after
+    value slot). Record-level references only — nested references inside another object's
+    snapshot payload are not counted. Exit 0 whether or not the id is present.
   - `stats --dir D` → per-type and per-thread record counts, blob sizes, top methods
     by enter count, object count, wall-clock span from TIME_SYNCs.
   - `verify --dir D` → invariant checks, non-zero exit on violation: per-thread seq

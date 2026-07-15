@@ -226,4 +226,64 @@ final class ReaderSyntheticTest {
         assertEquals(2, TestCli.run("dump").code());
         assertEquals(2, TestCli.run("dump", "--dir", tmp.resolve("nope").toString()).code());
     }
+
+    @Test
+    void findReportsFirstSeenReferencesAndNoSnapshot() throws IOException {
+        // basic fixture: Bank#5 is the ENTER's `this`; Account#7 owns the field write.
+        Path dir = basic(tmp.resolve("rec")).write();
+        TestCli.Result r = TestCli.run("find", "--dir", dir.toString(), "--object", "5");
+        assertEquals(0, r.code(), r.err());
+        assertTrue(r.outContains("object #5  (com.example.Bank)"), r.out());
+        assertTrue(r.outContains("first-seen: seq"), r.out());
+        assertTrue(r.outContains("snapshots:  none"), r.out());
+        // referenced once, as the ENTER target (this); the FIRST_SEEN itself is not a reference.
+        assertTrue(r.outContains("references: 1  (this/owner 1,"), r.out());
+        assertTrue(r.outContains("Bank.transfer"), r.out());
+    }
+
+    @Test
+    void findAcceptsClassHashIdFormAndCountsFieldOwner() throws IOException {
+        Path dir = basic(tmp.resolve("rec")).write();
+        TestCli.Result r = TestCli.run("find", "--dir", dir.toString(), "--object", "Account#7");
+        assertEquals(0, r.code(), r.err());
+        assertTrue(r.outContains("object #7  (com.example.Account)"), r.out());
+        assertTrue(r.outContains("references: 1  (this/owner 1,"), r.out());
+        assertTrue(r.outContains(".balance:"), r.out());
+    }
+
+    @Test
+    void findRendersAnExistingSnapshot() throws IOException {
+        SyntheticRecording sr = new SyntheticRecording(tmp.resolve("rec"));
+        sr.threadStart(1, "main", 1, 100L);
+        int rtCls = sr.rtSym("RTCLASS", "com.example.Box");
+        int fName = sr.rtSym("FIELDNAME", "value");
+        sr.rec(1, Format.OBJECT_FIRST_SEEN, 0, 0, 0, rtCls, 5, 0, 0);
+        long snapOff = sr.blobRaw(1, Format.BLOB_MAGIC, Format.BLOB_SNAPSHOT,
+                SyntheticRecording.snapshotPayload(
+                        rtCls, new int[][] {{fName, Format.TAG_INT, Format.KIND_INLINE, 42, 0}}));
+        sr.rec(1, Format.SNAPSHOT, SyntheticRecording.flags(0, Format.KIND_BLOB, 0), 0, 0, 0, 5, 0, snapOff);
+        Path dir = sr.write();
+
+        TestCli.Result r = TestCli.run("find", "--dir", dir.toString(), "--object", "5");
+        assertEquals(0, r.code(), r.err());
+        assertTrue(r.outContains("snapshots:  1"), r.out());
+        assertTrue(r.outContains("snapshot Box#5 {value=42}"), r.out());
+    }
+
+    @Test
+    void findOnMissingIdReportsNoneAndSucceeds() throws IOException {
+        Path dir = basic(tmp.resolve("rec")).write();
+        TestCli.Result r = TestCli.run("find", "--dir", dir.toString(), "--object", "99");
+        assertEquals(0, r.code(), r.err());
+        assertTrue(r.outContains("first-seen: none"), r.out());
+        assertTrue(r.outContains("references: none"), r.out());
+    }
+
+    @Test
+    void findRejectsMissingAndMalformedObjectId() throws IOException {
+        Path dir = basic(tmp.resolve("rec")).write();
+        assertEquals(2, TestCli.run("find", "--dir", dir.toString()).code());
+        assertEquals(2, TestCli.run("find", "--dir", dir.toString(), "--object", "notanumber").code());
+        assertEquals(2, TestCli.run("find", "--dir", dir.toString(), "--object", "0").code());
+    }
 }
