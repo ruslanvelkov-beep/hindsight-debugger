@@ -94,6 +94,12 @@ public final class AgentConfig {
     /** Baseline snapshot of every object at first sight (§7). */
     public final boolean snapshotFirstSeen;
 
+    /** Emit LINE records at each source line (FULL scope only) — the §7 execution-flow backbone. */
+    public final boolean lines;
+
+    /** Emit BRANCH records at each conditional jump (FULL scope only) — §7 condition values. */
+    public final boolean branches;
+
     /** Per-thread record chunk size in KiB. */
     public final int recordBufKB;
 
@@ -121,6 +127,8 @@ public final class AgentConfig {
             int maxString,
             int snapshotEvery,
             boolean snapshotFirstSeen,
+            boolean lines,
+            boolean branches,
             int recordBufKB,
             int blobBufKB,
             long maxTotalMB,
@@ -137,6 +145,8 @@ public final class AgentConfig {
         this.maxString = maxString;
         this.snapshotEvery = snapshotEvery;
         this.snapshotFirstSeen = snapshotFirstSeen;
+        this.lines = lines;
+        this.branches = branches;
         this.recordBufKB = recordBufKB;
         this.blobBufKB = blobBufKB;
         this.maxTotalMB = maxTotalMB;
@@ -204,6 +214,8 @@ public final class AgentConfig {
         final int maxString = parseInt(remove(pairs, "maxString", "512"), "maxString", 0);
         final int snapshotEvery = parseInt(remove(pairs, "snapshotEvery", "8192"), "snapshotEvery", 0);
         final boolean snapshotFirstSeen = parseBoolean(remove(pairs, "snapshotFirstSeen", "true"), "snapshotFirstSeen");
+        final boolean lines = parseBoolean(remove(pairs, "lines", "true"), "lines");
+        final boolean branches = parseBoolean(remove(pairs, "branches", "true"), "branches");
         final int recordBufKB = parseInt(remove(pairs, "recordBufKB", "256"), "recordBufKB", 1);
         final int blobBufKB = parseInt(remove(pairs, "blobBufKB", "128"), "blobBufKB", 1);
         final long maxTotalMB = parseLong(remove(pairs, "maxTotalMB", "204800"), "maxTotalMB", 0);
@@ -225,6 +237,8 @@ public final class AgentConfig {
                 maxString,
                 snapshotEvery,
                 snapshotFirstSeen,
+                lines,
+                branches,
                 recordBufKB,
                 blobBufKB,
                 maxTotalMB,
@@ -273,6 +287,9 @@ public final class AgentConfig {
                 + ", trigger=" + (triggerClass == null ? "none" : triggerClass + "#" + triggerMethod)
                 + ", maxString=" + maxString
                 + ", snapshotEvery=" + snapshotEvery
+                + ", snapshotFirstSeen=" + snapshotFirstSeen
+                + ", lines=" + lines
+                + ", branches=" + branches
                 + ", recordBufKB=" + recordBufKB
                 + ", blobBufKB=" + blobBufKB
                 + ", maxTotalMB=" + maxTotalMB

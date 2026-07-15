@@ -61,6 +61,7 @@ public final class SiteRegistry implements AutoCloseable {
 
     private final ConcurrentHashMap<String, Integer> symbolIds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Integer> methodSiteIds = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> lineSiteIds = new ConcurrentHashMap<>();
 
     /** Guards id assignment + row write for both TSVs (symbols nest inside sites, never reverse). */
     private final Object lock = new Object();
@@ -188,6 +189,43 @@ public final class SiteRegistry implements AutoCloseable {
             final int fileSym = sourceFile == null ? 0 : symbol(SymbolKind.FILE, sourceFile);
             final int memberSym = symbol(SymbolKind.VAR, varName);
             return writeSite("LOCAL", classSym, fileSym, line, memberSym, typeDescriptor, slot);
+        }
+    }
+
+    /**
+     * Resolves the LINE site for one source line, assigning it on first sight. Deduplicated on
+     * {@code class#line}: a line crossed a million times in a loop still produces one site row,
+     * and every LINE record just references it (§5, §7).
+     */
+    public int lineSite(String classBinaryName, String sourceFile, int line) {
+        final String key = classBinaryName + '#' + line;
+        final Integer cached = lineSiteIds.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (lock) {
+            final Integer raced = lineSiteIds.get(key);
+            if (raced != null) {
+                return raced;
+            }
+            final int classSym = symbol(SymbolKind.CLASS, classBinaryName);
+            final int fileSym = sourceFile == null ? 0 : symbol(SymbolKind.FILE, sourceFile);
+            final int id = writeSite("LINE", classSym, fileSym, line, 0, "", -1);
+            lineSiteIds.put(key, id);
+            return id;
+        }
+    }
+
+    /**
+     * Assigns a fresh BRANCH site for one conditional-jump instruction (§5: one per
+     * instruction, never deduplicated). The JVM jump opcode is stored in the {@code slot}
+     * column so the reader can render the comparison operator and derive the taken result.
+     */
+    public int branchSite(String classBinaryName, String sourceFile, int line, int opcode) {
+        synchronized (lock) {
+            final int classSym = symbol(SymbolKind.CLASS, classBinaryName);
+            final int fileSym = sourceFile == null ? 0 : symbol(SymbolKind.FILE, sourceFile);
+            return writeSite("BRANCH", classSym, fileSym, line, 0, "", opcode);
         }
     }
 

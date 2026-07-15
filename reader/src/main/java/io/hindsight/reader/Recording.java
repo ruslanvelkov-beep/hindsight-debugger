@@ -78,7 +78,8 @@ public final class Recording implements AutoCloseable {
     private final String truncationReason;
     private Map<Long, Integer> objectClassByIdCache;
     private Map<Long, String> objectDisplayNameByIdCache;
-    private int schemaVersion = 2; // manifest-less directories get the current writer's schema
+    private Map<Long, Long> objectArrayLengthByIdCache;
+    private int schemaVersion = 3; // manifest-less directories get the current writer's schema
 
     /** Per-thread file pair, mapped lazily so huge recordings open instantly. */
     private final class ThreadFiles {
@@ -160,11 +161,15 @@ public final class Recording implements AutoCloseable {
         Recording r = new Recording(dir);
         String schema = r.manifest.getProperty("schema");
         if (schema != null) {
-            r.schemaVersion = "1".equals(schema.trim()) ? 1 : 2;
-        }
-        if (schema != null && !"1".equals(schema.trim()) && !"2".equals(schema.trim())) {
-            r.close();
-            throw new IOException("unsupported schema version '" + schema + "' (reader supports 1-2)");
+            switch (schema.trim()) {
+                case "1" -> r.schemaVersion = 1;
+                case "2" -> r.schemaVersion = 2;
+                case "3" -> r.schemaVersion = 3;
+                default -> {
+                    r.close();
+                    throw new IOException("unsupported schema version '" + schema + "' (reader supports 1-3)");
+                }
+            }
         }
         return r;
     }
@@ -492,10 +497,21 @@ public final class Recording implements AutoCloseable {
         return objectDisplayNameByIdCache.get(objectId);
     }
 
+    /**
+     * Length of an array object id, from the {@code before} slot of its {@code OBJECT_FIRST_SEEN}
+     * (§2.1 schema 2), or {@code -1} when the id is not a (known) array. Lets the reader show
+     * {@code byte[8192]#id} at every reference, not just inside an unfolded snapshot.
+     */
+    public long objectArrayLength(final long objectId) {
+        objectClassMap();
+        return objectArrayLengthByIdCache.getOrDefault(objectId, -1L);
+    }
+
     private synchronized Map<Long, Integer> objectClassMap() {
         if (objectClassByIdCache == null) {
             Map<Long, Integer> m = new HashMap<>();
             Map<Long, String> names = new HashMap<>();
+            Map<Long, Long> arrayLengths = new HashMap<>();
             try {
                 for (int tid : threadIds()) {
                     long n = recordCount(tid);
@@ -510,6 +526,9 @@ public final class Recording implements AutoCloseable {
                                     // dangling display-name blob (truncated tail): id-only rendering
                                 }
                             }
+                            if (r.beforeKind() == Format.KIND_INLINE) {
+                                arrayLengths.putIfAbsent(r.target(), r.before());
+                            }
                         }
                     }
                 }
@@ -517,6 +536,7 @@ public final class Recording implements AutoCloseable {
                 throw new UncheckedIOException(e);
             }
             objectDisplayNameByIdCache = names;
+            objectArrayLengthByIdCache = arrayLengths;
             objectClassByIdCache = m;
         }
         return objectClassByIdCache;

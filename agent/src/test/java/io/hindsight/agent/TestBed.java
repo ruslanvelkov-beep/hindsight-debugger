@@ -44,6 +44,12 @@ final class TestBed implements AutoCloseable {
      * and prepares a fresh loader that defines the instrumented bytes.
      */
     static TestBed start(Path tempDir, AgentConfig.Scope scope, String... classNames) throws IOException {
+        return startWithConfig(tempDir, scope, "hooks=unused.jar,include=io.hindsight.agent.fixtures.", classNames);
+    }
+
+    /** As {@link #start} but with an explicit agent-config string (to toggle lines/branches etc.). */
+    static TestBed startWithConfig(Path tempDir, AgentConfig.Scope scope, String configArgs, String... classNames)
+            throws IOException {
         final RuntimeConfig runtimeConfig = new RuntimeConfig();
         runtimeConfig.outDir = tempDir.resolve("recording");
         runtimeConfig.snapshotEvery = 0; // deterministic records
@@ -53,7 +59,7 @@ final class TestBed implements AutoCloseable {
 
         final AgentLog log = new AgentLog(recordingDir, false);
         final SiteRegistry registry = new SiteRegistry(recordingDir, null, null, log);
-        final AgentConfig config = AgentConfig.parse("hooks=unused.jar,include=io.hindsight.agent.fixtures.");
+        final AgentConfig config = AgentConfig.parse(configArgs);
         final HindsightTransformer transformer = new HindsightTransformer(config, registry, log);
 
         final ClassFileLocator locator = ClassFileLocator.ForClassLoader.of(TestBed.class.getClassLoader());

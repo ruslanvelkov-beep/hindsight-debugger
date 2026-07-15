@@ -113,6 +113,8 @@ final class Verifier {
                     requireSite(r, Site.KIND_METHOD);
             case Format.FIELD_WRITE -> requireSite(r, Site.KIND_FIELD);
             case Format.LOCAL_WRITE -> requireSite(r, Site.KIND_LOCAL);
+            case Format.LINE -> requireFlowSite(r, Site.KIND_LINE);
+            case Format.BRANCH -> requireFlowSite(r, Site.KIND_BRANCH);
             case Format.OBJECT_FIRST_SEEN, Format.THREAD_START -> {
                 if (recording.symbol(r.location()) == null) {
                     violation(r, Format.typeName(r.type()) + " references unknown symbol id "
@@ -141,6 +143,25 @@ final class Verifier {
         }
         if (recording.symbol(s.memberSym()) == null) {
             violation(r, "site " + s.id() + " references unknown member symbol " + s.memberSym());
+        }
+        if (s.fileSym() != 0 && recording.symbol(s.fileSym()) == null) {
+            violation(r, "site " + s.id() + " references unknown file symbol " + s.fileSym());
+        }
+    }
+
+    /** Like {@link #requireSite} but for LINE/BRANCH sites, which carry no member symbol. */
+    private void requireFlowSite(final Rec r, final String expectedKind) {
+        Site s = recording.site(r.location());
+        if (s == null) {
+            violation(r, Format.typeName(r.type()) + " references unknown site id " + r.location());
+            return;
+        }
+        if (!expectedKind.equals(s.kind())) {
+            violation(r, Format.typeName(r.type()) + " references " + s.kind() + " site "
+                    + r.location() + " (expected " + expectedKind + ")");
+        }
+        if (recording.symbol(s.classSym()) == null) {
+            violation(r, "site " + s.id() + " references unknown class symbol " + s.classSym());
         }
         if (s.fileSym() != 0 && recording.symbol(s.fileSym()) == null) {
             violation(r, "site " + s.id() + " references unknown file symbol " + s.fileSym());

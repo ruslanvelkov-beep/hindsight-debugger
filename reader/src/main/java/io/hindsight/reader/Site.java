@@ -36,4 +36,10 @@ public record Site(
 
     /** Site kind constant for local-variable-store sites. */
     public static final String KIND_LOCAL = "LOCAL";
+
+    /** Site kind constant for source-line sites (§7 flow); {@code slot} is unused (-1). */
+    public static final String KIND_LINE = "LINE";
+
+    /** Site kind constant for conditional-jump sites (§7); {@code slot} holds the JVM opcode. */
+    public static final String KIND_BRANCH = "BRANCH";
 }

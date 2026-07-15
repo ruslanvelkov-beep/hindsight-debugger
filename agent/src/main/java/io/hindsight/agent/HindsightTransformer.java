@@ -68,7 +68,7 @@ public final class HindsightTransformer implements AgentBuilder.Transformer {
         AsmVisitorWrapper prescanWrapper = null;
         try {
             AsmBridge.factory(); // fail here, once, not per class
-            fieldLocalWrapper = new FieldLocalVisitor(registry);
+            fieldLocalWrapper = new FieldLocalVisitor(registry, config.lines, config.branches);
             prescanWrapper = new MethodLinePrescan(registry);
         } catch (Throwable t) {
             if (log != null) {

@@ -219,6 +219,12 @@ public final class Main {
                 yield b.toString();
             }
             case Format.ARG -> "arg" + r.idx() + " = " + vr.render(r, false);
+            case Format.LINE -> {
+                int ln = s == null ? 0 : s.line();
+                String file = (s == null || s.fileSym() == 0) ? null : rec.symbolText(s.fileSym());
+                yield "line " + ln + (file == null ? "" : " (" + file + ":" + ln + ")");
+            }
+            case Format.BRANCH -> describeBranch(rec, vr, r, s);
             case Format.METHOD_EXIT -> {
                 StringBuilder b = new StringBuilder();
                 if (r.isExceptional()) {
@@ -255,6 +261,37 @@ public final class Main {
 
     private static String orUnknown(final String s) {
         return s == null ? "?" : s;
+    }
+
+    /**
+     * Renders a BRANCH record as {@code condition: <operands> <op> -> <result>}: the operand
+     * values (int compares) or the derived boolean (ref compares), plus the taken result the
+     * reader computes from the site's stored opcode. The following LINE records show which
+     * body actually ran.
+     */
+    private static String describeBranch(final Recording rec, final ValueRenderer vr, final Rec r, final Site s) {
+        final int op = s == null ? -1 : s.slot();
+        final StringBuilder b = new StringBuilder("condition: ");
+        final boolean result;
+        if (Format.isIntCmp(op)) {
+            final long a = r.before();
+            final long bb = r.after();
+            result = Format.intCmpResult(op, a, bb);
+            b.append(a).append(' ').append(Format.branchOp(op)).append(' ').append(bb);
+        } else if (Format.isIntZeroCmp(op)) {
+            final long v = r.after();
+            result = Format.intZeroCmpResult(op, v);
+            b.append(v).append(' ').append(Format.branchOp(op));
+        } else {
+            result = Format.refCmpResult(op, r.after() != 0);
+            b.append(Format.branchOp(op));
+        }
+        b.append(" -> ").append(result);
+        if (s != null && s.fileSym() != 0) {
+            String file = rec.symbolText(s.fileSym());
+            b.append(" (").append(file == null ? "?" : file).append(':').append(s.line()).append(')');
+        }
+        return b.toString();
     }
 
     // ---- find ----

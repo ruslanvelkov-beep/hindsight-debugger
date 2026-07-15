@@ -2,12 +2,15 @@
 
 Single source of truth for the on-disk recording format, the runtime hook API, and the
 agent configuration grammar. Implementations in `hooks/`, `agent/`, and `reader/` MUST
-conform to this document exactly. Schema version: **1**.
+conform to this document exactly. Schema version: **3**.
 
-Scope of v1 (deliberate): method enter/exit (+args, +return/throw), local-variable
-writes, field writes (before → after), object identity, occasional 1-level shallow
-snapshots, string/boxed-primitive values by value. NOT in v1: array stores, monitor
-events, allocation events (first-seen records subsume them), line-step records.
+Scope: method enter/exit (+args, +return/throw), local-variable writes, field writes
+(before → after), object identity (+array length), 1-level shallow snapshots (with
+container unfolding), string/boxed/enum values, source-line flow, and conditional-branch
+conditions. NOT captured: array element stores, monitor events, allocation events
+(first-seen records subsume them). Schema history: 1 = base; 2 = snapshot `form` byte +
+first-seen display names; 3 = LINE/BRANCH records + array length in first-seen. The reader
+accepts all three.
 
 ## 1. Recording directory
 
@@ -51,10 +54,12 @@ Fixed 40-byte records, record `i` at byte offset `i × 40`. No file header.
 |---|---|---|---|---|---|---|
 | `0x02` | `METHOD_ENTER` | method site | `this` id (0 for static **and** for constructors) | arg count (capped 255) | — | — |
 | `0x04` | `ARG` | method site | — | arg index | — | encoded arg value |
+| `0x05` | `LINE` | LINE site (§5) | — | — | — | — |
+| `0x06` | `BRANCH` | BRANCH site (§5; opcode in its `slot`) | — | — | int compares: first operand (2-operand only) | int compares: the (last) operand; ref compares: computed boolean result |
 | `0x03` | `METHOD_EXIT` | method site | `this` id for constructors, else 0 | — | — | encoded return value; throwable object id when `EXCEPTIONAL` |
 | `0x10` | `FIELD_WRITE` | field-write site | owner object id (0 for statics) | before-slot runtime tag (ref-typed fields only, else 0) | encoded old value | encoded new value |
 | `0x20` | `LOCAL_WRITE` | local-write site | — | slot (capped 255) | — | encoded new value |
-| `0x60` | `OBJECT_FIRST_SEEN` | **rt-symbol id** of the object's runtime class (enums: the *declaring* enum class) | new object id | — | — | enums: display-name blob offset (`AFTER_KIND=BLOB`, tag `STRING`, UTF8 constant name); else 0 |
+| `0x60` | `OBJECT_FIRST_SEEN` | **rt-symbol id** of the object's runtime class (enums: the *declaring* enum class) | new object id | — | arrays: element count (`BEFORE_KIND=INLINE`, tag `INT`); else 0 | enums: display-name blob offset (`AFTER_KIND=BLOB`, tag `STRING`, UTF8 constant name); else 0 |
 | `0x61` | `SNAPSHOT` | 0 | object id | — | — | blob offset of snapshot payload (`AFTER_KIND=BLOB`) |
 | `0x70` | `THREAD_START` | **rt-symbol id** of thread name | — | — | — | Java thread id (`Thread.getId()`) |
 | `0x72` | `TIME_SYNC` | 0 | — | — | — | `System.currentTimeMillis()` |
@@ -191,6 +196,10 @@ One line per instrumented location, assigned at transform time, ids dense from 1
   the store, `slot` = LVT slot index. `classSym` = declaring class of the method
   containing the store. NOTE: one site per **store instruction**, so several sites can
   share the same variable.
+- kind `LINE`: `memberSym` = 0, `desc` = "", `line` = the source line, `slot` = -1.
+  Deduplicated per `(class, line)` — one row however many times the line executes.
+- kind `BRANCH`: `memberSym` = 0, `desc` = "", `line` = the source line, `slot` = the JVM
+  conditional-jump opcode (e.g. `0xA2` = `IF_ICMPGE`). One site per jump instruction.
 
 `fileSym` = FILE symbol of the class's source file (0 if unknown). `line` = 0 when no
 LineNumberTable.
@@ -324,6 +333,8 @@ list-valued keys use `|` between elements. Keys:
 | `maxString` | `512` | max recorded string length (chars) |
 | `snapshotEvery` | `8192` | §7 sampling refresh; `0` = off |
 | `snapshotFirstSeen` | `true` | §7 baseline snapshot of every object at first sight |
+| `lines` | `true` | emit LINE records at each source line (FULL scope) — §2.1 flow |
+| `branches` | `true` | emit BRANCH records at each conditional jump (FULL scope) — §2.1 condition values |
 | `recordBufKB` | `256` | per-thread record chunk |
 | `blobBufKB` | `128` | per-thread blob chunk |
 | `maxTotalMB` | `204800` | recording size cap |
@@ -407,6 +418,7 @@ must be skipped: storing an uninitialized `this` is a verify error.)
 
 ## 13. Versioning
 
-`manifest.properties` keys: `schema=2`, `recorder=<project version>`, `jvm`, `pid`,
+`manifest.properties` keys: `schema=3`, `recorder=<project version>`, `jvm`, `pid`,
 `startEpochMillis`, `args`. Readers refuse unknown major schema; this reader accepts
-1 (no snapshot `form` byte, no first-seen display names) and 2.
+1 (no snapshot `form` byte, no display names, no LINE/BRANCH), 2 (adds form byte + display
+names), and 3 (adds LINE/BRANCH records and array length in first-seen).

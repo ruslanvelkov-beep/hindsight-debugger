@@ -21,6 +21,8 @@ public final class Wire {
     public static final byte TYPE_METHOD_ENTER = 0x02;
     public static final byte TYPE_METHOD_EXIT = 0x03;
     public static final byte TYPE_ARG = 0x04;
+    public static final byte TYPE_LINE = 0x05;
+    public static final byte TYPE_BRANCH = 0x06;
     public static final byte TYPE_FIELD_WRITE = 0x10;
     public static final byte TYPE_LOCAL_WRITE = 0x20;
     public static final byte TYPE_OBJECT_FIRST_SEEN = 0x60;

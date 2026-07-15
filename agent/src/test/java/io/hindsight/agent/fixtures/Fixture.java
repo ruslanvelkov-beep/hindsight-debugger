@@ -52,6 +52,18 @@ public final class Fixture {
         return n + recurse(n - 1);
     }
 
+    /**
+     * A {@code NEW} whose constructor arguments contain a branch — the ternary forces
+     * stack-map frames whose {@code Uninitialized} entries reference the {@code NEW}'s
+     * offset, with the line marker sitting directly on the {@code NEW}. Splicing a LINE
+     * hook between the {@code NEW}'s label and the {@code NEW} re-points those frame
+     * entries and the class fails to DEFINE ("bad offset for Uninitialized") — the exact
+     * shape that killed {@code Hedera.initializeDagger} on the consensus node.
+     */
+    public static String conditionalCtorArg(boolean flag) {
+        return new StringBuilder(flag ? "yes" : "no").toString();
+    }
+
     /** Always unwinds exceptionally. */
     public static void throwing() {
         throw new IllegalStateException("boom");

@@ -87,7 +87,13 @@ public final class ValueRenderer {
         if (display != null) {
             return (cls == null ? "?" : Format.simpleName(cls)) + "." + display;
         }
-        return (cls == null ? "?" : Format.simpleName(cls)) + "#" + objectId;
+        String simple = cls == null ? "?" : Format.simpleName(cls);
+        // Arrays carry their length (§2.1): render byte[8192]#id, not byte[]#id.
+        long len = recording.objectArrayLength(objectId);
+        if (len >= 0 && simple.endsWith("[]")) {
+            simple = simple.substring(0, simple.length() - 2) + "[" + len + "]";
+        }
+        return simple + "#" + objectId;
     }
 
     private String renderBlob(final int tag, final long offset, final int tid, final boolean truncated) {

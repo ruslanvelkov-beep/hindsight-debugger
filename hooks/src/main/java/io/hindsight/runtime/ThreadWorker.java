@@ -211,6 +211,35 @@ public final class ThreadWorker {
                 siteId, 0, 0, encSlot);
     }
 
+    /** LINE: execution crossed into the source line described by {@code siteId} (§7 flow). */
+    public synchronized void recordLine(int siteId) {
+        emit(Wire.TYPE_LINE, 0, Wire.TAG_VOID, 0, siteId, 0, 0, 0);
+    }
+
+    /** BRANCH on one int operand (compare vs 0): after = the operand value (§2.1). */
+    public synchronized void recordBranchInt1(int siteId, int value) {
+        emit(Wire.TYPE_BRANCH, Wire.KIND_INLINE << Wire.AFTER_KIND_SHIFT, Wire.TAG_INT, 0,
+                siteId, 0, 0, value);
+    }
+
+    /** BRANCH on two int operands: before = a, after = b; the reader derives the result. */
+    public synchronized void recordBranchInt2(int siteId, int a, int b) {
+        emit(Wire.TYPE_BRANCH, Wire.KIND_INLINE | (Wire.KIND_INLINE << Wire.AFTER_KIND_SHIFT),
+                Wire.TAG_INT, 0, siteId, 0, a, b);
+    }
+
+    /** BRANCH on one reference operand (null test): after = the computed boolean result. */
+    public synchronized void recordBranchRefNull(int siteId, boolean result) {
+        emit(Wire.TYPE_BRANCH, Wire.KIND_INLINE << Wire.AFTER_KIND_SHIFT, Wire.TAG_BOOLEAN, 0,
+                siteId, 0, 0, result ? 1L : 0L);
+    }
+
+    /** BRANCH on two reference operands (identity ==/!=): after = the computed boolean result. */
+    public synchronized void recordBranchRefCmp(int siteId, boolean result) {
+        emit(Wire.TYPE_BRANCH, Wire.KIND_INLINE << Wire.AFTER_KIND_SHIFT, Wire.TAG_BOOLEAN, 0,
+                siteId, 0, 0, result ? 1L : 0L);
+    }
+
     // ---- pending OBJECT_FIRST_SEEN reservations (§6): seq claimed under the registry bin
     // ---- lock (cheap), bytes + symbol interning materialised outside it (may block on I/O).
     private long[] pendingFsIds = new long[4];
@@ -295,7 +324,16 @@ public final class ThreadWorker {
             emitWithSeq(seq, Wire.TYPE_OBJECT_FIRST_SEEN, 0, Wire.TAG_REF, 0, classSym, id, 0, 0);
             return;
         }
-        final int classSym = rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, obj.getClass().getName());
+        final Class<?> cls = obj.getClass();
+        final int classSym = rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, cls.getName());
+        if (cls.isArray()) {
+            // Array length in the before slot (INLINE INT) so the reader can show byte[8192]#id
+            // at every reference site, not just where a snapshot happens to unfold it (§2.1).
+            final int len = java.lang.reflect.Array.getLength(obj);
+            emitWithSeq(seq, Wire.TYPE_OBJECT_FIRST_SEEN, Wire.KIND_INLINE, Wire.TAG_INT, 0,
+                    classSym, id, len, 0);
+            return;
+        }
         emitWithSeq(seq, Wire.TYPE_OBJECT_FIRST_SEEN, 0, Wire.TAG_REF, 0, classSym, id, 0, 0);
     }
 

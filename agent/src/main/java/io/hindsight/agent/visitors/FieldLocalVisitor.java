@@ -17,10 +17,13 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.LineNumberNode;
 import org.objectweb.asm.tree.LocalVariableNode;
@@ -65,6 +68,7 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
 
     private static final String LOCAL_HOOK = "io/hindsight/hooks/LocalWriteHook";
     private static final String FIELD_HOOK = "io/hindsight/hooks/FieldWriteHook";
+    private static final String FLOW_HOOK = "io/hindsight/hooks/FlowHooks";
 
     // §2.3 tags, mirrored locally (same precedent as the hook classes).
     private static final int TAG_INT = 1;
@@ -74,10 +78,18 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
     private static final int TAG_SHORT = 8;
 
     private final SiteRegistry registry;
+    private final boolean lines;
+    private final boolean branches;
 
-    /** @param registry allocator for the one-per-instruction FIELD and LOCAL sites (§5) */
-    public FieldLocalVisitor(SiteRegistry registry) {
+    /**
+     * @param registry allocator for the FIELD/LOCAL/LINE/BRANCH sites (§5)
+     * @param lines whether to splice a LINE record at each source-line marker (§7)
+     * @param branches whether to splice a BRANCH record at each conditional jump (§7)
+     */
+    public FieldLocalVisitor(SiteRegistry registry, boolean lines, boolean branches) {
         this.registry = registry;
+        this.lines = lines;
+        this.branches = branches;
     }
 
     /**
@@ -101,20 +113,25 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
             int writerFlags,
             int readerFlags) {
         final org.objectweb.asm.ClassVisitor downstream = AsmBridge.factory().wrap(classVisitor);
-        return AsmBridge.factory().unwrap(new SpliceClassVisitor(downstream, registry));
+        return AsmBridge.factory().unwrap(new SpliceClassVisitor(downstream, registry, lines, branches));
     }
 
     /** Per-class driver: captures names/source file, buffers each method, splices, replays. */
     private static final class SpliceClassVisitor extends org.objectweb.asm.ClassVisitor {
 
         private final SiteRegistry registry;
+        private final boolean lines;
+        private final boolean branches;
         private String classInternalName;
         private String superInternalName;
         private String sourceFile;
 
-        SpliceClassVisitor(org.objectweb.asm.ClassVisitor downstream, SiteRegistry registry) {
+        SpliceClassVisitor(org.objectweb.asm.ClassVisitor downstream, SiteRegistry registry,
+                boolean lines, boolean branches) {
             super(Opcodes.ASM9, downstream);
             this.registry = registry;
+            this.lines = lines;
+            this.branches = branches;
         }
 
         @Override
@@ -140,7 +157,8 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
                 @Override
                 public void visitEnd() {
                     super.visitEnd();
-                    new MethodSplicer(registry, classInternalName, superInternalName, sourceFile, this).splice();
+                    new MethodSplicer(registry, classInternalName, superInternalName, sourceFile, this, lines, branches)
+                            .splice();
                     accept(downstream);
                 }
             };
@@ -156,6 +174,8 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
         private final String superInternalName;
         private final String sourceFile;
         private final MethodNode method;
+        private final boolean lines;
+        private final boolean branches;
 
         /** Base slot of the field-splice scratch area (== the method's original maxLocals). */
         private final int scratchBase;
@@ -168,13 +188,17 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
                 String classInternalName,
                 String superInternalName,
                 String sourceFile,
-                MethodNode method) {
+                MethodNode method,
+                boolean lines,
+                boolean branches) {
             this.registry = registry;
             this.classInternalName = classInternalName;
             this.classBinaryName = classInternalName.replace('/', '.');
             this.superInternalName = superInternalName;
             this.sourceFile = sourceFile;
             this.method = method;
+            this.lines = lines;
+            this.branches = branches;
             this.scratchBase = method.maxLocals;
         }
 
@@ -198,10 +222,20 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
                 final AbstractInsnNode insn = original[i];
                 if (insn instanceof LineNumberNode lineNode) {
                     line = lineNode.line;
+                    if (lines) {
+                        spliceLine(original, i, line); // safe even pre-super(): touches no `this`
+                    }
                 } else if (insn instanceof VarInsnNode store && isStoreOpcode(store.getOpcode())) {
                     spliceLocalStore(store, i, line, position);
                 } else if (insn instanceof IincInsnNode iinc) {
                     spliceIinc(iinc, i, line, position);
+                } else if (insn instanceof JumpInsnNode jump && branches && isConditionalJump(jump.getOpcode())) {
+                    // Pre-super() a ref-compare operand could be the uninitialized `this`, which
+                    // cannot legally be passed to a hook — skip the whole region, like PUTFIELD.
+                    if (isCtor && i < initBoundary) {
+                        continue;
+                    }
+                    spliceBranch(jump, line);
                 } else if (insn instanceof FieldInsnNode field
                         && (field.getOpcode() == Opcodes.PUTFIELD || field.getOpcode() == Opcodes.PUTSTATIC)) {
                     if (field.getOpcode() == Opcodes.PUTFIELD && isCtor && i < initBoundary) {
@@ -311,6 +345,102 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
 
         private int localSite(LocalVariableNode variable, int line) {
             return registry.localSite(classBinaryName, variable.name, variable.desc, variable.index, sourceFile, line);
+        }
+
+        // ---------------------------------------------------------------------------------
+        // Execution flow (§7): line markers and conditional-jump conditions
+        // ---------------------------------------------------------------------------------
+
+        /**
+         * Emits a LINE record for this source line. The insertion target is the first real
+         * instruction at/after the line marker in the ORIGINAL snapshot — skipping any
+         * {@code LabelNode}/{@code FrameNode}/{@code LineNumberNode} <em>and any {@code NEW}
+         * instruction</em> — for three reasons:
+         *
+         * <ul>
+         *   <li>it is never between a branch target's label and its stack-map frame, so the
+         *       target keeps its frame and the stack-neutral {@code push siteId; INVOKESTATIC
+         *       line} sequence verifies (touches no locals or {@code this} — legal even
+         *       pre-{@code super()});</li>
+         *   <li>it is never between a {@code NEW}'s label and the {@code NEW} itself: a
+         *       stack-map frame's {@code Uninitialized} entry references the {@code NEW}'s
+         *       bytecode <em>offset</em> (via that label). Splicing there re-points the label
+         *       at the hook code and every such frame fails class-file parsing with
+         *       "StackMapTable format error: bad offset for Uninitialized" — a define-time
+         *       error fail-open cannot catch (real-world trigger: any
+         *       {@code new Foo(cond ? a : b)}, where the ternary forces frames while the
+         *       uninitialized ref is on the stack). Inserting after the {@code NEW} keeps the
+         *       label on it and is stack-legal — the hook args sit above the uninitialized
+         *       ref, which is never touched;</li>
+         *   <li>walking the snapshot rather than the live list means the walk never stops at a
+         *       previous splice's own instructions. Two line markers sharing one real
+         *       instruction therefore both {@code insertBefore} it in source order, so the LINE
+         *       records keep ascending seq order (a live-list walk reversed them).</li>
+         * </ul>
+         */
+        private void spliceLine(AbstractInsnNode[] original, int lineIdx, int line) {
+            AbstractInsnNode target = null;
+            for (int j = lineIdx + 1; j < original.length; j++) {
+                final AbstractInsnNode n = original[j];
+                if (n instanceof LabelNode || n instanceof FrameNode || n instanceof LineNumberNode
+                        || n.getOpcode() == Opcodes.NEW) {
+                    continue;
+                }
+                target = n;
+                break;
+            }
+            if (target == null) {
+                return; // no real instruction follows this line marker
+            }
+            final int siteId = registry.lineSite(classBinaryName, sourceFile, line);
+            final InsnList seq = new InsnList();
+            seq.add(pushInt(siteId));
+            seq.add(new MethodInsnNode(Opcodes.INVOKESTATIC, FLOW_HOOK, "line", "(I)V", false));
+            method.instructions.insertBefore(target, seq);
+        }
+
+        /**
+         * Captures a conditional jump's operand(s) just before the jump, leaving them in place
+         * for the jump itself. Every sequence is stack-neutral: {@code DUP}/{@code DUP2} the
+         * live operand(s) (all branch operands are category-1 ints or refs — long/double
+         * comparisons already reduced to an int via {@code LCMP}/{@code DCMPx}), push the site
+         * id, then a hook that consumes {@code (…operands, siteId)}. The reader derives the
+         * taken result from the site's stored opcode plus the recorded operand values.
+         */
+        private void spliceBranch(JumpInsnNode jump, int line) {
+            final int op = jump.getOpcode();
+            final int siteId = registry.branchSite(classBinaryName, sourceFile, line, op);
+            final InsnList seq = new InsnList();
+            switch (op) {
+                case Opcodes.IFEQ, Opcodes.IFNE, Opcodes.IFLT, Opcodes.IFGE, Opcodes.IFGT, Opcodes.IFLE -> {
+                    seq.add(new InsnNode(Opcodes.DUP));
+                    seq.add(pushInt(siteId));
+                    seq.add(new MethodInsnNode(Opcodes.INVOKESTATIC, FLOW_HOOK, "branchInt1", "(II)V", false));
+                }
+                case Opcodes.IF_ICMPEQ, Opcodes.IF_ICMPNE, Opcodes.IF_ICMPLT,
+                        Opcodes.IF_ICMPGE, Opcodes.IF_ICMPGT, Opcodes.IF_ICMPLE -> {
+                    seq.add(new InsnNode(Opcodes.DUP2));
+                    seq.add(pushInt(siteId));
+                    seq.add(new MethodInsnNode(Opcodes.INVOKESTATIC, FLOW_HOOK, "branchInt2", "(III)V", false));
+                }
+                case Opcodes.IFNULL, Opcodes.IFNONNULL -> {
+                    seq.add(new InsnNode(Opcodes.DUP));
+                    seq.add(pushInt(siteId));
+                    seq.add(new MethodInsnNode(
+                            Opcodes.INVOKESTATIC, FLOW_HOOK, "branchRefNull", "(Ljava/lang/Object;I)V", false));
+                }
+                case Opcodes.IF_ACMPEQ, Opcodes.IF_ACMPNE -> {
+                    seq.add(new InsnNode(Opcodes.DUP2));
+                    seq.add(pushInt(siteId));
+                    seq.add(new MethodInsnNode(
+                            Opcodes.INVOKESTATIC, FLOW_HOOK, "branchRefCmp",
+                            "(Ljava/lang/Object;Ljava/lang/Object;I)V", false));
+                }
+                default -> {
+                    return; // not a conditional jump we capture
+                }
+            }
+            method.instructions.insertBefore(jump, seq);
         }
 
         /**
@@ -456,6 +586,17 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
 
         private static boolean isStoreOpcode(int opcode) {
             return opcode >= Opcodes.ISTORE && opcode <= Opcodes.ASTORE;
+        }
+
+        /** The conditional jumps we capture — everything except {@code GOTO} and {@code JSR}. */
+        private static boolean isConditionalJump(int opcode) {
+            return switch (opcode) {
+                case Opcodes.IFEQ, Opcodes.IFNE, Opcodes.IFLT, Opcodes.IFGE, Opcodes.IFGT, Opcodes.IFLE,
+                        Opcodes.IF_ICMPEQ, Opcodes.IF_ICMPNE, Opcodes.IF_ICMPLT, Opcodes.IF_ICMPGE,
+                        Opcodes.IF_ICMPGT, Opcodes.IF_ICMPLE, Opcodes.IF_ACMPEQ, Opcodes.IF_ACMPNE,
+                        Opcodes.IFNULL, Opcodes.IFNONNULL -> true;
+                default -> false;
+            };
         }
 
         /** §2.3 tag for an int-category descriptor, or -1 when the descriptor is not one. */

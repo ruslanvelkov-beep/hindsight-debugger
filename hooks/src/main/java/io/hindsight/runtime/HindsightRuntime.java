@@ -412,7 +412,7 @@ public final class HindsightRuntime {
 
     private static void writeManifest(Path dir, RuntimeConfig cfg, long startEpochMillis) throws IOException {
         final Properties p = new Properties();
-        p.setProperty("schema", "2");
+        p.setProperty("schema", "3");
         final Package pkg = HindsightRuntime.class.getPackage();
         final String version = pkg == null ? null : pkg.getImplementationVersion();
         p.setProperty("recorder", version != null ? version : "0.0.1-SNAPSHOT");
