@@ -29,7 +29,7 @@ final class LayoutTest {
     @Test
     void rightHeightsSumToAvailableAndFavourLocals() {
         int[] h = Layout.rightHeights(22);
-        assertEquals(22, h[0] + h[1] + h[2] + h[3] + h[4]);
+        assertEquals(22, h[0] + h[1] + h[2] + h[3]);
         assertEquals(7, h[2]); // 6 by weight + the rounding remainder went to Locals
         for (int v : h) {
             assertTrue(v >= 3, "each window >= 3 rows");
@@ -39,12 +39,11 @@ final class LayoutTest {
     @Test
     void rightHeightsScaleProportionally() {
         int[] h = Layout.rightHeights(42);
-        assertEquals(42, h[0] + h[1] + h[2] + h[3] + h[4]);
-        assertEquals(6, h[0]);
+        assertEquals(42, h[0] + h[1] + h[2] + h[3]);
+        assertEquals(10, h[0]);
         assertEquals(10, h[1]);
         assertEquals(12, h[2]);
-        assertEquals(8, h[3]);
-        assertEquals(6, h[4]);
+        assertEquals(10, h[3]);
     }
 
     @Test
@@ -52,7 +51,7 @@ final class LayoutTest {
         Layout layout = Layout.compute(80, 24);
         assertEquals(new Layout.Rect(0, 0, 46, 22), layout.source());
         List<Layout.Rect> r = layout.right();
-        assertEquals(5, r.size());
+        assertEquals(4, r.size());
         int y = 0;
         for (Layout.Rect rect : r) {
             assertEquals(46, rect.col());

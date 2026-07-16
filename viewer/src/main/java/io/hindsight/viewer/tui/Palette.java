@@ -10,10 +10,13 @@ import io.hindsight.viewer.highlight.JavaHighlighter;
  *
  * <p>Only the standard 16 ANSI colours are used (no RGB), so the scheme renders
  * identically on a plain xterm, an SSH session and a rich emulator — the viewer is
- * a terminal tool and must not assume truecolour. The choices favour readability of
- * code over decoration: comments dimmed, string/number/keyword each distinct, and
- * the two current-line backgrounds (exec vs. merely-selected frame) chosen to keep
- * foreground syntax legible on top.
+ * a terminal tool and must not assume truecolour. The one deliberate exception
+ * (VIEWER.md §12.3) is {@link #FRAME_LINE_BG}, which uses xterm-256 indexed 236: no
+ * ANSI-16 background is both darker than every syntax foreground and still visible
+ * against the default background, and 256-colour support is ubiquitous. The choices
+ * favour readability of code over decoration: comments dimmed, string/number/keyword
+ * each distinct, and the two current-line backgrounds (exec vs. merely-selected
+ * frame) chosen to keep foreground syntax legible on top.
  */
 public final class Palette {
 
@@ -35,8 +38,12 @@ public final class Palette {
     /** Background of the exec (innermost) current line — the brightest highlight (§6.1). */
     public static final TextColor EXEC_LINE_BG = TextColor.ANSI.BLUE;
 
-    /** Background of a selected outer frame's call-site line — a dimmer highlight (§6.1). */
-    public static final TextColor FRAME_LINE_BG = TextColor.ANSI.BLACK_BRIGHT;
+    /**
+     * Background of a selected outer frame's call-site line (also the §11.8 browse-mode marker) —
+     * a dim highlight, dark enough that every syntax foreground stays readable on it (§12.3).
+     * Indexed 236 = {@code #303030}, the palette's one step outside ANSI-16.
+     */
+    public static final TextColor FRAME_LINE_BG = new TextColor.Indexed(236);
 
     /** Background of the selected row in a list/tree window. */
     public static final TextColor SELECTION_BG = TextColor.ANSI.CYAN;

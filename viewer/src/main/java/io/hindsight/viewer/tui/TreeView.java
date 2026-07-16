@@ -9,9 +9,9 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * The interactive object-tree model shared by the Locals and Watches windows
- * (VIEWER.md §6.4/§6.5): a forest of lazily-expanded {@link ObjectNode} roots with
- * per-node expand/collapse state, a selection cursor, and a vertical scroll offset.
+ * The interactive object-tree model behind the Locals window (VIEWER.md §6.4): a
+ * forest of lazily-expanded {@link ObjectNode} roots with per-node expand/collapse
+ * state, a selection cursor, and a vertical scroll offset.
  *
  * <p>Children are never stored — they are re-fetched from a {@link ChildSource}
  * (the engine, in production) every time the visible list is (re)computed, so the
@@ -66,7 +66,7 @@ public final class TreeView {
         this.roots = List.copyOf(newRoots);
     }
 
-    /** Drops all expansion state (used when the Watches list is edited so paths cannot alias). */
+    /** Drops all expansion state (for when the root list is replaced so paths cannot alias). */
     public void clearExpansion() {
         expanded.clear();
         selection = 0;
@@ -170,7 +170,7 @@ public final class TreeView {
         }
     }
 
-    /** The root index (top-level watch/local) that the current selection belongs to, or -1. */
+    /** The root index (top-level entry) that the current selection belongs to, or -1. */
     public int selectedRootIndex() {
         List<Row> all = rows();
         if (all.isEmpty()) {

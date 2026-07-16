@@ -19,8 +19,6 @@ import io.hindsight.viewer.engine.Local;
 import io.hindsight.viewer.engine.ObjectNode;
 import io.hindsight.viewer.engine.RecordInfo;
 import io.hindsight.viewer.engine.StepResult;
-import io.hindsight.viewer.engine.Value;
-import io.hindsight.viewer.engine.WatchResult;
 import io.hindsight.viewer.highlight.JavaHighlighter;
 import io.hindsight.viewer.source.SourcePath;
 import java.io.IOException;
@@ -37,11 +35,11 @@ import java.util.OptionalInt;
 import java.util.regex.PatternSyntaxException;
 
 /**
- * The lanterna terminal UI (VIEWER.md §5–§11): the one class that touches a
+ * The lanterna terminal UI (VIEWER.md §5–§12): the one class that touches a
  * terminal. It owns the {@link Screen}, drives the render/read/dispatch loop, keeps
- * all per-window view state (scroll offsets, selections, expansion, the Watches
- * editor, the browse-mode source target, the navigation history trail and the
- * search dialogs), and translates key strokes into {@link Engine} navigation,
+ * all per-window view state (scroll offsets, selections, expansion, the browse-mode
+ * source target, the navigation history trail, the search dialogs and the quit
+ * confirmation), and translates key strokes into {@link Engine} navigation,
  * refreshing the whole model from the engine after every move.
  *
  * <p>Design notes tying back to the spec:
@@ -77,9 +75,9 @@ public final class ViewerApp {
     private static final long SEEK_CAP = 5_000_000L;
     private static final String DOT = " · ";
 
-    /** The six focusable windows, in Tab-cycle order (VIEWER.md §5, §11.3/§11.5). */
+    /** The five focusable windows, in Tab-cycle order (VIEWER.md §5, §11.3/§11.5, §12.1). */
     private enum Win {
-        SOURCE, THREADS, STACK, LOCALS, WATCHES, RECORDS
+        SOURCE, THREADS, STACK, LOCALS, RECORDS
     }
 
     /** Which modal dialog is open (§9, §11.7 regex method browse, §11.8 open file). */
@@ -109,8 +107,6 @@ public final class ViewerApp {
     private final List<Integer> tids;
 
     private final TreeView localsTree;
-    private final TreeView watchesTree;
-    private final List<String> watches = new ArrayList<>();
     private final Map<String, List<List<JavaHighlighter.Span>>> highlightCache = new HashMap<>();
     private final HistoryTrail history = new HistoryTrail();
 
@@ -118,6 +114,7 @@ public final class ViewerApp {
     private boolean running = true;
     private String status = "";
     private boolean helpOverlay;
+    private boolean quitConfirm;
     private SearchDialog dialog;
     private TerminalPosition cursorPos;
 
@@ -150,16 +147,10 @@ public final class ViewerApp {
     private int stackViewH = 1;
     private int localsHcol;
     private int localsViewH = 1;
-    private int watchesHcol;
-    private int watchesViewH = 1;
     private int recordsSel;
     private int recordsScroll;
     private int recordsHcol;
     private int recordsViewH = 1;
-
-    // Watches inline editor.
-    private boolean watchEditing;
-    private final StringBuilder watchBuffer = new StringBuilder();
 
     /**
      * Wires the UI to its backing engine/recording/source-path and applies the initial thread.
@@ -182,7 +173,6 @@ public final class ViewerApp {
         this.sourcePath = sourcePath;
         this.tids = engine.threads();
         this.localsTree = new TreeView(engine::children);
-        this.watchesTree = new TreeView(engine::children);
         if (initialTid.isPresent()) {
             StepResult r = engine.selectThread(initialTid.getAsInt());
             if (!r.moved()) {
@@ -239,8 +229,7 @@ public final class ViewerApp {
         renderThreads(g, r.get(0));
         renderStack(g, r.get(1));
         renderLocals(g, r.get(2));
-        renderWatches(g, r.get(3));
-        renderRecords(g, r.get(4));
+        renderRecords(g, r.get(3));
         renderStatus(g, cols, layout.statusRow(), ri);
         renderHelp(g, cols, layout.helpRow());
         if (helpOverlay) {
@@ -248,6 +237,9 @@ public final class ViewerApp {
         }
         if (dialog != null) {
             drawDialog(g, cols, rows);
+        }
+        if (quitConfirm) {
+            drawQuitConfirm(g, cols, rows);
         }
         screen.setCursorPosition(cursorPos);
     }
@@ -463,42 +455,6 @@ public final class ViewerApp {
         drawTree(g, ix, iy, iw, ih, localsTree, localsHcol);
     }
 
-    private void renderWatches(final TextGraphics g, final Layout.Rect rect) {
-        boolean focused = focus == Win.WATCHES;
-        drawBox(g, rect, "Watches [w]", Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
-        int ix = rect.col() + 1;
-        int iy = rect.row() + 1;
-        int iw = rect.width() - 2;
-        int ih = rect.height() - 2;
-        if (iw <= 0 || ih <= 0) {
-            return;
-        }
-        List<ObjectNode> roots = new ArrayList<>();
-        for (String expr : watches) {
-            WatchResult wr = engine.resolveWatch(expr);
-            if (wr.error() != null) {
-                roots.add(new ObjectNode(expr + " = <" + wr.error() + ">", new Value.Absent(), false));
-            } else {
-                ObjectNode rr = wr.root();
-                roots.add(new ObjectNode(expr + " = " + rr.value().display(), rr.value(), rr.expandable()));
-            }
-        }
-        watchesTree.setRoots(roots);
-
-        int treeH = watchEditing ? ih - 1 : ih;
-        watchesViewH = Math.max(1, treeH);
-        if (watches.isEmpty() && !watchEditing) {
-            put(g, ix, iy, clip("(no watches — press a to add)", iw), Palette.DIM, Palette.BG, false);
-        } else if (treeH > 0) {
-            drawTree(g, ix, iy, iw, treeH, watchesTree, watchesHcol);
-        }
-        if (watchEditing) {
-            int ey = iy + ih - 1;
-            put(g, ix, ey, clipPad("+ " + watchBuffer, iw), Palette.SELECTION_FG, Palette.SELECTION_BG, false);
-            cursorPos = new TerminalPosition(Math.min(ix + iw - 1, ix + 2 + watchBuffer.length()), ey);
-        }
-    }
-
     private void renderRecords(final TextGraphics g, final Layout.Rect rect) {
         boolean focused = focus == Win.RECORDS;
         drawBox(g, rect, "Records [r]", Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
@@ -532,7 +488,7 @@ public final class ViewerApp {
 
     private void renderHelp(final TextGraphics g, final int cols, final int row) {
         String base = "F7 step  F8 over  ⇧/F9 F10 rev  e/E exit-frame  ^R run  o origin  "
-                + "/ calls  . obj  F file  c/s/t/l/w/r focus  q quit";
+                + "/ calls  . obj  F file  c/s/t/l/r focus  q quit";
         String ctx = switch (focus) {
             case SOURCE -> browseMode
                     ? "↑↓ scroll  <> hscroll  o return  g/G/Home/End"
@@ -540,7 +496,6 @@ public final class ViewerApp {
             case THREADS -> "↑↓ select  ↵ switch  ←→/<> hscroll";
             case STACK -> "↑↓ select frame  ←→/<> hscroll";
             case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  <> hscroll";
-            case WATCHES -> "a add  d del  ↑↓ move  →/← expand  <> hscroll";
             case RECORDS -> "↑↓ select  ↵ jump  ←→/<> hscroll";
         };
         put(g, 0, row, clipPad(ctx + "  |  " + base, cols), Palette.DIM, Palette.BG, false);
@@ -726,15 +681,14 @@ public final class ViewerApp {
             "e / E                 exit current frame: forward / backward",
             "Ctrl+R / Alt+R        run to current line: forward / backward",
             "o                     origin — return Source to the execution line",
-            "c t s l w r           focus Source Code/Threads/Stack/Locals/Watches/Records",
+            "c t s l r             focus Source Code/Threads/Stack/Locals/Records",
             "Tab / Shift+Tab       cycle focus forward / backward",
             "Arrows PgUp PgDn      navigate the focused window",
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
             "/  .  F               browse method calls / find object / open file",
-            "a / d  (Watches)      add / delete a watch",
             "?  F1                 toggle this help",
-            "q  Ctrl+C             quit",
+            "q  Ctrl+C             quit (q asks to confirm)",
             "",
             "press ? / F1 / Esc to close",
         };
@@ -756,27 +710,48 @@ public final class ViewerApp {
         }
     }
 
+    /** The small centered §12.4 quit-confirmation box drawn over everything else. */
+    private void drawQuitConfirm(final TextGraphics g, final int cols, final int rows) {
+        String msg = "Really quit the viewer?";
+        String hint = "y / ↵ quit    any other key stays";
+        int w = Math.min(cols - 2, Math.max(msg.length(), hint.length()) + 6);
+        int h = Math.min(rows - 2, 5);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), "Quit", Palette.DIALOG_BG, Palette.FOCUS, true);
+        put(g, x + 3, y + 1, clip(msg, w - 6), Palette.FG, Palette.DIALOG_BG, false);
+        put(g, x + 3, y + 3, clip(hint, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+    }
+
     // ---- key dispatch ----
 
     private void handleKey(final KeyStroke k) {
         try {
             TerminalSize sz = screen.getTerminalSize();
             if (sz.getColumns() < MIN_COLS || sz.getRows() < MIN_ROWS) {
-                if (isQuit(k)) {
+                // No room for the confirm box (§12.4) — quit immediately.
+                if (isCtrlC(k) || isChar(k, 'q')) {
                     running = false;
                 }
                 return;
             }
-            if (watchEditing) {
-                handleWatchEditor(k);
+            if (quitConfirm) {
+                handleQuitConfirm(k);
                 return;
             }
             if (helpOverlay) {
                 KeyType t = k.getKeyType();
                 if (t == KeyType.F1 || t == KeyType.Escape || isChar(k, '?')) {
                     helpOverlay = false;
-                } else if (isQuit(k)) {
+                } else if (isCtrlC(k)) {
                     running = false;
+                } else if (isChar(k, 'q')) {
+                    helpOverlay = false;
+                    quitConfirm = true;
                 }
                 return;
             }
@@ -784,8 +759,12 @@ public final class ViewerApp {
                 handleDialog(k);
                 return;
             }
-            if (isQuit(k)) {
+            if (isCtrlC(k)) {
                 running = false;
+                return;
+            }
+            if (isChar(k, 'q')) {
+                quitConfirm = true;
                 return;
             }
             if (handleGlobal(k)) {
@@ -795,6 +774,16 @@ public final class ViewerApp {
         } catch (RuntimeException e) {
             status = "error: " + describe(e);
         }
+    }
+
+    /** One key while the §12.4 confirm box is open: y/Y/Enter quits, anything else cancels. */
+    private void handleQuitConfirm(final KeyStroke k) {
+        if (isChar(k, 'y') || isChar(k, 'Y') || k.getKeyType() == KeyType.Enter) {
+            running = false;
+            return;
+        }
+        quitConfirm = false;
+        status = "quit cancelled";
     }
 
     /** Handles keys that work regardless of focus (§7, §11); returns whether the key was consumed. */
@@ -901,16 +890,12 @@ public final class ViewerApp {
                         focus = Win.LOCALS;
                         return true;
                     }
-                    case 'w' -> {
-                        focus = Win.WATCHES;
-                        return true;
-                    }
                     case 'r' -> {
                         focus = Win.RECORDS;
                         return true;
                     }
                     default -> {
-                        // not a focus letter; navigation may still want it (g/G/a/d)
+                        // not a focus letter; navigation may still want it (g/G)
                     }
                 }
             }
@@ -924,7 +909,6 @@ public final class ViewerApp {
             case THREADS -> navThreads(k);
             case STACK -> navStack(k);
             case LOCALS -> navTree(k, localsTree, localsViewH);
-            case WATCHES -> navWatches(k);
             case RECORDS -> navRecords(k);
         }
     }
@@ -1056,25 +1040,6 @@ public final class ViewerApp {
         }
     }
 
-    private void navWatches(final KeyStroke k) {
-        if (isChar(k, 'a') || k.getKeyType() == KeyType.Insert) {
-            watchEditing = true;
-            watchBuffer.setLength(0);
-            return;
-        }
-        if (isChar(k, 'd') || k.getKeyType() == KeyType.Delete) {
-            int root = watchesTree.selectedRootIndex();
-            if (root >= 0 && root < watches.size()) {
-                String removed = watches.remove(root);
-                watchesTree.clearExpansion();
-                watchesHcol = 0;
-                status = "removed watch: " + removed;
-            }
-            return;
-        }
-        navTree(k, watchesTree, watchesViewH);
-    }
-
     private void navRecords(final KeyStroke k) {
         List<HistoryTrail.HistoryEntry> entries = history.entries();
         KeyType t = k.getKeyType();
@@ -1105,34 +1070,6 @@ public final class ViewerApp {
             if (r.moved()) {
                 afterMove();          // selecting from the list does NOT append (§11.5)
                 recordsSel = clamp(keep, 0, Math.max(0, history.size() - 1));
-            }
-        }
-    }
-
-    private void handleWatchEditor(final KeyStroke k) {
-        KeyType t = k.getKeyType();
-        if (t == KeyType.Escape) {
-            watchEditing = false;
-            watchBuffer.setLength(0);
-            status = "watch cancelled";
-        } else if (t == KeyType.Enter) {
-            String expr = watchBuffer.toString().trim();
-            watchEditing = false;
-            watchBuffer.setLength(0);
-            if (!expr.isEmpty()) {
-                watches.add(expr);
-                watchesTree.clearExpansion();
-                watchesHcol = 0;
-                status = "added watch: " + expr;
-            }
-        } else if (t == KeyType.Backspace) {
-            if (watchBuffer.length() > 0) {
-                watchBuffer.deleteCharAt(watchBuffer.length() - 1);
-            }
-        } else if (t == KeyType.Character) {
-            Character ch = k.getCharacter();
-            if (ch != null && ch >= ' ') {
-                watchBuffer.append(ch.charValue());
             }
         }
     }
@@ -1453,7 +1390,6 @@ public final class ViewerApp {
             case THREADS -> threadsHcol = Math.max(0, threadsHcol + delta);
             case STACK -> stackHcol = Math.max(0, stackHcol + delta);
             case LOCALS -> localsHcol = Math.max(0, localsHcol + delta);
-            case WATCHES -> watchesHcol = Math.max(0, watchesHcol + delta);
             case RECORDS -> recordsHcol = Math.max(0, recordsHcol + delta);
         }
     }
@@ -1466,8 +1402,9 @@ public final class ViewerApp {
 
     // ---- small helpers ----
 
-    private boolean isQuit(final KeyStroke k) {
-        return isChar(k, 'q') || (k.isCtrlDown() && isChar(k, 'c'));
+    /** Ctrl+C — the immediate (unconfirmed) quit, §12.4. */
+    private static boolean isCtrlC(final KeyStroke k) {
+        return k.isCtrlDown() && isChar(k, 'c');
     }
 
     private static boolean isChar(final KeyStroke k, final char c) {

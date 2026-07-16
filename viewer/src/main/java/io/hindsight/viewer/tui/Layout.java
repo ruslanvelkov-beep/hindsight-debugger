@@ -5,9 +5,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Geometry of the viewer's fixed screen layout (VIEWER.md §5): a left Source panel,
- * a right column of five stacked bordered windows, and two reserved bottom rows for
- * the status and help lines.
+ * Geometry of the viewer's fixed screen layout (VIEWER.md §5, §12.1/§12.2): a left
+ * Source panel, a right column of four stacked bordered windows, and two reserved
+ * bottom rows for the status and help lines.
  *
  * <p>The math is pulled out of the renderer into pure static functions
  * ({@link #sourceWidth(int)}, {@link #rightHeights(int)}) so the exact clamping and
@@ -17,16 +17,16 @@ import java.util.List;
  */
 public final class Layout {
 
-    /** Number of stacked windows in the right column (Threads, Stack, Locals, Watches, Record Info). */
-    public static final int RIGHT_WINDOWS = 5;
+    /** Number of stacked windows in the right column (Threads, Stack, Locals, Records — §12.1). */
+    public static final int RIGHT_WINDOWS = 4;
 
     /** Minimum width, in columns, the right column is guaranteed (§5). */
     public static final int MIN_RIGHT_WIDTH = 34;
 
-    /** Height weights of the five right windows before normalisation (§5). */
-    private static final int[] WEIGHTS = {3, 5, 6, 4, 3};
+    /** Height weights of the four right windows before normalisation (§12.2). */
+    private static final int[] WEIGHTS = {5, 5, 6, 5};
 
-    private static final int WEIGHT_TOTAL = 3 + 5 + 6 + 4 + 3;
+    private static final int WEIGHT_TOTAL = 5 + 5 + 6 + 5;
 
     /** Index of the Locals window, which absorbs the rounding remainder (§5). */
     private static final int LOCALS = 2;
@@ -84,13 +84,13 @@ public final class Layout {
     }
 
     /**
-     * Distributes {@code available} rows across the five right windows using the §5 weights,
+     * Distributes {@code available} rows across the four right windows using the §12.2 weights,
      * giving every window at least 3 rows (border included) and handing the rounding remainder
      * to Locals; if the flooring plus the 3-row minimum overshoots (only possible far below the
      * 24-row minimum), rows are trimmed from the tallest windows so the total always fits.
      *
      * @param available rows available to the right column (the screen height minus the 2 info rows)
-     * @return the five window heights, top-to-bottom, summing to {@code available}
+     * @return the four window heights, top-to-bottom, summing to {@code available}
      */
     public static int[] rightHeights(final int available) {
         int[] h = new int[RIGHT_WINDOWS];
@@ -125,7 +125,7 @@ public final class Layout {
         return source;
     }
 
-    /** The five right-column window rectangles, top-to-bottom. */
+    /** The four right-column window rectangles, top-to-bottom. */
     public List<Rect> right() {
         return right;
     }

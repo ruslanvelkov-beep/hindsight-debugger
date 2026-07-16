@@ -511,3 +511,39 @@ innermost on a move, exactly like the other navigation methods.
 The status row keeps the compact position and adds nothing. The help row base becomes (fitting
 the width, elide as needed):
 `F7 step  F8 over  ⇧/F9 F10 rev  e/E exit-frame  ^R run  o origin  / calls  . obj  F file  c/s/t/l/w/r focus  q quit`.
+
+## 12. v1.2 changes
+
+Authoritative over conflicting earlier text (§5, §6.1, §8, §11.4, §11.10). Everything not
+mentioned here is unchanged.
+
+### 12.1 Watches window removed
+The Watches window is removed from the TUI entirely: no watch list, no `w` focus letter, no
+`a`/`d` keys, no inline input mode (and therefore no "`<`/`>` suspended while editing" rule).
+The right column becomes **four** stacked windows, top to bottom: Threads, Stack, Locals,
+Records. `Engine.resolveWatch` stays as tested headless API (the engine is a library; only the
+UI surface is dropped).
+
+### 12.2 Right-column heights
+The §5 height weights change from `{3, 5, 6, 4, 3}` (Threads, Stack, Locals, Watches, Records)
+to `{5, 5, 6, 5}` (Threads, Stack, Locals, Records): the freed Watches weight goes to Threads
+and Records, which each grow from 3 to 5, while Stack and Locals keep their share. All other §5
+rules are unchanged (3-row minimum per window, Locals absorbs the rounding remainder, trimming
+from the tallest below the screen minimum).
+
+### 12.3 Darker selected-frame line highlight
+`FRAME_LINE_BG` (the current-line background of a selected **non-innermost** frame, also reused
+as the browse-mode line marker, §11.8) changes from ANSI bright-black — a light gray on which
+most syntax foregrounds (white, bright-black comments, yellow) became unreadable — to xterm-256
+indexed **236** (`#303030`): clearly darker than every syntax foreground yet still visible
+against the default background. This is the palette's single deliberate exception to the
+ANSI-16-only rule (256-colour support is ubiquitous; `EXEC_LINE_BG` stays ANSI blue).
+
+### 12.4 Quit confirmation
+`q` no longer quits immediately: it opens a small centered confirm box ("Really quit the
+viewer?"). `y`/`Y`/Enter quits; **any** other key cancels it (status `quit cancelled`). While
+the box is open all other dispatch is suspended. `Ctrl+C` remains an immediate quit (emergency
+exit), as does the terminal's EOF; on the too-small screen (§1) `q` also quits immediately —
+there is no room for the box. Inside the search dialogs `q` keeps typing into the query as
+before; from the help overlay `q` closes the overlay and opens the confirm box. The help texts
+say `q quit (y confirms)`.
