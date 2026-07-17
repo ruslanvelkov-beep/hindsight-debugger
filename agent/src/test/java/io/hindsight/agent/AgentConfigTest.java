@@ -19,7 +19,8 @@ class AgentConfigTest {
         final AgentConfig c = AgentConfig.parse(
                 "hooks=/tmp/hooks.jar,outDir=/tmp/rec,include=com.hedera.|com.swirlds.merkle.,"
                         + "callsOnly=com.swirlds.,exclude=com.hedera.internal.,"
-                        + "snapshotOpen=com.hedera.hapi.|com.hedera.pbj.,autostart=false,"
+                        + "snapshotOpen=com.hedera.hapi.|com.hedera.pbj.,"
+                        + "snapshotAlways=com.hedera.pbj.runtime.OneOf,autostart=false,"
                         + "trigger=com.hedera.node.App#main,maxString=64,snapshotEvery=0,snapshotDepth=3,"
                         + "recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true");
         assertEquals("/tmp/hooks.jar", c.hooksJar);
@@ -28,6 +29,7 @@ class AgentConfigTest {
         assertEquals(List.of("com.swirlds."), c.callsOnly);
         assertEquals(List.of("com.hedera.internal."), c.exclude);
         assertEquals(List.of("com.hedera.hapi.", "com.hedera.pbj."), c.snapshotOpen);
+        assertEquals(List.of("com.hedera.pbj.runtime.OneOf"), c.snapshotAlways);
         assertFalse(c.autostart);
         assertEquals("com.hedera.node.App", c.triggerClass);
         assertEquals("main", c.triggerMethod);
@@ -56,6 +58,7 @@ class AgentConfigTest {
         assertTrue(c.callsOnly.isEmpty());
         assertTrue(c.exclude.isEmpty());
         assertTrue(c.snapshotOpen.isEmpty(), "§10: snapshotOpen defaults to empty");
+        assertTrue(c.snapshotAlways.isEmpty(), "§10: snapshotAlways defaults to empty");
     }
 
     @Test

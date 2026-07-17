@@ -247,6 +247,18 @@ first-seen list — never recursive). Levels count *dumps*, not field hops: dept
 THAT one get first-seen only". `snapshotDepth=1` reproduces the pre-v1.3 depth-1
 containment.
 
+**Always-dump wrappers** (recorder ≥ v1.3): the `java.base` single-value wrappers —
+`AtomicInteger`/`AtomicLong`/`AtomicBoolean`/`AtomicReference` (read via their `final`
+`get()`) and `StringBuilder`/`StringBuffer` (read via `toString()`, `maxString`
+truncation) — are baseline-dumped at first sight at ANY nesting level (depth-exempt),
+and the trigger-2 refresh walk re-dumps them alongside containers (their state drifts
+invisibly the same way). Their payload is a FIELDS form with a single synthetic
+`value` field carrying the current content; no reflection is involved, so no module
+opens are needed. The `snapshotAlways` config key (§10) lists ADDITIONAL class-name
+prefixes exempted from the depth limit (dumped per the normal reflective/unfolding
+rules; not part of the refresh walk). Note `String` and boxed primitives need none of
+this — they are never object-registered and always travel by value (§2.4/§6).
+
 Payload shape by object kind — plain objects dump fields; `java.base` maps, sets,
 lists/collections and **all arrays** are UNFOLDED into their elements (§3 forms; arrays
 as ARRAY-form payloads with element values per §2.4, 64-entry cap, true length in
@@ -308,8 +320,8 @@ first business record). `autostart=true` bypasses the trigger.
 
 `RuntimeConfig` (plain fields, constructed by the agent, hooks-module class):
 `Path outDir; int maxString; int snapshotEvery; boolean snapshotFirstSeen;
-int snapshotDepth; int recordBufKB; int blobBufKB; long maxTotalMB; boolean autostart;
-int sweepMillis;`
+int snapshotDepth; String[] snapshotAlways; int recordBufKB; int blobBufKB;
+long maxTotalMB; boolean autostart; int sweepMillis;`
 
 ## 9. Runtime architecture requirements
 
@@ -351,6 +363,7 @@ list-valued keys use `|` between elements. Keys:
 | `snapshotEvery` | `8192` | §7 sampling refresh; `0` = off |
 | `snapshotFirstSeen` | `true` | §7 baseline snapshot of every object at first sight |
 | `snapshotDepth` | `2` | §7 nested-baseline depth; `1` = pre-v1.3 behaviour (must be ≥ 1) |
+| `snapshotAlways` | empty | prefixes always baseline-dumped at first sight regardless of `snapshotDepth` (§7 always-dump; the `java.base` wrappers are exempt unconditionally and need no entry) |
 | `lines` | `true` | emit LINE records at each source line (FULL scope) — §2.1 flow |
 | `branches` | `true` | emit BRANCH records at each conditional jump (FULL scope) — §2.1 condition values |
 | `recordBufKB` | `256` | per-thread record chunk |

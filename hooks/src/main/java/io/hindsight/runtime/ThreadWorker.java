@@ -317,8 +317,9 @@ public final class ThreadWorker {
             System.arraycopy(pendingFsLevels, 1, pendingFsLevels, 0, pendingFsCount);
             pendingFsObjects[pendingFsCount] = null;
             emitObjectFirstSeenAt(seq, id, obj);
-            if (rt.snapshotFirstSeen && level <= rt.snapshotDepth) {
+            if (rt.snapshotFirstSeen && (level <= rt.snapshotDepth || alwaysDump(obj))) {
                 // §7: baseline snapshot at first sight; later field writes evolve it.
+                // Always-dump wrappers and snapshotAlways-matched classes are depth-exempt.
                 enqueuePendingDump(id, obj, level);
             }
         }
@@ -566,6 +567,10 @@ public final class ThreadWorker {
         if (o instanceof Enum<?>) {
             return;
         }
+        if (isJavaBaseWrapper(o)) {
+            emitWrapperSnapshot(o, id, cls);
+            return;
+        }
         if (cls.isArray()) {
             emitUnfoldedSnapshot(o, id, cls, Wire.SNAPSHOT_FORM_ARRAY);
         } else if (o instanceof java.util.Map && isJavaBase(cls)) {
@@ -590,20 +595,59 @@ public final class ThreadWorker {
     }
 
     /**
+     * The §7 always-dump {@code java.base} single-value wrappers: the core Atomic cells and the
+     * mutable string builders. Their state drifts invisibly (uninstrumented {@code java.base}
+     * mutation, exactly like containers), their dump is a single bounded value, and their
+     * accessors are {@code final} — safe to call from a hook even for app-defined subclasses.
+     */
+    private static boolean isJavaBaseWrapper(Object v) {
+        return v instanceof java.util.concurrent.atomic.AtomicInteger
+                || v instanceof java.util.concurrent.atomic.AtomicLong
+                || v instanceof java.util.concurrent.atomic.AtomicBoolean
+                || v instanceof java.util.concurrent.atomic.AtomicReference
+                || v instanceof StringBuilder
+                || v instanceof StringBuffer;
+    }
+
+    /**
+     * Whether {@code o} is baseline-dumped regardless of its §7 discovery level: the
+     * {@code java.base} wrappers unconditionally, plus any class matching a configured
+     * {@code snapshotAlways} prefix (small value carriers like PBJ's {@code OneOf} that appear
+     * arbitrarily deep). Called only on the cold first-sight path.
+     */
+    private boolean alwaysDump(Object o) {
+        if (isJavaBaseWrapper(o)) {
+            return true;
+        }
+        final String[] prefixes = rt.snapshotAlways;
+        if (prefixes.length == 0) {
+            return false;
+        }
+        final String name = o.getClass().getName();
+        for (final String p : prefixes) {
+            if (name.startsWith(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * §7 trigger 2, container refresh (recorder ≥ v1.3): after a sampling-refresh dump of a
      * FIELDS-form object, re-dump the <em>current</em> contents of up to
-     * {@link Wire#SNAPSHOT_MAX_CONTAINER_REDUMPS} of its direct container-valued fields
-     * ({@code java.base} maps/sets/lists and arrays) — even when those containers are already
-     * registered. Container mutations run inside uninstrumented {@code java.base} code, so
-     * without this checkpoint a long-lived collection's contents drift invisibly between its
-     * first-sight baseline and the end of the recording. Each re-dump is an ordinary SNAPSHOT
-     * record for the container's id, executed at level 2: objects newly discovered inside it
-     * get FIRST_SEEN always and a dump of their own only when {@code 2 < snapshotDepth}.
-     * Called only from the refresh path with {@code dumpLevel} 1; objects that themselves
-     * unfold are skipped — their refresh dump already IS their contents.
+     * {@link Wire#SNAPSHOT_MAX_CONTAINER_REDUMPS} of its direct container- or wrapper-valued
+     * fields ({@code java.base} maps/sets/lists, arrays, and the {@link #isJavaBaseWrapper
+     * always-dump wrappers}) — even when those objects are already registered. Their mutations
+     * run inside uninstrumented {@code java.base} code, so without this checkpoint a long-lived
+     * collection's contents (or an Atomic cell's value) drift invisibly between the first-sight
+     * baseline and the end of the recording. Each re-dump is an ordinary SNAPSHOT record for
+     * the field value's id, executed at level 2: objects newly discovered inside it get
+     * FIRST_SEEN always and a dump of their own only when {@code 2 < snapshotDepth}. Called
+     * only from the refresh path with {@code dumpLevel} 1; objects that themselves unfold or
+     * wrap are skipped — their refresh dump already IS their contents.
      */
     private void refreshContainerFields(Object o) {
-        if (o instanceof Enum<?> || isUnfoldedContainer(o)) {
+        if (o instanceof Enum<?> || isUnfoldedContainer(o) || isJavaBaseWrapper(o)) {
             return;
         }
         final Field[] plan = SNAPSHOT_PLANS.get(o.getClass());
@@ -621,7 +665,7 @@ public final class ThreadWorker {
             } catch (Throwable t) {
                 continue; // reflection failures silently skip (§7)
             }
-            if (v == null || !isUnfoldedContainer(v)) {
+            if (v == null || !(isUnfoldedContainer(v) || isJavaBaseWrapper(v))) {
                 continue;
             }
             redumps++;
@@ -638,6 +682,51 @@ public final class ThreadWorker {
                 dumpLevel = outerLevel;
             }
         }
+    }
+
+    /**
+     * §7 always-dump wrapper payload: a FIELDS payload with a single synthetic {@code value}
+     * field carrying the wrapper's current content — Atomic cells via their {@code final}
+     * {@code get()}, StringBuilder/StringBuffer via {@code toString()} (§2.4 string rules,
+     * {@code maxString} truncation). No reflection is involved, so no module opens are needed
+     * and the dump works on any launch configuration.
+     */
+    private void emitWrapperSnapshot(Object o, long id, Class<?> cls) {
+        try {
+            if (o instanceof java.util.concurrent.atomic.AtomicInteger a) {
+                encInline(Wire.TAG_INT, a.get());
+            } else if (o instanceof java.util.concurrent.atomic.AtomicLong a) {
+                encInline(Wire.TAG_LONG, a.get());
+            } else if (o instanceof java.util.concurrent.atomic.AtomicBoolean a) {
+                encInline(Wire.TAG_BOOLEAN, a.get() ? 1 : 0);
+            } else if (o instanceof java.util.concurrent.atomic.AtomicReference<?> a) {
+                encodeRef(a.get()); // nested ref registers per the normal §7 level rules
+            } else {
+                encodeString(o.toString()); // builders: the current text
+            }
+        } catch (Throwable t) {
+            return; // a racing mutation garbled the read: no payload beats a wrong one
+        }
+        final ByteBuffer payload = ByteBuffer.allocate(21).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, cls.getName()));
+        payload.put((byte) Wire.SNAPSHOT_FORM_FIELDS);
+        payload.putShort((short) 1);
+        payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.FIELDNAME, "value"));
+        payload.put((byte) encTag);
+        payload.put((byte) encKind);
+        payload.putLong(encSlot);
+        final long offset = writeBlobEntry(Wire.BLOB_KIND_SNAPSHOT, payload.array(), payload.position());
+        if (offset >= 0) {
+            emit(Wire.TYPE_SNAPSHOT, Wire.KIND_BLOB << Wire.AFTER_KIND_SHIFT, 0, 0, 0, id, 0, offset);
+        }
+    }
+
+    /** Sets the {@code enc*} scratch to an INLINE primitive slot (§2.4 rule 1). */
+    private void encInline(int tag, long slot) {
+        encKind = Wire.KIND_INLINE;
+        encTag = tag;
+        encSlot = slot;
+        encExtraFlags = 0;
     }
 
     /** Unfolded §3 payload (forms MAP/SET/LIST/ARRAY): totalSize, then up to 64 elements. */

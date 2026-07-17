@@ -83,6 +83,7 @@ public final class HindsightAgent {
         runtimeConfig.snapshotEvery = config.snapshotEvery;
         runtimeConfig.snapshotFirstSeen = config.snapshotFirstSeen;
         runtimeConfig.snapshotDepth = config.snapshotDepth;
+        runtimeConfig.snapshotAlways = config.snapshotAlways.toArray(new String[0]);
         runtimeConfig.recordBufKB = config.recordBufKB;
         runtimeConfig.blobBufKB = config.blobBufKB;
         runtimeConfig.maxTotalMB = config.maxTotalMB;

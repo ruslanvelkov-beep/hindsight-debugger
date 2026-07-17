@@ -84,6 +84,13 @@ public final class AgentConfig {
      */
     public final List<String> snapshotOpen;
 
+    /**
+     * Binary-name prefixes always baseline-dumped at first sight regardless of
+     * {@code snapshotDepth} (§7/§10 {@code snapshotAlways}) — small value carriers (PBJ's
+     * {@code OneOf}) that appear arbitrarily deep in object graphs.
+     */
+    public final List<String> snapshotAlways;
+
     /** Start recording at premain; defaults false when a trigger is configured. */
     public final boolean autostart;
 
@@ -133,6 +140,7 @@ public final class AgentConfig {
             List<String> callsOnly,
             List<String> exclude,
             List<String> snapshotOpen,
+            List<String> snapshotAlways,
             boolean autostart,
             String triggerClass,
             String triggerMethod,
@@ -153,6 +161,7 @@ public final class AgentConfig {
         this.callsOnly = callsOnly;
         this.exclude = exclude;
         this.snapshotOpen = snapshotOpen;
+        this.snapshotAlways = snapshotAlways;
         this.autostart = autostart;
         this.triggerClass = triggerClass;
         this.triggerMethod = triggerMethod;
@@ -209,6 +218,7 @@ public final class AgentConfig {
         final List<String> callsOnly = parseList(pairs.remove("callsOnly"), "callsOnly");
         final List<String> exclude = parseList(pairs.remove("exclude"), "exclude");
         final List<String> snapshotOpen = parseList(pairs.remove("snapshotOpen"), "snapshotOpen");
+        final List<String> snapshotAlways = parseList(pairs.remove("snapshotAlways"), "snapshotAlways");
 
         final String trigger = pairs.remove("trigger");
         String triggerClass = null;
@@ -249,6 +259,7 @@ public final class AgentConfig {
                 callsOnly,
                 exclude,
                 snapshotOpen,
+                snapshotAlways,
                 autostart,
                 triggerClass,
                 triggerMethod,
@@ -303,6 +314,7 @@ public final class AgentConfig {
                 + ", callsOnly=" + callsOnly
                 + ", exclude=" + exclude
                 + ", snapshotOpen=" + snapshotOpen
+                + ", snapshotAlways=" + snapshotAlways
                 + ", autostart=" + autostart
                 + ", trigger=" + (triggerClass == null ? "none" : triggerClass + "#" + triggerMethod)
                 + ", maxString=" + maxString

@@ -46,6 +46,10 @@ EXCLUDE='com.hedera.node.app.metrics.|com.hedera.node.app.blocks.impl.streaming.
 # instrumenting them would drown the recording, but their packages must be OPEN to the
 # hooks module or their reflective snapshots silently come out empty (FORMAT.md §10).
 SNAPSHOT_OPEN='com.hedera.hapi.|com.hedera.pbj.'
+# OneOf cells hold the actual values of PBJ oneofs (e.g. an AccountID's account number)
+# and appear arbitrarily deep — always dump them regardless of snapshotDepth. Atomics and
+# StringBuilder/StringBuffer are always-dumped unconditionally (FORMAT.md §7).
+SNAPSHOT_ALWAYS='com.hedera.pbj.runtime.OneOf'
 TRIGGER='com.hedera.node.app.workflows.ingest.IngestWorkflowImpl#submitTransaction'
 
 # Size the recording cap from actual free disk (leave 20 GiB headroom, cap at 100 GiB):
@@ -61,7 +65,7 @@ MAX_TOTAL_MB=$(( FREE_MB - 20480 ))
 # containers) get their own baseline dump, one level further so PBJ wrapper cells are
 # readable too — Account(L1) -> AccountID(L2) -> OneOf holding the account number (L3)
 # (FORMAT.md §7).
-AGENT_OPTS="hooks=$HOOKS_JAR,outDir=$OUT_DIR,include=$INCLUDE,callsOnly=$CALLS_ONLY,exclude=$EXCLUDE,snapshotOpen=$SNAPSHOT_OPEN,trigger=$TRIGGER,maxString=512,snapshotEvery=256,snapshotDepth=3,maxTotalMB=$MAX_TOTAL_MB,debug=true"
+AGENT_OPTS="hooks=$HOOKS_JAR,outDir=$OUT_DIR,include=$INCLUDE,callsOnly=$CALLS_ONLY,exclude=$EXCLUDE,snapshotOpen=$SNAPSHOT_OPEN,snapshotAlways=$SNAPSHOT_ALWAYS,trigger=$TRIGGER,maxString=512,snapshotEvery=256,snapshotDepth=3,maxTotalMB=$MAX_TOTAL_MB,debug=true"
 
 echo "==> Writing node0 jvmargs seam file"
 mkdir -p "$TEST_CLIENTS_DIR/build/hindsight"
