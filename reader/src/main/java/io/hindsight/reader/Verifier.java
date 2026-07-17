@@ -21,7 +21,8 @@ import java.util.Map;
  *       and local records; symbol ids for OBJECT_FIRST_SEEN / THREAD_START;
  *       plus the ids a site row itself references);</li>
  *   <li>every blob offset lands on a {@code 0xB5} magic with a sane length —
- *       including SNAPSHOT payload structure and its nested UTF8 offsets;</li>
+ *       including SNAPSHOT payload structure and its nested UTF8 offsets, and
+ *       (schema 4) STACK payload bounds plus frame-symbol resolvability;</li>
  *   <li>{@code OBJECT_FIRST_SEEN} precedes, by seq, every reference to that
  *       object id (checked over the global merge);</li>
  *   <li>aux tags and flags within spec (known type, known tag, flags only on
@@ -104,6 +105,9 @@ final class Verifier {
         }
         if (r.type() == Format.SNAPSHOT && r.afterKind() != Format.KIND_BLOB) {
             violation(r, "SNAPSHOT record without AFTER_KIND=BLOB");
+        }
+        if (r.type() == Format.STACK_SNAPSHOT && r.afterKind() != Format.KIND_BLOB) {
+            violation(r, "STACK_SNAPSHOT record without AFTER_KIND=BLOB");
         }
     }
 
@@ -191,6 +195,39 @@ final class Verifier {
                 return;
             }
             checkSnapshotPayload(r, entry.payload(), offset);
+        }
+        if (r.type() == Format.STACK_SNAPSHOT) {
+            if (entry.kind() != Format.BLOB_STACK) {
+                violation(r, "STACK_SNAPSHOT record points at blob kind " + entry.kind());
+                return;
+            }
+            checkStackPayload(r, entry.payload());
+        }
+    }
+
+    /**
+     * §12 schema-4 STACK payload checks: the frame count must fit within the payload bounds,
+     * and every frame's class/method/file symbol id must resolve ({@code fileSym} 0 = "no
+     * source file" is allowed).
+     */
+    private void checkStackPayload(final Rec r, final byte[] payload) {
+        final List<Recording.StackFrame> frames;
+        try {
+            frames = Recording.parseStack(payload);
+        } catch (IOException e) {
+            violation(r, e.getMessage());
+            return;
+        }
+        for (Recording.StackFrame f : frames) {
+            if (recording.symbol(f.classSym()) == null) {
+                violation(r, "stack frame references unknown class symbol " + f.classSym());
+            }
+            if (recording.symbol(f.methodSym()) == null) {
+                violation(r, "stack frame references unknown method symbol " + f.methodSym());
+            }
+            if (f.fileSym() != 0 && recording.symbol(f.fileSym()) == null) {
+                violation(r, "stack frame references unknown file symbol " + f.fileSym());
+            }
         }
     }
 

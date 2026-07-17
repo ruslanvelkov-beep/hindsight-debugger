@@ -22,7 +22,7 @@ class AgentConfigTest {
                         + "snapshotOpen=com.hedera.hapi.|com.hedera.pbj.,"
                         + "snapshotAlways=com.hedera.pbj.runtime.OneOf,autostart=false,"
                         + "trigger=com.hedera.node.App#main,maxString=64,snapshotEvery=0,snapshotDepth=3,"
-                        + "recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true");
+                        + "stackEvery=256,recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true");
         assertEquals("/tmp/hooks.jar", c.hooksJar);
         assertEquals("/tmp/rec", c.outDir);
         assertEquals(List.of("com.hedera.", "com.swirlds.merkle."), c.include);
@@ -36,6 +36,7 @@ class AgentConfigTest {
         assertEquals(64, c.maxString);
         assertEquals(0, c.snapshotEvery);
         assertEquals(3, c.snapshotDepth);
+        assertEquals(256, c.stackEvery);
         assertEquals(8, c.recordBufKB);
         assertEquals(4, c.blobBufKB);
         assertEquals(100L, c.maxTotalMB);
@@ -51,6 +52,7 @@ class AgentConfigTest {
         assertEquals(512, c.maxString);
         assertEquals(8192, c.snapshotEvery);
         assertEquals(2, c.snapshotDepth, "§10: snapshotDepth defaults to 2");
+        assertEquals(1024, c.stackEvery, "§10: stackEvery defaults to 1024");
         assertEquals(256, c.recordBufKB);
         assertEquals(128, c.blobBufKB);
         assertEquals(204_800L, c.maxTotalMB);
@@ -98,6 +100,10 @@ class AgentConfigTest {
                 () -> AgentConfig.parse("hooks=h.jar,include=a.,snapshotDepth=0"), "snapshotDepth must be >= 1");
         assertThrows(IllegalArgumentException.class,
                 () -> AgentConfig.parse("hooks=h.jar,include=a.,snapshotDepth=deep"));
+        assertThrows(IllegalArgumentException.class,
+                () -> AgentConfig.parse("hooks=h.jar,include=a.,stackEvery=-1"), "stackEvery must be >= 0");
+        assertThrows(IllegalArgumentException.class,
+                () -> AgentConfig.parse("hooks=h.jar,include=a.,stackEvery=often"));
     }
 
     @Test

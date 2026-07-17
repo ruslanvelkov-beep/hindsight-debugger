@@ -56,6 +56,22 @@ public final class ThreadWorker {
     private long xorshiftState;
     private long snapshotCountdown;
 
+    // ---- §2.1 STACK_SNAPSHOT cadence state (schema 4), mirroring the TIME_SYNC counter:
+    // ---- the hot path pays one predictable countdown branch per record, and a due capture
+    // ---- is deferred to the next record that a capture may legally follow.
+
+    /** Records until the next capture comes due; re-armed to {@link #stackInterval} per capture. */
+    private long stackCountdown;
+
+    /** {@code rt.stackEvery} when captures are on, else effectively-never. */
+    private long stackInterval;
+
+    /** A capture is due; flushed by the next safe record (see {@link #emitWithSeq}). */
+    private boolean stackDue;
+
+    /** Set while a capture is being emitted so the capture cannot re-trigger itself. */
+    private boolean inStackCapture;
+
     /**
      * Nesting level of the snapshot dump currently executing on this thread (§7): 0 = no dump
      * in progress, 1 = a triggering dump (first-sight baseline or sampling refresh), and a
@@ -83,6 +99,11 @@ public final class ThreadWorker {
         long seed = System.nanoTime() ^ (javaThreadId * 0x9E3779B97F4A7C15L);
         this.xorshiftState = seed == 0 ? 0x2545F4914F6CDD1DL : seed;
         rearmSnapshotCountdown();
+        // §2.1 schema 4: the first capture accompanies the thread's FIRST business record
+        // (the due flag is pre-set), then once every stackEvery records; 0 = never.
+        this.stackInterval = rt.stackEvery > 0 ? rt.stackEvery : Long.MAX_VALUE;
+        this.stackCountdown = stackInterval;
+        this.stackDue = rt.stackEvery > 0;
         // §2.1: THREAD_START is the first record of every thread file, then a TIME_SYNC.
         final int nameSym = rt.symbols.intern(RuntimeSymbols.Kind.THREAD, threadName);
         emit(Wire.TYPE_THREAD_START, Wire.KIND_INLINE << Wire.AFTER_KIND_SHIFT, Wire.TAG_LONG, 0,
@@ -97,6 +118,8 @@ public final class ThreadWorker {
         this.denied = true;
         this.suspended = true;
         this.stringMemo = null;
+        this.stackInterval = Long.MAX_VALUE;
+        this.stackCountdown = Long.MAX_VALUE;
     }
 
     /**
@@ -136,6 +159,12 @@ public final class ThreadWorker {
         for (int i = 0; i < argc && i < argScratchFlagsTag.length; i++) {
             emit(Wire.TYPE_ARG, argScratchFlagsTag[i] >>> 8, argScratchFlagsTag[i] & 0xFF, i,
                     siteId, 0, 0, argScratchSlots[i]);
+        }
+        // §2.1 schema 4: emitWithSeq defers a due capture past ENTER/ARG (their adjacency is
+        // sacred), so flush it here, right after the bracket — this is also what guarantees a
+        // capture alongside a thread whose FIRST business record is a METHOD_ENTER.
+        if (stackDue && !inStackCapture) {
+            flushStackSnapshot();
         }
     }
 
@@ -910,11 +939,31 @@ public final class ThreadWorker {
         if ((++recordCount % Wire.TIME_SYNC_INTERVAL) == 0) {
             timeSyncDue = true;
         }
+        if (--stackCountdown == 0) {
+            stackDue = true; // §2.1 schema 4; re-armed by the capture itself
+        }
         // Deferred past ENTER/ARG so a sync never splits §2.1's ENTER→ARG adjacency;
         // recursion depth is 1: the nested emit is itself a TIME_SYNC and cannot re-trigger.
         if (timeSyncDue && type != Wire.TYPE_METHOD_ENTER && type != Wire.TYPE_ARG && type != Wire.TYPE_TIME_SYNC) {
             timeSyncDue = false;
             emitTimeSync();
+        }
+        // §2.1 schema 4: a due capture is emitted right after the record it accompanies.
+        // Deferred past ENTER/ARG (adjacency; recordMethodEnter flushes after its bracket)
+        // and skipped on the prologue/bookkeeping types: THREAD_START (a capture there would
+        // predate any business record), TIME_SYNC and the capture record itself (recursion),
+        // and OBJECT_FIRST_SEEN — first-seen records can carry a pre-reserved seq, and a
+        // fresh-seq capture squeezed into that materialisation could regress per-thread seq
+        // order. The guarded flag keeps the capture machinery from re-triggering itself.
+        if (stackDue
+                && !inStackCapture
+                && type != Wire.TYPE_METHOD_ENTER
+                && type != Wire.TYPE_ARG
+                && type != Wire.TYPE_TIME_SYNC
+                && type != Wire.TYPE_THREAD_START
+                && type != Wire.TYPE_STACK_SNAPSHOT
+                && type != Wire.TYPE_OBJECT_FIRST_SEEN) {
+            flushStackSnapshot();
         }
     }
 
@@ -924,6 +973,67 @@ public final class ThreadWorker {
     private void emitTimeSync() {
         emit(Wire.TYPE_TIME_SYNC, Wire.KIND_INLINE << Wire.AFTER_KIND_SHIFT, Wire.TAG_LONG, 0,
                 0, 0, 0, System.currentTimeMillis());
+    }
+
+    /** Consumes the due flag, re-arms the §2.1 cadence countdown and emits one capture. */
+    private void flushStackSnapshot() {
+        stackDue = false;
+        stackCountdown = stackInterval;
+        emitStackSnapshot();
+    }
+
+    /**
+     * §2.1/§3 STACK_SNAPSHOT (schema 4): captures this thread's live Java stack, strips the
+     * leading recorder frames ({@code io.hindsight.*} plus the capture machinery itself) so
+     * the innermost remaining frame is (best effort) the instrumented method whose hook
+     * fired, and writes the frames innermost-first as a STACK blob entry referenced by a
+     * {@code 0x73} record ({@code location} 0, {@code target} 0, {@code after} = blob offset,
+     * AFTER_KIND=BLOB). Deep stacks are capped at {@link Wire#STACK_MAX_FRAMES} innermost
+     * frames. Any failure is swallowed: the payload is fully assembled before a single byte
+     * is committed, so a throw can never leave a malformed entry behind, and the app thread
+     * sees at most a one-time internal-error report.
+     */
+    private void emitStackSnapshot() {
+        inStackCapture = true;
+        try {
+            final StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+            int start = 0;
+            while (start < stack.length && isRecorderFrame(stack[start])) {
+                start++;
+            }
+            final int count = Math.min(stack.length - start, Wire.STACK_MAX_FRAMES);
+            final ByteBuffer payload =
+                    ByteBuffer.allocate(2 + count * Wire.STACK_FRAME_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+            payload.putShort((short) count);
+            for (int i = 0; i < count; i++) {
+                final StackTraceElement f = stack[start + i];
+                payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, f.getClassName()));
+                payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.METHODNAME, f.getMethodName()));
+                final String file = f.getFileName();
+                payload.putInt(file == null ? 0 : rt.symbols.intern(RuntimeSymbols.Kind.FILENAME, file));
+                final int line = f.getLineNumber();
+                payload.putInt(line < 0 ? -1 : line); // §3: -1/0 = unknown (native frames read -2)
+            }
+            final long offset = writeBlobEntry(Wire.BLOB_KIND_STACK, payload.array(), payload.position());
+            if (offset >= 0) {
+                emit(Wire.TYPE_STACK_SNAPSHOT, Wire.KIND_BLOB << Wire.AFTER_KIND_SHIFT, 0, 0, 0, 0, 0, offset);
+            }
+        } catch (Throwable t) {
+            HindsightRuntime.reportInternalError("stack-snapshot", t);
+        } finally {
+            inStackCapture = false;
+        }
+    }
+
+    /**
+     * §2.1: leading frames stripped from a capture — the recorder's own ({@code io.hindsight.*})
+     * and the capture machinery ({@code Thread.getStackTrace} itself). The strip stops at the
+     * first surviving frame, so application {@code Thread} frames deeper in the stack are kept.
+     */
+    private static boolean isRecorderFrame(StackTraceElement f) {
+        final String cls = f.getClassName();
+        return cls.startsWith("io.hindsight.")
+                || ("java.lang.Thread".equals(cls) && "getStackTrace".equals(f.getMethodName()));
     }
 
     /**

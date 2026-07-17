@@ -89,6 +89,8 @@ final class EndToEndRecordingTest {
     private void assertSemantics(final Recording rec, final String diag) throws IOException {
         long enters = 0;
         long snapshots = 0;
+        long stackSnapshots = 0;
+        long parsedCaptures = 0;
         long exceptionalExits = 0;
         boolean transferArgsSeen = false;
         boolean balanceWriteConsistent = false;
@@ -156,6 +158,13 @@ final class EndToEndRecordingTest {
                     }
                 }
                 case Format.SNAPSHOT -> snapshots++;
+                case Format.STACK_SNAPSHOT -> {
+                    stackSnapshots++;
+                    if (parsedCaptures < 5) { // spot-check a few payloads end-to-end
+                        rec.stackAt(r.tid(), r.after());
+                        parsedCaptures++;
+                    }
+                }
                 default -> {
                     // THREAD_START / TIME_SYNC / OBJECT_FIRST_SEEN — covered by verify
                 }
@@ -170,6 +179,10 @@ final class EndToEndRecordingTest {
         assertTrue(localWithName, "no LOCAL_WRITE with a resolvable variable name" + diag);
         assertTrue(exceptionalExits >= 1, "expected at least one EXCEPTIONAL exit" + diag);
         assertTrue(snapshots >= 1, "expected at least one SNAPSHOT (snapshotEvery=64)" + diag);
+        assertEquals(4, rec.schemaVersion(), "the recorder writes schema 4" + diag);
+        assertTrue(stackSnapshots >= 1,
+                "expected STACK_SNAPSHOT captures (stackEvery defaults to 1024)" + diag);
+        assertTrue(parsedCaptures >= 1, "expected at least one parsable capture payload" + diag);
         assertTrue(strings.stream().anyMatch(s -> s.contains("alice") || s.contains("carol")),
                 "expected account names among recorded strings, got " + strings + diag);
     }

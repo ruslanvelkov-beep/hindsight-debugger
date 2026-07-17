@@ -68,6 +68,22 @@ public final class Recording implements AutoCloseable {
      */
     public record Snapshot(int classSym, int form, long totalSize, List<SnapField> fields) {}
 
+    /**
+     * One raw frame of a §3 STACK payload (schema 4), symbol ids unresolved — the shape
+     * verification works on. {@code fileSym} 0 = unknown source file; {@code line} ≤ 0 =
+     * unknown line.
+     */
+    public record StackFrame(int classSym, int methodSym, int fileSym, int line) {}
+
+    /**
+     * One resolved frame of a §2.1 STACK_SNAPSHOT capture (schema 4). {@code classBinary} is
+     * the runtime class binary name and {@code methodName} the bare method name (either is
+     * {@code null} only when its symbol id is missing from a damaged recording);
+     * {@code fileName} is {@code null} when the frame carries no source file (fileSym 0);
+     * {@code line} ≤ 0 = unknown. Frames are consumed innermost-first, exactly as stored.
+     */
+    public record CapturedFrame(String classBinary, String methodName, String fileName, int line) {}
+
     private final Path dir;
     private final Properties manifest = new Properties();
     private final Map<Integer, Sym> symbols = new HashMap<>();
@@ -79,7 +95,7 @@ public final class Recording implements AutoCloseable {
     private Map<Long, Integer> objectClassByIdCache;
     private Map<Long, String> objectDisplayNameByIdCache;
     private Map<Long, Long> objectArrayLengthByIdCache;
-    private int schemaVersion = 3; // manifest-less directories get the current writer's schema
+    private int schemaVersion = 4; // manifest-less directories get the current writer's schema
 
     /** Per-thread file pair, mapped lazily so huge recordings open instantly. */
     private final class ThreadFiles {
@@ -155,7 +171,7 @@ public final class Recording implements AutoCloseable {
     /**
      * Opens a recording directory, refusing only an unknown schema version.
      *
-     * @throws IOException if the directory is unusable or declares a schema other than 1
+     * @throws IOException if the directory is unusable or declares a schema other than 1–4
      */
     public static Recording open(final Path dir) throws IOException {
         Recording r = new Recording(dir);
@@ -165,9 +181,10 @@ public final class Recording implements AutoCloseable {
                 case "1" -> r.schemaVersion = 1;
                 case "2" -> r.schemaVersion = 2;
                 case "3" -> r.schemaVersion = 3;
+                case "4" -> r.schemaVersion = 4;
                 default -> {
                     r.close();
-                    throw new IOException("unsupported schema version '" + schema + "' (reader supports 1-3)");
+                    throw new IOException("unsupported schema version '" + schema + "' (reader supports 1-4)");
                 }
             }
         }
@@ -394,7 +411,7 @@ public final class Recording implements AutoCloseable {
                     + offset + " in " + Format.blobFileName(tid));
         }
         int kind = seg.get(BYTE, offset + 1) & 0xFF;
-        if (kind != Format.BLOB_UTF8 && kind != Format.BLOB_SNAPSHOT) {
+        if (kind != Format.BLOB_UTF8 && kind != Format.BLOB_SNAPSHOT && kind != Format.BLOB_STACK) {
             throw new IOException("unknown blob kind " + kind + " at offset " + offset + " in "
                     + Format.blobFileName(tid));
         }
@@ -469,9 +486,61 @@ public final class Recording implements AutoCloseable {
         }
     }
 
-    /** The recording's declared schema version (§13); manifest-less directories read as 2. */
+    /** The recording's declared schema version (§13); manifest-less directories read as 4. */
     public int schemaVersion() {
         return schemaVersion;
+    }
+
+    // ---- stack captures (schema 4) ----
+
+    /**
+     * Reads and resolves the §3 STACK payload behind a {@code STACK_SNAPSHOT} record: pass the
+     * record's thread and its {@code after} slot (the blob offset, AFTER_KIND=BLOB). Frames
+     * come back innermost-first with symbols resolved per {@link CapturedFrame} — this is the
+     * accessor the viewer engine's §14.5 stack merge consumes.
+     *
+     * @throws IOException on any framing violation or if the entry is not a STACK blob
+     */
+    public List<CapturedFrame> stackAt(final int tid, final long offset) throws IOException {
+        BlobEntry e = blobAt(tid, offset);
+        if (e.kind() != Format.BLOB_STACK) {
+            throw new IOException("expected STACK blob at offset " + offset + " in "
+                    + Format.blobFileName(tid) + " but found kind " + e.kind());
+        }
+        List<StackFrame> raw = parseStack(e.payload());
+        List<CapturedFrame> frames = new ArrayList<>(raw.size());
+        for (StackFrame f : raw) {
+            frames.add(new CapturedFrame(
+                    symbolText(f.classSym()),
+                    symbolText(f.methodSym()),
+                    f.fileSym() == 0 ? null : symbolText(f.fileSym()),
+                    f.line()));
+        }
+        return List.copyOf(frames);
+    }
+
+    /**
+     * Decodes a raw §3 STACK payload (schema 4): a 2-byte frame count followed by
+     * {@link Format#STACK_FRAME_SIZE 16-byte} frame entries, innermost-first. Bounds-checked:
+     * a count pointing past the payload end is an {@link IOException}, never a crash — this
+     * is the check {@code verify} reports.
+     */
+    public static List<StackFrame> parseStack(final byte[] payload) throws IOException {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+        try {
+            int count = b.getShort() & 0xFFFF;
+            if (2L + (long) count * Format.STACK_FRAME_SIZE > payload.length) {
+                throw new IOException("stack payload declares " + count + " frames but holds only "
+                        + payload.length + " bytes");
+            }
+            List<StackFrame> frames = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                frames.add(new StackFrame(b.getInt(), b.getInt(), b.getInt(), b.getInt()));
+            }
+            return List.copyOf(frames);
+        } catch (java.nio.BufferUnderflowException e) {
+            throw new IOException("stack payload truncated (" + payload.length + " bytes)");
+        }
     }
 
     // ---- object identity ----

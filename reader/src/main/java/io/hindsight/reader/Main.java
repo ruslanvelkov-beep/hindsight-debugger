@@ -175,9 +175,42 @@ public final class Main {
             line.append("  ".repeat(printDepth));
             line.append(describe(rec, vr, r));
             out.println(line);
+            if (r.type() == Format.STACK_SNAPSHOT) {
+                printStackFrames(rec, r, printDepth, out);
+            }
             printed++;
         }
         return 0;
+    }
+
+    /**
+     * §12 schema 4: the {@code stack-snapshot (<n> frames)} header line is followed by one
+     * {@code at Class.method (File:line)} line per frame, innermost first, indented one step
+     * past the header's call-tree depth. A damaged payload prints nothing extra — the header
+     * (from {@link #describe}) already carries the diagnostic.
+     */
+    private static void printStackFrames(final Recording rec, final Rec r, final int printDepth,
+            final PrintStream out) {
+        final List<Recording.CapturedFrame> frames;
+        try {
+            frames = rec.stackAt(r.tid(), r.after());
+        } catch (IOException e) {
+            return;
+        }
+        String indent = "    " + "  ".repeat(printDepth + 1);
+        for (Recording.CapturedFrame f : frames) {
+            out.println(indent + "at " + renderFrame(f));
+        }
+    }
+
+    /** {@code Class.method (File:line)} — {@code (Unknown Source)} when the frame has no file. */
+    private static String renderFrame(final Recording.CapturedFrame f) {
+        String cls = f.classBinary() == null ? "?" : f.classBinary();
+        String method = f.methodName() == null ? "?" : f.methodName();
+        String where = f.fileName() == null
+                ? "Unknown Source"
+                : (f.line() > 0 ? f.fileName() + ":" + f.line() : f.fileName());
+        return cls + "." + method + " (" + where + ")";
     }
 
     private static boolean methodFilterMatches(final Recording rec, final Rec r, final String method) {
@@ -255,6 +288,13 @@ public final class Main {
             case Format.THREAD_START ->
                     "thread start \"" + orUnknown(rec.symbolText(r.location())) + "\" javaTid=" + r.after();
             case Format.TIME_SYNC -> "time-sync " + r.after();
+            case Format.STACK_SNAPSHOT -> {
+                try {
+                    yield "stack-snapshot (" + rec.stackAt(r.tid(), r.after()).size() + " frames)";
+                } catch (IOException e) {
+                    yield "stack-snapshot <bad payload: " + e.getMessage() + ">";
+                }
+            }
             default -> Format.typeName(r.type());
         };
     }

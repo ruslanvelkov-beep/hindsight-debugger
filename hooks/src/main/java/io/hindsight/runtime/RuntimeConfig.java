@@ -54,6 +54,13 @@ public final class RuntimeConfig {
      */
     public String[] snapshotAlways = new String[0];
 
+    /**
+     * §2.1 STACK_SNAPSHOT cadence (schema 4): capture the thread's live stack with each
+     * thread's first business record and every this-many records of that thread thereafter;
+     * {@code 0} = no captures at all.
+     */
+    public int stackEvery = 1024;
+
     /** Per-thread record chunk size in KiB (§9). */
     public int recordBufKB = 256;
 

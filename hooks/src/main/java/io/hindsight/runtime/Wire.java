@@ -29,6 +29,7 @@ public final class Wire {
     public static final byte TYPE_SNAPSHOT = 0x61;
     public static final byte TYPE_THREAD_START = 0x70;
     public static final byte TYPE_TIME_SYNC = 0x72;
+    public static final byte TYPE_STACK_SNAPSHOT = 0x73;
 
     // ---------- value kinds, 2 bits each in the flags byte (§2.2) ----------
 
@@ -72,7 +73,20 @@ public final class Wire {
     public static final int BLOB_MAGIC = 0xB5;
     public static final int BLOB_KIND_UTF8 = 1;
     public static final int BLOB_KIND_SNAPSHOT = 2;
+    public static final int BLOB_KIND_STACK = 3; // schema 4
     public static final int BLOB_HEADER_SIZE = 6; // magic(1) + kind(1) + len(4)
+
+    // ---------- STACK payload (§3, schema 4) ----------
+
+    /** Bytes of one STACK frame entry: classSym(4) + methodSym(4) + fileSym(4) + line(4). */
+    public static final int STACK_FRAME_SIZE = 16;
+
+    /**
+     * Deep stacks are capped at this many captured frames (innermost kept; anything beyond is
+     * dropped). The §3 count field could carry 65 535, but past a couple hundred frames the
+     * outer context is recursion noise, and the cap bounds a capture's blob cost to ~4 KiB.
+     */
+    public static final int STACK_MAX_FRAMES = 255;
 
     /** Max instance fields / elements / map entries captured by one snapshot payload (§3). */
     public static final int SNAPSHOT_MAX_FIELDS = 64;

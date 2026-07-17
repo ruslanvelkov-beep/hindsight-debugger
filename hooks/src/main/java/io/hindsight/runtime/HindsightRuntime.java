@@ -216,6 +216,7 @@ public final class HindsightRuntime {
         final boolean snapshotFirstSeen;
         final int snapshotDepth;
         final String[] snapshotAlways;
+        final int stackEvery;
 
         /** Global monotonic sequence, starts at 1 (§2); one getAndIncrement per record. */
         final AtomicLong seq = new AtomicLong(1);
@@ -236,6 +237,7 @@ public final class HindsightRuntime {
             this.snapshotFirstSeen = cfg.snapshotFirstSeen;
             this.snapshotDepth = Math.max(1, cfg.snapshotDepth); // §7/§10: must be ≥ 1
             this.snapshotAlways = cfg.snapshotAlways != null ? cfg.snapshotAlways.clone() : new String[0];
+            this.stackEvery = Math.max(0, cfg.stackEvery);
             this.dir = resolveRecordingDir(cfg.outDir.toAbsolutePath());
             writeManifest(dir, cfg, System.currentTimeMillis());
             this.symbols = new RuntimeSymbols(dir);
@@ -416,7 +418,7 @@ public final class HindsightRuntime {
 
     private static void writeManifest(Path dir, RuntimeConfig cfg, long startEpochMillis) throws IOException {
         final Properties p = new Properties();
-        p.setProperty("schema", "3");
+        p.setProperty("schema", "4");
         final Package pkg = HindsightRuntime.class.getPackage();
         final String version = pkg == null ? null : pkg.getImplementationVersion();
         p.setProperty("recorder", version != null ? version : "0.0.1-SNAPSHOT");
@@ -431,6 +433,7 @@ public final class HindsightRuntime {
                 + ",snapshotDepth=" + cfg.snapshotDepth
                 + ",snapshotAlways=" + String.join("|",
                         cfg.snapshotAlways != null ? cfg.snapshotAlways : new String[0])
+                + ",stackEvery=" + cfg.stackEvery
                 + ",recordBufKB=" + cfg.recordBufKB
                 + ",blobBufKB=" + cfg.blobBufKB
                 + ",maxTotalMB=" + cfg.maxTotalMB

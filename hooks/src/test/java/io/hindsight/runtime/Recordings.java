@@ -16,27 +16,32 @@ import java.util.Map;
  * Test-side parser for recording directories: reads {@code records-*.bin}, {@code blob-*.bin}
  * and {@code rt-symbols.tsv} strictly per FORMAT.md §2–§4 so the tests verify the bytes on
  * disk, not the writer's opinion of them.
+ *
+ * <p>Public (with public members) because the STACK_SNAPSHOT tests must live OUTSIDE
+ * {@code io.hindsight.*} — a capture strips leading recorder frames by that prefix, so a test
+ * asserting its own frames survive cannot share the package.
  */
-final class Recordings {
+public final class Recordings {
 
     private Recordings() {}
 
     /** One decoded 40-byte record (§2). */
-    record Rec(long seq, int type, int flags, int idx, int tag, int location, long target, long before, long after) {
+    public record Rec(
+            long seq, int type, int flags, int idx, int tag, int location, long target, long before, long after) {
 
-        int beforeKind() {
+        public int beforeKind() {
             return flags & Wire.BEFORE_KIND_MASK;
         }
 
-        int afterKind() {
+        public int afterKind() {
             return (flags & Wire.AFTER_KIND_MASK) >> Wire.AFTER_KIND_SHIFT;
         }
     }
 
     /** One decoded blob entry (§3). */
-    record Blob(int kind, byte[] payload) {}
+    public record Blob(int kind, byte[] payload) {}
 
-    static List<Path> recordFiles(Path dir) throws IOException {
+    public static List<Path> recordFiles(Path dir) throws IOException {
         final List<Path> files = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, "records-*.bin")) {
             for (final Path p : ds) {
@@ -47,7 +52,7 @@ final class Recordings {
         return files;
     }
 
-    static List<Rec> parse(Path recordsFile) throws IOException {
+    public static List<Rec> parse(Path recordsFile) throws IOException {
         final byte[] bytes = Files.readAllBytes(recordsFile);
         final ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
         final List<Rec> out = new ArrayList<>(bytes.length / Wire.RECORD_SIZE);
@@ -66,7 +71,7 @@ final class Recordings {
         return out;
     }
 
-    static List<Rec> parseAll(Path dir) throws IOException {
+    public static List<Rec> parseAll(Path dir) throws IOException {
         final List<Rec> all = new ArrayList<>();
         for (final Path f : recordFiles(dir)) {
             all.addAll(parse(f));
@@ -74,7 +79,7 @@ final class Recordings {
         return all;
     }
 
-    static Blob blobAt(Path blobFile, long offset) throws IOException {
+    public static Blob blobAt(Path blobFile, long offset) throws IOException {
         final byte[] bytes = Files.readAllBytes(blobFile);
         final ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
         buf.position(Math.toIntExact(offset));
@@ -91,7 +96,7 @@ final class Recordings {
     }
 
     /** {@code rt-symbols.tsv} as id → [kind, unescaped text] (§4). */
-    static Map<Integer, String[]> rtSymbols(Path dir) throws IOException {
+    public static Map<Integer, String[]> rtSymbols(Path dir) throws IOException {
         final Map<Integer, String[]> out = new HashMap<>();
         final Path file = dir.resolve("rt-symbols.tsv");
         if (!Files.exists(file)) {
@@ -127,10 +132,11 @@ final class Recordings {
     }
 
     /** A config pointing at {@code dir} with test-friendly (tiny-buffer) defaults. */
-    static RuntimeConfig config(Path dir) {
+    public static RuntimeConfig config(Path dir) {
         final RuntimeConfig cfg = new RuntimeConfig();
         cfg.outDir = dir;
         cfg.snapshotEvery = 0; // deterministic by default; snapshot tests opt in
+        cfg.stackEvery = 0; // deterministic by default; stack-capture tests opt in
         return cfg;
     }
 }

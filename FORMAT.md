@@ -2,7 +2,7 @@
 
 Single source of truth for the on-disk recording format, the runtime hook API, and the
 agent configuration grammar. Implementations in `hooks/`, `agent/`, and `reader/` MUST
-conform to this document exactly. Schema version: **3**.
+conform to this document exactly. Schema version: **4**.
 
 Scope: method enter/exit (+args, +return/throw), local-variable writes, field writes
 (before → after), object identity (+array length), bounded-depth shallow snapshots (with
@@ -10,9 +10,10 @@ container and array unfolding), string/boxed/enum values, source-line flow, and
 conditional-branch conditions. NOT captured: array element stores, monitor events,
 allocation events (first-seen records subsume them). Schema history: 1 = base; 2 =
 snapshot `form` byte + first-seen display names; 3 = LINE/BRANCH records + array length
-in first-seen. The reader accepts all three. Recorder ≥ v1.3 additionally emits nested
-baseline snapshots and container-refresh snapshots (§7) — a purely behavioural addition
-(more records of existing types), NOT a schema change.
+in first-seen; 4 = STACK_SNAPSHOT records (periodic live stack traces, §2.1/§3) with the
+STACK blob kind and the METHODNAME/FILENAME rt-symbol kinds. The reader accepts all
+four. Recorder ≥ v1.3 additionally emits nested baseline snapshots and container-refresh
+snapshots (§7) — a purely behavioural addition within schema 3.
 
 ## 1. Recording directory
 
@@ -65,6 +66,7 @@ Fixed 40-byte records, record `i` at byte offset `i × 40`. No file header.
 | `0x61` | `SNAPSHOT` | 0 | object id | — | — | blob offset of snapshot payload (`AFTER_KIND=BLOB`) |
 | `0x70` | `THREAD_START` | **rt-symbol id** of thread name | — | — | — | Java thread id (`Thread.getId()`) |
 | `0x72` | `TIME_SYNC` | 0 | — | — | — | `System.currentTimeMillis()` |
+| `0x73` | `STACK_SNAPSHOT` | 0 | — | — | — | blob offset of STACK payload (`AFTER_KIND=BLOB`) — schema 4 |
 
 Ordering rules:
 - Every `ARG` record for a call immediately follows its `METHOD_ENTER` in the same
@@ -73,6 +75,13 @@ Ordering rules:
   `seq` strictly lower than any record referencing that object id.
 - `THREAD_START` is the first record of every thread file, immediately followed by a
   `TIME_SYNC`. A further `TIME_SYNC` is emitted every 65 536 records of that thread.
+- `STACK_SNAPSHOT` (schema 4, `stackEvery > 0`): the thread's live Java stack at emission
+  time — captured alongside the thread's FIRST business record and thereafter once every
+  `stackEvery` records of that thread. Frames are innermost-first with the recorder's own
+  frames (`io.hindsight.*`, the capture machinery) stripped, so the innermost remaining
+  frame is (best effort) the instrumented method whose hook fired. Readers use the
+  nearest preceding capture as the approximate uninstrumented-caller context of later
+  records in the same thread; exactness is only guaranteed AT the capture record.
 - `METHOD_EXIT` with `EXCEPTIONAL` set means the frame unwound with a throwable. If a
   method's exit is missing at end-of-file, the frame was live at shutdown (reader must
   tolerate truncated tails).
@@ -123,12 +132,23 @@ Concatenated entries; a "blob offset" points at an entry's first byte. Entry:
 
 ```
 magic  : 1 byte  = 0xB5
-kind   : 1 byte  (1 = UTF8, 2 = SNAPSHOT)
+kind   : 1 byte  (1 = UTF8, 2 = SNAPSHOT, 3 = STACK — schema 4)
 len    : 4 bytes LE — payload length
 payload: len bytes
 ```
 
 `UTF8` payload: raw UTF-8 bytes (already truncated).
+
+`STACK` payload (schema 4 — a §2.1 `STACK_SNAPSHOT`'s live stack, innermost first):
+
+```
+count : 2 bytes — frames after stripping the recorder's own
+per frame:
+  classSym  : 4 bytes — rt-symbol id (kind RTCLASS, class binary name)
+  methodSym : 4 bytes — rt-symbol id (kind METHODNAME, bare method name)
+  fileSym   : 4 bytes — rt-symbol id (kind FILENAME, source file name; 0 if unknown)
+  line      : 4 bytes — signed source line (-1/0 if unknown)
+```
 
 `SNAPSHOT` payload (bounded shallow dump — one level per payload, §7 depth rules; schema 2):
 
@@ -177,7 +197,8 @@ UTF-8 text, one record per line: `id<TAB>kind<TAB>text`. Text has `\` → `\\`, 
   `com.hedera.node.app.workflows.ingest.IngestWorkflow`), `METHOD` (bare name), `FIELD`
   (bare name), `VAR` (bare name), `FILE` (source file name).
 - `rt-symbols.tsv` (runtime-side, ids = `0x4000_0000 | n`, n dense from 1): kinds
-  `THREAD`, `RTCLASS` (runtime class binary name), `FIELDNAME`.
+  `THREAD`, `RTCLASS` (runtime class binary name), `FIELDNAME`, and (schema 4)
+  `METHODNAME` / `FILENAME` for §3 STACK payload frames.
 
 Readers MUST treat the two id spaces as one map (they cannot collide).
 
@@ -320,8 +341,8 @@ first business record). `autostart=true` bypasses the trigger.
 
 `RuntimeConfig` (plain fields, constructed by the agent, hooks-module class):
 `Path outDir; int maxString; int snapshotEvery; boolean snapshotFirstSeen;
-int snapshotDepth; String[] snapshotAlways; int recordBufKB; int blobBufKB;
-long maxTotalMB; boolean autostart; int sweepMillis;`
+int snapshotDepth; String[] snapshotAlways; int stackEvery; int recordBufKB;
+int blobBufKB; long maxTotalMB; boolean autostart; int sweepMillis;`
 
 ## 9. Runtime architecture requirements
 
@@ -364,6 +385,7 @@ list-valued keys use `|` between elements. Keys:
 | `snapshotFirstSeen` | `true` | §7 baseline snapshot of every object at first sight |
 | `snapshotDepth` | `2` | §7 nested-baseline depth; `1` = pre-v1.3 behaviour (must be ≥ 1) |
 | `snapshotAlways` | empty | prefixes always baseline-dumped at first sight regardless of `snapshotDepth` (§7 always-dump; the `java.base` wrappers are exempt unconditionally and need no entry) |
+| `stackEvery` | `1024` | §2.1 STACK_SNAPSHOT cadence: capture the live stack with each thread's first business record and every N records thereafter; `0` = no captures at all (schema 4) |
 | `lines` | `true` | emit LINE records at each source line (FULL scope) — §2.1 flow |
 | `branches` | `true` | emit BRANCH records at each conditional jump (FULL scope) — §2.1 condition values |
 | `recordBufKB` | `256` | per-thread record chunk |
@@ -446,10 +468,15 @@ must be skipped: storing an uninitialized `this` is a verify error.)
     and flags within spec.
 - Value rendering: INLINE by tag (`true`/`'c'`/`3.14`), BLOB strings quoted (with `…`
   when TRUNCATED), object ids as `SimpleClassName#id`, `null`, `void`.
+- `STACK_SNAPSHOT` rendering (schema 4): one dump line `stack-snapshot (<n> frames)`
+  followed (in dump) by the frames as `at Class.method (File:line)`, innermost first.
+  `verify` additionally checks each STACK payload: count within payload bounds and every
+  frame's class/method/file symbol id resolvable (fileSym 0 allowed).
 
 ## 13. Versioning
 
-`manifest.properties` keys: `schema=3`, `recorder=<project version>`, `jvm`, `pid`,
+`manifest.properties` keys: `schema=4`, `recorder=<project version>`, `jvm`, `pid`,
 `startEpochMillis`, `args`. Readers refuse unknown major schema; this reader accepts
 1 (no snapshot `form` byte, no display names, no LINE/BRANCH), 2 (adds form byte + display
-names), and 3 (adds LINE/BRANCH records and array length in first-seen).
+names), 3 (adds LINE/BRANCH records and array length in first-seen), and 4 (adds
+STACK_SNAPSHOT records, the STACK blob kind and the METHODNAME/FILENAME rt-symbol kinds).

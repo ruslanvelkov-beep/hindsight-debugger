@@ -53,6 +53,7 @@ final class TestBed implements AutoCloseable {
         final RuntimeConfig runtimeConfig = new RuntimeConfig();
         runtimeConfig.outDir = tempDir.resolve("recording");
         runtimeConfig.snapshotEvery = 0; // deterministic records
+        runtimeConfig.stackEvery = 0; // deterministic records; stack captures have their own tests
         runtimeConfig.autostart = true;
         HindsightRuntime.boot(runtimeConfig);
         final Path recordingDir = Objects.requireNonNull(HindsightRuntime.recordingDir(), "runtime failed to boot");

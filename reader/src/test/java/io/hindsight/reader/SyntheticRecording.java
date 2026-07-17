@@ -30,9 +30,16 @@ final class SyntheticRecording {
     private int nextRtSym = 1;
     private int nextSite = 1;
     private long nextSeq = 1;
+    private int schema = 1;
 
     SyntheticRecording(final Path dir) {
         this.dir = dir;
+    }
+
+    /** Sets the manifest schema version (§13); the default 1 keeps legacy fixtures untouched. */
+    SyntheticRecording schema(final int version) {
+        this.schema = version;
+        return this;
     }
 
     // ---- symbols (§4) ----
@@ -167,7 +174,7 @@ final class SyntheticRecording {
     Path write() throws IOException {
         Files.createDirectories(dir);
         Files.writeString(dir.resolve("manifest.properties"),
-                "schema=1\nrecorder=synthetic-test\njvm=test\npid=0\nstartEpochMillis=0\nargs=test\n");
+                "schema=" + schema + "\nrecorder=synthetic-test\njvm=test\npid=0\nstartEpochMillis=0\nargs=test\n");
         Files.writeString(dir.resolve("symbols.tsv"), symbols.toString());
         Files.writeString(dir.resolve("rt-symbols.tsv"), rtSymbols.toString());
         Files.writeString(dir.resolve("sites.tsv"), sites.toString());

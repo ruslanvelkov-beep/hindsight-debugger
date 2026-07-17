@@ -35,6 +35,7 @@ public final class Format {
     public static final int SNAPSHOT = 0x61;
     public static final int THREAD_START = 0x70;
     public static final int TIME_SYNC = 0x72;
+    public static final int STACK_SNAPSHOT = 0x73; // schema 4
 
     // ---- value kinds (§2.2, 2-bit fields) ----
     public static final int KIND_NONE = 0;
@@ -71,6 +72,10 @@ public final class Format {
 
     public static final int BLOB_UTF8 = 1;
     public static final int BLOB_SNAPSHOT = 2;
+    public static final int BLOB_STACK = 3; // schema 4
+
+    /** Bytes of one §3 STACK frame entry: classSym(4) + methodSym(4) + fileSym(4) + line(4). */
+    public static final int STACK_FRAME_SIZE = 16;
 
     /** Runtime symbol ids are {@code 0x4000_0000 | n} (§4); agent ids are dense from 1. */
     public static final int RT_SYMBOL_BASE = 0x4000_0000;
@@ -164,15 +169,16 @@ public final class Format {
             case SNAPSHOT -> "SNAPSHOT";
             case THREAD_START -> "THREAD_START";
             case TIME_SYNC -> "TIME_SYNC";
+            case STACK_SNAPSHOT -> "STACK_SNAPSHOT";
             default -> String.format("UNKNOWN(0x%02X)", type);
         };
     }
 
-    /** Whether {@code type} is one of the nine v1 record types. */
+    /** Whether {@code type} is one of the defined §2.1 record types (schemas 1–4). */
     public static boolean typeKnown(final int type) {
         return switch (type) {
             case METHOD_ENTER, METHOD_EXIT, ARG, LINE, BRANCH, FIELD_WRITE, LOCAL_WRITE,
-                    OBJECT_FIRST_SEEN, SNAPSHOT, THREAD_START, TIME_SYNC -> true;
+                    OBJECT_FIRST_SEEN, SNAPSHOT, THREAD_START, TIME_SYNC, STACK_SNAPSHOT -> true;
             default -> false;
         };
     }

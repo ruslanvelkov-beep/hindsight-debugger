@@ -112,6 +112,12 @@ public final class AgentConfig {
     /** Nested-baseline snapshot depth (§7); must be ≥ 1, and 1 reproduces pre-v1.3 behaviour. */
     public final int snapshotDepth;
 
+    /**
+     * §2.1 STACK_SNAPSHOT cadence (schema 4): capture each thread's live stack with its first
+     * business record and every this-many records thereafter; 0 disables captures.
+     */
+    public final int stackEvery;
+
     /** Emit LINE records at each source line (FULL scope only) — the §7 execution-flow backbone. */
     public final boolean lines;
 
@@ -148,6 +154,7 @@ public final class AgentConfig {
             int snapshotEvery,
             boolean snapshotFirstSeen,
             int snapshotDepth,
+            int stackEvery,
             boolean lines,
             boolean branches,
             int recordBufKB,
@@ -169,6 +176,7 @@ public final class AgentConfig {
         this.snapshotEvery = snapshotEvery;
         this.snapshotFirstSeen = snapshotFirstSeen;
         this.snapshotDepth = snapshotDepth;
+        this.stackEvery = stackEvery;
         this.lines = lines;
         this.branches = branches;
         this.recordBufKB = recordBufKB;
@@ -241,6 +249,7 @@ public final class AgentConfig {
         final int snapshotEvery = parseInt(remove(pairs, "snapshotEvery", "8192"), "snapshotEvery", 0);
         final boolean snapshotFirstSeen = parseBoolean(remove(pairs, "snapshotFirstSeen", "true"), "snapshotFirstSeen");
         final int snapshotDepth = parseInt(remove(pairs, "snapshotDepth", "2"), "snapshotDepth", 1);
+        final int stackEvery = parseInt(remove(pairs, "stackEvery", "1024"), "stackEvery", 0);
         final boolean lines = parseBoolean(remove(pairs, "lines", "true"), "lines");
         final boolean branches = parseBoolean(remove(pairs, "branches", "true"), "branches");
         final int recordBufKB = parseInt(remove(pairs, "recordBufKB", "256"), "recordBufKB", 1);
@@ -267,6 +276,7 @@ public final class AgentConfig {
                 snapshotEvery,
                 snapshotFirstSeen,
                 snapshotDepth,
+                stackEvery,
                 lines,
                 branches,
                 recordBufKB,
@@ -321,6 +331,7 @@ public final class AgentConfig {
                 + ", snapshotEvery=" + snapshotEvery
                 + ", snapshotFirstSeen=" + snapshotFirstSeen
                 + ", snapshotDepth=" + snapshotDepth
+                + ", stackEvery=" + stackEvery
                 + ", lines=" + lines
                 + ", branches=" + branches
                 + ", recordBufKB=" + recordBufKB
