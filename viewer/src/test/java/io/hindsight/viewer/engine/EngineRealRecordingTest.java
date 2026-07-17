@@ -8,7 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.hindsight.reader.Format;
+import io.hindsight.reader.Rec;
 import io.hindsight.reader.Recording;
+import io.hindsight.reader.Site;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -128,6 +130,94 @@ final class EngineRealRecordingTest {
                 assertTrue(cursorIsOnLine(e, probe), "exitFrameBackward lands on a LINE record");
                 assertFalse(e.exitFrameBackward().moved(), "already at frame entry is a no-op");
             }
+        }
+    }
+
+    /**
+     * Exercises the v1.3 instance/field-write API ({@code classSites}, {@code instancesOf},
+     * {@code creationOf}, {@code fieldWrites}) against the real recording: the class index must be
+     * sorted and every instance must point at a real {@code OBJECT_FIRST_SEEN} record, creation
+     * lookups must round-trip, and a field-write query seeded from a real {@code FIELD_WRITE}
+     * record must find that exact record again, ascending by seq.
+     */
+    @Test
+    void v13InstanceAndFieldWriteApiOnRealRecording() throws IOException {
+        assumeTrue(Files.isDirectory(REAL), "real recording not present: " + REAL);
+
+        try (Engine e = Engine.open(REAL);
+                Recording probe = Recording.open(REAL)) {
+
+            // --- classSites(): non-empty, sorted by classBinary ---
+            List<ClassSite> sites = e.classSites();
+            assertFalse(sites.isEmpty(), "a real recording should register instances");
+            for (int i = 1; i < sites.size(); i++) {
+                assertTrue(sites.get(i - 1).classBinary().compareTo(sites.get(i).classBinary()) <= 0,
+                        "classSites() must be sorted by classBinary");
+            }
+
+            // --- instancesOf(): the class with most instances — ascending seq, capped,
+            //     every Instance a real OBJECT_FIRST_SEEN coordinate ---
+            ClassSite biggest = sites.stream()
+                    .max((a, b) -> Long.compare(a.instanceCount(), b.instanceCount()))
+                    .orElseThrow();
+            List<Instance> instances = e.instancesOf(biggest.classBinary(), 500);
+            assertFalse(instances.isEmpty());
+            assertEquals(Math.min(500L, biggest.instanceCount()), instances.size(),
+                    "instancesOf must honour the cap");
+            long prevSeq = Long.MIN_VALUE;
+            for (Instance inst : instances) {
+                assertTrue(inst.seq() >= prevSeq, "instancesOf must be ascending by seq");
+                prevSeq = inst.seq();
+                Rec r = probe.recordAt(inst.tid(), inst.index());
+                assertEquals(Format.OBJECT_FIRST_SEEN, r.type(),
+                        "every Instance must point at an OBJECT_FIRST_SEEN record");
+                assertEquals(inst.objectId(), r.target());
+                assertEquals(inst.seq(), r.seq());
+            }
+            Instance first = instances.get(0);
+            assertEquals(List.of(first), e.instancesOf(biggest.classBinary(), 1), "cap 1 truncates");
+
+            // --- creationOf(): round-trips the first instance ---
+            assertEquals(first, e.creationOf(first.objectId()));
+
+            // --- fieldWrites(): seeded from the lowest-seq resolvable FIELD_WRITE, so the seed
+            //     is by construction the first hit of its own (file, field) query ---
+            Rec seed = null;
+            String seedOwner = null;
+            String seedField = null;
+            for (int tid : probe.threadIds()) {
+                long count = probe.recordCount(tid);
+                for (long i = 0; i < count; i++) {
+                    Rec r = probe.recordAt(tid, i);
+                    if (r.type() != Format.FIELD_WRITE || (seed != null && r.seq() >= seed.seq())) {
+                        continue;
+                    }
+                    Site s = probe.site(r.location());
+                    String owner = s != null ? probe.symbolText(s.classSym()) : null;
+                    String field = s != null && s.memberSym() != 0 ? probe.symbolText(s.memberSym()) : null;
+                    if (owner != null && field != null) {
+                        seed = r;
+                        seedOwner = owner;
+                        seedField = field;
+                    }
+                }
+            }
+            assumeTrue(seed != null, "recording has no resolvable FIELD_WRITE records");
+            String file = Engine.outermostSimpleName(seedOwner) + ".java"; // §13.5 owner-file rule
+            List<FieldWriteHit> hits = e.fieldWrites(file, seedField, 50);
+            assertFalse(hits.isEmpty(), "fieldWrites must find the seed write");
+            assertTrue(hits.size() <= 50, "fieldWrites must honour the cap");
+            prevSeq = Long.MIN_VALUE;
+            boolean containsSeed = false;
+            for (FieldWriteHit h : hits) {
+                assertTrue(h.seq() >= prevSeq, "fieldWrites must be ascending by seq");
+                prevSeq = h.seq();
+                assertEquals(seedField, h.fieldName());
+                if (h.tid() == seed.tid() && h.index() == seed.index()) {
+                    containsSeed = true;
+                }
+            }
+            assertTrue(containsSeed, "fieldWrites must contain the seed write's exact (tid, index)");
         }
     }
 

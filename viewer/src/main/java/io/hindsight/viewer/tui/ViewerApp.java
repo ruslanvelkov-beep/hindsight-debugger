@@ -14,7 +14,9 @@ import io.hindsight.reader.Rec;
 import io.hindsight.reader.Recording;
 import io.hindsight.reader.Site;
 import io.hindsight.viewer.engine.Engine;
+import io.hindsight.viewer.engine.FieldWriteHit;
 import io.hindsight.viewer.engine.Frame;
+import io.hindsight.viewer.engine.Instance;
 import io.hindsight.viewer.engine.Local;
 import io.hindsight.viewer.engine.ObjectNode;
 import io.hindsight.viewer.engine.RecordInfo;
@@ -63,6 +65,17 @@ import java.util.regex.PatternSyntaxException;
  *       lists them and {@code Enter} seeks back without re-appending.
  *   <li><b>Regex method browse</b> (§11.7) uses {@link Engine#methodSites()} /
  *       {@link Engine#callsOf}; object usage (§9) still scans the reader directly.
+ *   <li><b>Modal lists scroll incrementally</b> (§13.1): every dialog/overlay list
+ *       persists its scroll offset and adjusts it edge-only via
+ *       {@link ScrollMath#adjustScroll}, resetting to 0 on open/query/mode change.
+ *   <li><b>Instance browse & explore</b> (§13.2/§13.3): {@code Tab} in the {@code /}
+ *       dialog toggles calls ↔ instances ({@link InstanceBrowse}); Enter on an
+ *       instance opens the explore overlay (a dedicated {@link TreeView}) without
+ *       moving the cursor.
+ *   <li><b>Source-line cursor + variable history</b> (§13.4/§13.5): the Source
+ *       window keeps a cursor line (rendered in the gutter while focused) that
+ *       ↑/↓ move; {@code v} parses it via {@link FieldDecl} and lists the matching
+ *       {@link Engine#fieldWrites} in a jumpable modal.
  * </ul>
  */
 public final class ViewerApp {
@@ -72,6 +85,7 @@ public final class ViewerApp {
     private static final int TAB_WIDTH = 4;
     private static final int HSTEP = 4;
     private static final int RESULT_CAP = 200;
+    private static final int VAR_HISTORY_CAP = 500;
     private static final long SEEK_CAP = 5_000_000L;
     private static final String DOT = " · ";
 
@@ -85,17 +99,69 @@ public final class ViewerApp {
         METHOD, OBJECT, FILE
     }
 
-    /** Live state of an open modal dialog: a query, its result rows + jump targets, and a note. */
+    /**
+     * Live state of an open modal dialog: a query, its result rows + jump targets, a note, and a
+     * persistent scroll offset (§13.1 — adjusted incrementally each frame, reset to 0 on open, on
+     * query change and on the §13.2 mode toggle). The {@code METHOD} kind carries the calls ↔
+     * instances mode flag; in instances mode {@code instanceRows} mirrors {@code rows}.
+     */
     private static final class SearchDialog {
         final DialogKind kind;
         final StringBuilder query = new StringBuilder();
         List<String> rows = List.of();
         List<long[]> targets = List.of();
+        List<InstanceBrowse.Row> instanceRows = List.of();
         String note = "";
         int sel;
+        int scroll;
+        boolean instancesMode;
 
         SearchDialog(final DialogKind kind) {
             this.kind = kind;
+        }
+    }
+
+    /**
+     * Live state of the §13.3 instance explore overlay: one object id shown as an expandable tree
+     * (a dedicated {@link TreeView}) under two action rows, resolved as-of the seq captured in the
+     * title at open time (the cursor cannot move while it is open). {@code sel} runs over ALL rows
+     * (0 = {@code [jump to creation]}, 1 = {@code [close]}, 2+ = tree rows); {@code scroll} is the
+     * §13.1 persistent offset.
+     */
+    private static final class ExploreWindow {
+        final long objectId;
+        final String label;
+        final String title;
+        final TreeView tree;
+        int sel;
+        int scroll;
+        int hcol;
+
+        ExploreWindow(final long objectId, final String label, final String title, final TreeView tree) {
+            this.objectId = objectId;
+            this.label = label;
+            this.title = title;
+            this.tree = tree;
+        }
+    }
+
+    /**
+     * Live state of the §13.5 variable-history overlay: the matching field writes (rows rendered
+     * once at open — values are as-of the write, not the cursor), a §13.1 persistent scroll, and a
+     * cap note.
+     */
+    private static final class VarHistoryWindow {
+        final List<String> rows;
+        final List<FieldWriteHit> hits;
+        final String note;
+        int sel;
+        int scroll;
+        int hcol;
+
+        VarHistoryWindow(final List<String> rows, final List<FieldWriteHit> hits, final String note) {
+            this.rows = rows;
+            this.hits = hits;
+            this.note = note;
         }
     }
 
@@ -116,6 +182,8 @@ public final class ViewerApp {
     private boolean helpOverlay;
     private boolean quitConfirm;
     private SearchDialog dialog;
+    private ExploreWindow explore;
+    private VarHistoryWindow varHist;
     private TerminalPosition cursorPos;
 
     // Source window state.
@@ -127,6 +195,10 @@ public final class ViewerApp {
     private int srcViewH = 1;
     private int srcFileLines;
     private boolean srcResolved;
+
+    // Source-line cursor (§13.4): 1-based, rendered in the gutter while Source is focused.
+    private int srcCursor = 1;
+    private boolean srcCursorPending = true;
 
     // Source browse mode (§11.8): a file opened for reading, decoupled from execution.
     private boolean browseMode;
@@ -238,6 +310,12 @@ public final class ViewerApp {
         if (dialog != null) {
             drawDialog(g, cols, rows);
         }
+        if (explore != null) {
+            drawExplore(g, cols, rows);
+        }
+        if (varHist != null) {
+            drawVarHistory(g, cols, rows);
+        }
         if (quitConfirm) {
             drawQuitConfirm(g, cols, rows);
         }
@@ -296,6 +374,13 @@ public final class ViewerApp {
         shownFileKey = fileKey;
         followPending = false;
         recenterSource = false;
+        // §13.4: reset the source cursor to the exec/frame line after every navigation
+        // and whenever the shown file changed; always clamp to the shown file.
+        if (srcCursorPending || fileChanged) {
+            srcCursor = line;
+        }
+        srcCursor = clamp(srcCursor, 1, Math.max(1, srcFileLines));
+        srcCursorPending = false;
 
         if (frame == null) {
             put(g, ix, iy, "<no active frame at this record>", Palette.DIM, Palette.BG, false);
@@ -313,7 +398,8 @@ public final class ViewerApp {
         List<String> lines = src.get();
         List<List<JavaHighlighter.Span>> spans =
                 highlightCache.computeIfAbsent(fileKey, k -> highlighter.highlight(lines));
-        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, sf == frames.size() - 1);
+        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, sf == frames.size() - 1,
+                sourceCursorLine());
     }
 
     private void renderBrowse(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -323,10 +409,12 @@ public final class ViewerApp {
         if (browseCenterPending) {
             srcTop = ScrollMath.center(line, ih, srcFileLines);
             srcHcol = 0;
+            srcCursor = line; // §13.4: cursor starts on the requested line in browse mode
             browseCenterPending = false;
         } else {
             srcTop = ScrollMath.clampTop(srcTop, srcFileLines, ih);
         }
+        srcCursor = clamp(srcCursor, 1, Math.max(1, srcFileLines));
         if (srcFileLines == 0) {
             put(g, ix, iy, clip("<empty file>", iw), Palette.DIM, Palette.BG, false);
             return;
@@ -334,7 +422,12 @@ public final class ViewerApp {
         List<List<JavaHighlighter.Span>> spans =
                 highlightCache.computeIfAbsent(browseKey, k -> highlighter.highlight(browseLines));
         // Browse marks the requested line with the dim (frame) highlight, never the exec highlight.
-        renderCodeLines(g, ix, iy, iw, ih, browseLines, spans, srcTop, srcHcol, line, false);
+        renderCodeLines(g, ix, iy, iw, ih, browseLines, spans, srcTop, srcHcol, line, false, sourceCursorLine());
+    }
+
+    /** The §13.4 cursor line to render, or -1 — the cursor shows only while Source is focused. */
+    private int sourceCursorLine() {
+        return focus == Win.SOURCE ? srcCursor : -1;
     }
 
     private void renderCodeLines(
@@ -348,7 +441,8 @@ public final class ViewerApp {
             final int top,
             final int hcol,
             final int highlightLine,
-            final boolean execHighlight) {
+            final boolean execHighlight,
+            final int cursorLine) {
         int fileLines = lines.size();
         int gutterW = Integer.toString(Math.max(1, fileLines)).length() + 1;
         int numW = Math.max(1, gutterW - 1);
@@ -362,9 +456,13 @@ public final class ViewerApp {
             int y = iy + row;
             boolean isHl = lineNo == highlightLine;
             boolean isExec = isHl && execHighlight;
+            boolean isCursor = lineNo == cursorLine;
             TextColor lineBg = isHl ? (isExec ? Palette.EXEC_LINE_BG : Palette.FRAME_LINE_BG) : Palette.BG;
 
-            put(g, ix, y, String.format("%" + numW + "d ", lineNo), Palette.DIM, lineBg, false);
+            // §13.4: the cursor line marks only its gutter cells; the code keeps its own colours.
+            put(g, ix, y, String.format("%" + numW + "d ", lineNo),
+                    isCursor ? Palette.SELECTION_FG : Palette.DIM,
+                    isCursor ? Palette.SELECTION_BG : lineBg, false);
             if (contentW <= 0) {
                 continue;
             }
@@ -405,7 +503,7 @@ public final class ViewerApp {
             rows.add(mark + "t" + tid + "  \"" + engine.threadName(tid) + "\"  (" + count(tid) + ")");
         }
         threadSel = clamp(threadSel, 0, Math.max(0, rows.size() - 1));
-        threadScroll = adjustScroll(threadScroll, threadSel, ih, rows.size());
+        threadScroll = ScrollMath.adjustScroll(threadScroll, threadSel, ih, rows.size());
         drawRows(g, ix, iy, iw, ih, rows, threadSel, threadScroll, threadsHcol, true);
     }
 
@@ -431,7 +529,7 @@ public final class ViewerApp {
                     + " (" + (f.fileName() != null ? f.fileName() : "?") + ":" + f.currentLine() + ")");
         }
         stackSel = clamp(stackSel, 0, Math.max(0, rows.size() - 1));
-        stackScroll = adjustScroll(stackScroll, stackSel, ih, rows.size());
+        stackScroll = ScrollMath.adjustScroll(stackScroll, stackSel, ih, rows.size());
         drawRows(g, ix, iy, iw, ih, rows, stackSel, stackScroll, stackHcol, true);
     }
 
@@ -476,7 +574,7 @@ public final class ViewerApp {
             rows.add(HistoryTrail.render(e));
         }
         recordsSel = clamp(recordsSel, 0, rows.size() - 1);
-        recordsScroll = adjustScroll(recordsScroll, recordsSel, ih, rows.size());
+        recordsScroll = ScrollMath.adjustScroll(recordsScroll, recordsSel, ih, rows.size());
         drawRows(g, ix, iy, iw, ih, rows, recordsSel, recordsScroll, recordsHcol, true);
     }
 
@@ -491,8 +589,8 @@ public final class ViewerApp {
                 + "/ calls  . obj  F file  c/s/t/l/r focus  q quit";
         String ctx = switch (focus) {
             case SOURCE -> browseMode
-                    ? "↑↓ scroll  <> hscroll  o return  g/G/Home/End"
-                    : "↑↓ scroll  ←→/<> hscroll  g/G/Home/End";
+                    ? "↑↓ cursor  v var-history  <> hscroll  o return  g/G/Home/End"
+                    : "↑↓ cursor  v var-history  ←→/<> hscroll  g/G/Home/End";
             case THREADS -> "↑↓ select  ↵ switch  ←→/<> hscroll";
             case STACK -> "↑↓ select frame  ←→/<> hscroll";
             case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  <> hscroll";
@@ -618,7 +716,9 @@ public final class ViewerApp {
         g.disableModifiers(SGR.BOLD);
         g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
         String title = switch (dialog.kind) {
-            case METHOD -> "Browse method calls [/]";
+            case METHOD -> dialog.instancesMode
+                    ? "Browse instances [/]  ⇥ calls"
+                    : "Browse method calls [/]  ⇥ instances";
             case OBJECT -> "Find object usage [.]";
             case FILE -> "Open source file [F]";
         };
@@ -636,9 +736,13 @@ public final class ViewerApp {
         cursorPos = new TerminalPosition(Math.min(x + w - 2, ix + prompt.length() + dialog.query.length()), iy);
 
         int hintRow = y + h - 2;
-        String hint = dialog.kind == DialogKind.FILE
-                ? "class[:line] | path.java[:line]   ↵ open  Esc close"
-                : "↑↓ select  ↵ jump  Esc close";
+        String hint = switch (dialog.kind) {
+            case FILE -> "class[:line] | path.java[:line]   ↵ open  Esc close";
+            case METHOD -> dialog.instancesMode
+                    ? "↑↓ select  ↵ explore  ⇥ calls  Esc close"
+                    : "↑↓ select  ↵ jump  ⇥ instances  Esc close";
+            case OBJECT -> "↑↓ select  ↵ jump  Esc close";
+        };
         put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
         int listBottom = hintRow;
@@ -660,14 +764,99 @@ public final class ViewerApp {
             return;
         }
         dialog.sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
-        int scroll = adjustScroll(0, dialog.sel, listH, dialog.rows.size());
+        // §13.1: adjust the persisted offset incrementally — never recompute from 0.
+        dialog.scroll = ScrollMath.adjustScroll(dialog.scroll, dialog.sel, listH, dialog.rows.size());
         for (int r = 0; r < listH; r++) {
-            int idx = scroll + r;
+            int idx = dialog.scroll + r;
             if (idx >= dialog.rows.size()) {
                 break;
             }
             boolean s = idx == dialog.sel;
             put(g, ix, listTop + r, clipPad(dialog.rows.get(idx), iw),
+                    s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+        }
+    }
+
+    /**
+     * The §13.3 instance explore overlay: two action rows and the object tree, drawn as a centered
+     * modal like {@link #drawDialog}, with §13.1 persistent scrolling over ALL rows.
+     */
+    private void drawExplore(final TextGraphics g, final int cols, final int rows) {
+        int w = clamp(cols - 6, 24, 74);
+        int h = clamp(rows - 6, 8, 20);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), explore.title, Palette.DIALOG_BG, Palette.FOCUS, true);
+        int ix = x + 1;
+        int iy = y + 1;
+        int iw = w - 2;
+        int hintRow = y + h - 2;
+        put(g, ix, hintRow, clip("↑↓ move  →/↵ expand  ← collapse  <> hscroll  Esc close", iw),
+                Palette.DIM, Palette.DIALOG_BG, false);
+        int listH = hintRow - iy;
+        List<String> text = exploreRows();
+        explore.sel = clamp(explore.sel, 0, text.size() - 1);
+        explore.scroll = ScrollMath.adjustScroll(explore.scroll, explore.sel, listH, text.size());
+        for (int r = 0; r < listH; r++) {
+            int idx = explore.scroll + r;
+            if (idx >= text.size()) {
+                break;
+            }
+            boolean s = idx == explore.sel;
+            put(g, ix, iy + r, HScroll.clip(text.get(idx), explore.hcol, iw),
+                    s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+        }
+    }
+
+    /** All explore rows top to bottom: the two §13.3 action rows, then the flattened tree. */
+    private List<String> exploreRows() {
+        List<TreeView.Row> treeRows = explore.tree.rows();
+        List<String> out = new ArrayList<>(treeRows.size() + 2);
+        out.add("[jump to creation]");
+        out.add("[close]");
+        for (TreeView.Row r : treeRows) {
+            String glyph = r.expandable() ? (r.expanded() ? "▾ " : "▸ ") : "  ";
+            out.add("  ".repeat(r.depth()) + glyph + r.node().label());
+        }
+        return out;
+    }
+
+    /** The §13.5 variable-history overlay, drawn as a centered modal like {@link #drawDialog}. */
+    private void drawVarHistory(final TextGraphics g, final int cols, final int rows) {
+        int w = clamp(cols - 6, 24, 74);
+        int h = clamp(rows - 6, 8, 20);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), "Variable history [v]", Palette.DIALOG_BG, Palette.FOCUS, true);
+        int ix = x + 1;
+        int iy = y + 1;
+        int iw = w - 2;
+        int hintRow = y + h - 2;
+        put(g, ix, hintRow, clip("↑↓ select  ↵ jump  <> hscroll  Esc close", iw),
+                Palette.DIM, Palette.DIALOG_BG, false);
+        int listBottom = hintRow;
+        if (!varHist.note.isEmpty()) {
+            listBottom = hintRow - 1;
+            put(g, ix, listBottom, clip(varHist.note, iw), Palette.DIM, Palette.DIALOG_BG, false);
+        }
+        int listH = listBottom - iy;
+        varHist.sel = clamp(varHist.sel, 0, Math.max(0, varHist.rows.size() - 1));
+        varHist.scroll = ScrollMath.adjustScroll(varHist.scroll, varHist.sel, listH, varHist.rows.size());
+        for (int r = 0; r < listH; r++) {
+            int idx = varHist.scroll + r;
+            if (idx >= varHist.rows.size()) {
+                break;
+            }
+            boolean s = idx == varHist.sel;
+            put(g, ix, iy + r, HScroll.clip(varHist.rows.get(idx), varHist.hcol, iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
     }
@@ -686,7 +875,10 @@ public final class ViewerApp {
             "Arrows PgUp PgDn      navigate the focused window",
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
-            "/  .  F               browse method calls / find object / open file",
+            "v                     variable history for the Source cursor line",
+            "/  .  F               browse calls/instances / find object / open file",
+            "Tab in /              toggle calls ↔ instances; ↵ on an instance opens",
+            "                      the explore window ([jump to creation] / [close])",
             "?  F1                 toggle this help",
             "q  Ctrl+C             quit (q asks to confirm)",
             "",
@@ -757,6 +949,14 @@ public final class ViewerApp {
             }
             if (dialog != null) {
                 handleDialog(k);
+                return;
+            }
+            if (explore != null) {
+                handleExplore(k);
+                return;
+            }
+            if (varHist != null) {
+                handleVarHistory(k);
                 return;
             }
             if (isCtrlC(k)) {
@@ -913,14 +1113,16 @@ public final class ViewerApp {
         }
     }
 
+    /** Source-focused keys (§13.4): ↑/↓ etc. move the source-line cursor, not the plain scroll. */
     private void navSource(final KeyStroke k) {
         KeyType t = k.getKeyType();
         Character ch = k.getCharacter();
         int page = Math.max(1, srcViewH - 1);
+        int lastLine = Math.max(1, srcFileLines);
         if (t == KeyType.ArrowUp) {
-            srcScroll(-1);
+            setSrcCursor(srcCursor - 1);
         } else if (t == KeyType.ArrowDown) {
-            srcScroll(1);
+            setSrcCursor(srcCursor + 1);
         } else if (t == KeyType.ArrowLeft) {
             srcHcol = Math.max(0, srcHcol - HSTEP);
         } else if (t == KeyType.ArrowRight) {
@@ -928,23 +1130,30 @@ public final class ViewerApp {
                 srcHcol += HSTEP;
             }
         } else if (t == KeyType.PageUp || (k.isCtrlDown() && ch != null && ch == 'b')) {
-            srcScroll(-page);
+            setSrcCursor(srcCursor - page);
         } else if (t == KeyType.PageDown || (k.isCtrlDown() && ch != null && ch == 'f')) {
-            srcScroll(page);
+            setSrcCursor(srcCursor + page);
         } else if (t == KeyType.Home) {
-            srcTop = 1;
+            setSrcCursor(1);
             srcHcol = 0;
         } else if (t == KeyType.End) {
-            srcTop = ScrollMath.maxTop(srcFileLines, srcViewH);
+            setSrcCursor(lastLine);
         } else if (ch != null && ch == 'g') {
-            srcTop = 1;
+            setSrcCursor(1);
         } else if (ch != null && ch == 'G') {
-            srcTop = ScrollMath.maxTop(srcFileLines, srcViewH);
+            setSrcCursor(lastLine);
+        } else if (isChar(k, 'v') && !k.isCtrlDown() && !k.isAltDown()) {
+            varHistory();
         }
     }
 
-    private void srcScroll(final int delta) {
-        srcTop = ScrollMath.clampTop(srcTop + delta, srcFileLines, srcViewH);
+    /**
+     * Moves the §13.4 source cursor (clamped to the shown file) and scrolls the view only when the
+     * cursor would leave the visible rows — the §13.1 edge-only rule, no margin.
+     */
+    private void setSrcCursor(final int line) {
+        srcCursor = clamp(line, 1, Math.max(1, srcFileLines));
+        srcTop = ScrollMath.adjustScroll(srcTop - 1, srcCursor - 1, Math.max(1, srcViewH), Math.max(1, srcFileLines)) + 1;
     }
 
     private void navThreads(final KeyStroke k) {
@@ -1014,6 +1223,7 @@ public final class ViewerApp {
             followPending = true;
             srcHcol = 0;
             localsHcol = 0;
+            srcCursorPending = true; // §13.4: cursor to the selected frame's line
         }
     }
 
@@ -1087,6 +1297,14 @@ public final class ViewerApp {
             dialog = null;
         } else if (t == KeyType.Enter) {
             jumpDialog();
+        } else if (t == KeyType.Tab) {
+            // §13.2: Tab toggles calls ↔ instances (query kept; selection and scroll reset).
+            if (dialog.kind == DialogKind.METHOD) {
+                dialog.instancesMode = !dialog.instancesMode;
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            }
         } else if (t == KeyType.ArrowUp) {
             dialog.sel = Math.max(0, dialog.sel - 1);
         } else if (t == KeyType.ArrowDown) {
@@ -1095,6 +1313,7 @@ public final class ViewerApp {
             if (dialog.query.length() > 0) {
                 dialog.query.deleteCharAt(dialog.query.length() - 1);
                 dialog.sel = 0;
+                dialog.scroll = 0;
                 recomputeDialog();
             }
         } else if (t == KeyType.Character) {
@@ -1102,6 +1321,7 @@ public final class ViewerApp {
             if (ch != null && ch >= ' ') {
                 dialog.query.append(ch.charValue());
                 dialog.sel = 0;
+                dialog.scroll = 0;
                 recomputeDialog();
             }
         }
@@ -1109,7 +1329,13 @@ public final class ViewerApp {
 
     private void recomputeDialog() {
         switch (dialog.kind) {
-            case METHOD -> recomputeMethodResults();
+            case METHOD -> {
+                if (dialog.instancesMode) {
+                    recomputeInstanceResults();
+                } else {
+                    recomputeMethodResults();
+                }
+            }
             case OBJECT -> recomputeObjectResults();
             case FILE -> {
                 dialog.rows = List.of();
@@ -1145,6 +1371,37 @@ public final class ViewerApp {
         } catch (PatternSyntaxException e) {
             dialog.rows = List.of();
             dialog.targets = List.of();
+            dialog.note = "invalid regex";
+            status = "invalid regex: " + describe(e);
+        }
+    }
+
+    /** The §13.2 instances mode of the {@code /} dialog: regex over runtime class binary names. */
+    private void recomputeInstanceResults() {
+        String q = dialog.query.toString();
+        dialog.targets = List.of();
+        if (q.isEmpty()) {
+            dialog.rows = List.of();
+            dialog.instanceRows = List.of();
+            dialog.note = "";
+            return;
+        }
+        try {
+            InstanceBrowse.Result res = InstanceBrowse.filter(
+                    engine.classSites(), cls -> engine.instancesOf(cls, InstanceBrowse.CAP), q, InstanceBrowse.CAP);
+            List<String> rows = new ArrayList<>(res.rows().size());
+            for (InstanceBrowse.Row r : res.rows()) {
+                rows.add("seq " + r.seq() + DOT + "t" + r.tid() + DOT + r.display());
+            }
+            dialog.rows = rows;
+            dialog.instanceRows = res.rows();
+            long shown = rows.size();
+            dialog.note = res.totalMatches() > shown
+                    ? "showing first " + shown + " of " + res.totalMatches()
+                    : "";
+        } catch (PatternSyntaxException e) {
+            dialog.rows = List.of();
+            dialog.instanceRows = List.of();
             dialog.note = "invalid regex";
             status = "invalid regex: " + describe(e);
         }
@@ -1228,6 +1485,13 @@ public final class ViewerApp {
             return;
         }
         int sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
+        if (dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
+            // §13.2: Enter on an instance does NOT move the cursor — it opens the explore window.
+            InstanceBrowse.Row row = dialog.instanceRows.get(sel);
+            dialog = null;
+            openExplore(row.objectId(), row.display());
+            return;
+        }
         long[] target = dialog.targets.get(sel);
         DialogKind kind = dialog.kind;
         dialog = null;
@@ -1253,6 +1517,195 @@ public final class ViewerApp {
         engine.stepInto();
         afterMove();
         appendHistory();
+    }
+
+    // ---- instance explore window (§13.3) ----
+
+    /** Opens the explore overlay for an object id; the execution cursor does not move. */
+    private void openExplore(final long objectId, final String label) {
+        ExploreWindow w = new ExploreWindow(
+                objectId,
+                label,
+                label + "  (as of seq " + engine.currentSeq() + ")",
+                new TreeView(engine::children));
+        w.tree.setRoots(List.of(engine.objectTree(objectId)));
+        explore = w;
+    }
+
+    /** One key while the explore overlay is open — it consumes all keys, like a dialog (§13.3). */
+    private void handleExplore(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (t == KeyType.Escape) {
+            explore = null;
+            return;
+        }
+        if (isCtrlC(k)) {
+            running = false;
+            return;
+        }
+        int total = 2 + explore.tree.rows().size();
+        if (t == KeyType.ArrowUp) {
+            explore.sel = Math.max(0, explore.sel - 1);
+        } else if (t == KeyType.ArrowDown) {
+            explore.sel = Math.min(total - 1, explore.sel + 1);
+        } else if (isChar(k, '<')) {
+            explore.hcol = Math.max(0, explore.hcol - HSTEP);
+        } else if (isChar(k, '>')) {
+            explore.hcol += HSTEP;
+        } else if (t == KeyType.ArrowRight) {
+            if (explore.sel >= 2) {
+                exploreTreeOp(true);
+            }
+        } else if (t == KeyType.ArrowLeft) {
+            if (explore.sel >= 2) {
+                exploreTreeOp(false);
+            }
+        } else if (t == KeyType.Enter) {
+            if (explore.sel == 0) {
+                jumpToCreation();
+            } else if (explore.sel == 1) {
+                explore = null;
+            } else {
+                exploreTreeOp(true);
+            }
+        }
+    }
+
+    /** Expand/collapse the tree row under the overall selection, then re-sync the selection. */
+    private void exploreTreeOp(final boolean expand) {
+        TreeView tree = explore.tree;
+        tree.toFirst();
+        tree.moveDown(explore.sel - 2);
+        if (expand) {
+            tree.expandOrDescend();
+        } else {
+            tree.collapseOrParent();
+        }
+        explore.sel = 2 + tree.selection();
+    }
+
+    /**
+     * The {@code [jump to creation]} action (§13.3): close, seek to the {@code OBJECT_FIRST_SEEN},
+     * advance to the nearest following LINE (the §11.7 jump pattern), one history entry. If the
+     * engine has no creation record (defensive), report and stay open.
+     */
+    private void jumpToCreation() {
+        Instance c = engine.creationOf(explore.objectId);
+        if (c == null) {
+            status = "no creation record for " + explore.label;
+            return;
+        }
+        String label = explore.label;
+        explore = null;
+        engine.seek(c.tid(), c.index());
+        engine.stepInto();
+        afterMove();
+        appendHistory();
+        status = "jumped to creation of " + label + " (seq " + c.seq() + ")";
+    }
+
+    // ---- variable history (§13.5) ----
+
+    /**
+     * The {@code v} key (Source focused): parse the cursor line of the shown file for field
+     * declarations and open the history of the first candidate with recorded writes.
+     */
+    private void varHistory() {
+        List<String> lines;
+        String fileName;
+        if (browseMode) {
+            lines = browseLines;
+            fileName = browseName;
+        } else {
+            List<Frame> frames = engine.stack();
+            int sf = engine.selectedFrame();
+            Frame frame = sf >= 0 && sf < frames.size() ? frames.get(sf) : null;
+            fileName = frame != null ? frame.fileName() : null;
+            lines = frame != null
+                    ? sourcePath.lines(frame.classBinary(), fileName).orElse(null)
+                    : null;
+        }
+        if (lines == null || lines.isEmpty()) {
+            status = "no class variable definition on this line";
+            return;
+        }
+        List<String> names = FieldDecl.parse(lines.get(clamp(srcCursor, 1, lines.size()) - 1));
+        if (names.isEmpty()) {
+            status = "no class variable definition on this line";
+            return;
+        }
+        for (String name : names) {
+            // Ask for one extra hit so an exactly-full window is distinguishable from a capped one.
+            List<FieldWriteHit> hits = engine.fieldWrites(fileName, name, VAR_HISTORY_CAP + 1);
+            if (!hits.isEmpty()) {
+                boolean capped = hits.size() > VAR_HISTORY_CAP;
+                List<FieldWriteHit> shown = capped ? hits.subList(0, VAR_HISTORY_CAP) : hits;
+                List<String> rows = new ArrayList<>(shown.size());
+                for (FieldWriteHit hit : shown) {
+                    rows.add(varHistoryRow(hit));
+                }
+                varHist = new VarHistoryWindow(
+                        rows,
+                        List.copyOf(shown),
+                        capped
+                                ? "showing first " + VAR_HISTORY_CAP + " of "
+                                        + engine.countFieldWrites(fileName, name)
+                                : "");
+                return;
+            }
+        }
+        status = "no recorded writes for '" + names.get(0) + "'";
+    }
+
+    /** {@code seq N · t<tid> · Owner#oid.field: old → new  (File:line)}; statics omit {@code #oid}. */
+    private String varHistoryRow(final FieldWriteHit h) {
+        String owner = h.ownerClass() == null ? "?" : Format.simpleName(h.ownerClass());
+        String target = h.isStatic() ? owner : owner + "#" + h.ownerId();
+        String file = h.fileName() != null ? h.fileName() : "?";
+        return "seq " + h.seq() + DOT + "t" + h.tid() + DOT + target + "." + h.fieldName()
+                + ": " + h.before() + " → " + h.after() + "  (" + file + ":" + h.line() + ")";
+    }
+
+    /** One key while the variable-history overlay is open — it consumes all keys, like a dialog. */
+    private void handleVarHistory(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (t == KeyType.Escape) {
+            varHist = null;
+            return;
+        }
+        if (isCtrlC(k)) {
+            running = false;
+            return;
+        }
+        int last = Math.max(0, varHist.rows.size() - 1);
+        if (t == KeyType.ArrowUp) {
+            varHist.sel = Math.max(0, varHist.sel - 1);
+        } else if (t == KeyType.ArrowDown) {
+            varHist.sel = Math.min(last, varHist.sel + 1);
+        } else if (isChar(k, '<')) {
+            varHist.hcol = Math.max(0, varHist.hcol - HSTEP);
+        } else if (isChar(k, '>')) {
+            varHist.hcol += HSTEP;
+        } else if (t == KeyType.Enter) {
+            jumpToWrite();
+        }
+    }
+
+    /**
+     * Jump to a field write (§13.5): seek to the {@code FIELD_WRITE} record, then position on the
+     * nearest LINE at/before it (the write belongs to that line); fall forward only if no LINE
+     * precedes. One history entry.
+     */
+    private void jumpToWrite() {
+        FieldWriteHit hit = varHist.hits.get(clamp(varHist.sel, 0, varHist.hits.size() - 1));
+        varHist = null;
+        engine.seek(hit.tid(), hit.index());
+        if (!engine.reverseStep().moved()) {
+            engine.stepInto();
+        }
+        afterMove();
+        appendHistory();
+        status = "jumped to seq " + engine.currentSeq() + " (t" + engine.currentTid() + ")";
     }
 
     private void openFile() {
@@ -1347,6 +1800,7 @@ public final class ViewerApp {
         stackHcol = 0;
         localsHcol = 0;
         recordsHcol = 0;
+        srcCursorPending = true; // §13.4: cursor back to the execution line
     }
 
     /** Records the current cursor position in the history trail and selects it (§11.5). */
@@ -1375,6 +1829,7 @@ public final class ViewerApp {
         browseMode = false;
         recenterSource = true;
         srcHcol = 0;
+        srcCursorPending = true; // §13.4: cursor back to the execution line
         status = "origin: following the execution line";
     }
 
@@ -1413,19 +1868,6 @@ public final class ViewerApp {
 
     private static int clamp(final int v, final int lo, final int hi) {
         return Math.min(Math.max(v, lo), hi);
-    }
-
-    private static int adjustScroll(final int scroll, final int sel, final int height, final int total) {
-        if (height <= 0) {
-            return 0;
-        }
-        int s = scroll;
-        if (sel < s) {
-            s = sel;
-        } else if (sel >= s + height) {
-            s = sel - height + 1;
-        }
-        return Math.min(Math.max(s, 0), Math.max(0, total - height));
     }
 
     private static String clip(final String s, final int w) {

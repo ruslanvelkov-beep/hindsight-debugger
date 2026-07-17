@@ -547,3 +547,118 @@ exit), as does the terminal's EOF; on the too-small screen (§1) `q` also quits 
 there is no room for the box. Inside the search dialogs `q` keeps typing into the query as
 before; from the help overlay `q` closes the overlay and opens the confirm box. The help texts
 say `q quit (y confirms)`.
+
+## 13. v1.3 additions & changes
+
+Authoritative over conflicting earlier text (§6.1, §8, §9, §11.7, §11.10, §12).
+Everything not mentioned here is unchanged.
+
+### 13.1 Modal-list scroll fix
+Every modal result list (the `/` and `.` dialogs, and the new §13.3/§13.5 windows) must
+scroll like the main list windows: the selection moves one row at a time, and the list
+scrolls ONLY when the selection would leave the visible rows (top or bottom edge).
+Concretely: each dialog keeps a PERSISTENT scroll offset (reset to 0 whenever the
+query/mode changes or the dialog opens), adjusted incrementally from its previous value —
+never recomputed from 0 each frame (the v1.1 bug that pinned a moving-up selection to the
+bottom row until the top of the list was reached).
+
+### 13.2 Instance browse — `/` mode toggle
+The `/` dialog gains a second mode; `Tab` inside the dialog toggles it.
+- **calls** (§11.7, unchanged). Title: `Browse method calls [/]  ⇥ instances`.
+- **instances**. Title: `Browse instances [/]  ⇥ calls`. The regex (case-insensitive,
+  `find()`) matches recorded instances' runtime class binary names (engine
+  `classSites()`). Results are the matching classes' instances flattened ascending by
+  `seq`, capped at 500 with a `showing first 500 of N` note; rows:
+  `seq <N> · t<tid> · <SimpleClass>#<id>`.
+The toggle keeps the typed query, recomputes results, resets selection and scroll. Enter
+on an instance row does NOT move the execution cursor: it closes the dialog and opens the
+instance explore window (§13.3) for that object id. Enter in calls mode is unchanged.
+
+### 13.3 Instance explore window
+A modal overlay presenting one instance as an expandable object tree resolved as-of the
+CURRENT cursor seq; the execution cursor does not move while it is open and the right
+windows keep reflecting the execution position. Title: `<SimpleClass>#<id>  (as of seq <S>)`.
+Rows, top to bottom:
+1. `[jump to creation]` — action row;
+2. `[close]` — action row;
+3. the object tree: root = `engine.objectTree(id)`, lazily expanded via
+   `engine.children`, rendered like Locals (`▸`/`▾` glyphs, indentation).
+Keys: ↑/↓ move the selection over ALL rows (actions + tree, §13.1 scrolling); on tree
+rows →/↵ expand (when expandable), ← collapse; `<`/`>` horizontal scroll; Esc closes.
+Enter on `[close]` closes. Enter on `[jump to creation]`: closes the window and moves the
+cursor to the instance's `OBJECT_FIRST_SEEN` position — `engine.creationOf(id)`, then
+seek to its `(tid, index)` and advance to the nearest FOLLOWING LINE in that thread
+(§11.7 jump pattern), appending exactly ONE history entry; status:
+`jumped to creation of <SimpleClass>#<id> (seq <N>)`. If `creationOf` returns nothing
+(defensive), a status message instead and the window stays open.
+
+### 13.4 Source-line cursor
+The Source Code window gains a cursor line (the target for §13.5 and future line
+commands). Rendering: the cursor line's GUTTER cells (the line number) use the selection
+colours (SELECTION_BG/SELECTION_FG); the code cells keep their normal colours and
+highlights, so the §6.1 exec/frame line highlight stays visible when the cursor sits on
+it. The cursor renders only while the Source window is FOCUSED. Keys while Source is
+focused (replacing the previous plain-scroll semantics):
+- ↑/↓ move the cursor one line; the view scrolls only when the cursor would leave the
+  visible rows (no margin — §13.1 semantics);
+- PgUp/PgDn (and ^B/^F) move the cursor by a page, view following;
+- Home / `g` → cursor to line 1; End / `G` → cursor to the last line (view follows);
+- ←/→ and `<`/`>` keep their §11.4 horizontal-scroll meaning.
+The cursor resets to the highlighted execution/frame line after every navigation that
+moves the cursor or changes the shown file (steps, seeks, frame select, thread switch,
+`o` origin), and to the requested line when a file opens in browse mode (§11.8).
+
+### 13.5 Variable history — `v`
+With the Source window focused, `v` inspects the cursor line (§13.4) of the SHOWN file
+(exec or browse mode alike):
+1. Parse the line for a class-variable (field) declaration with a pure lexical heuristic
+   (`FieldDecl.parse(String) -> List<String>` candidates, unit-tested): consider the text
+   before `=` (else before `;`); strip `//` comments; reject lines whose segment contains
+   `(` or `)` (methods/calls) or starts with a control keyword (`if`, `for`, `while`,
+   `return`, `switch`, `case`, `throw`, `new`, `else`, `do`, `try`, `catch`, `import`,
+   `package`, `class`, `interface`, `enum`, `record`, `assert`, `yield`); require at
+   least a type token AND a name token (≥ 2 identifier-ish tokens, `<...>`/`[]`
+   stripped); support multi-declarators split on commas at angle-bracket depth 0
+   (`int a, b;` → `a`, `b`). Candidates are the declared identifier(s), in order.
+2. No candidate parses → status row `no class variable definition on this line`; no window.
+3. For each candidate in order (first with hits wins):
+   `engine.fieldWrites(shownFileName, name, 500)` — every FIELD_WRITE whose site field
+   name equals the candidate AND whose owner class belongs to the shown file (the
+   OUTERMOST simple name of the owner binary — text after the last `.`, cut at the first
+   `$` — plus `.java` equals the file name; inner/nested classes thus match their
+   enclosing file).
+4. Hits → modal `Variable history [v]`, rows ascending by seq (§13.1 scrolling):
+   `seq <N> · t<tid> · <Owner>#<oid>.<field>: <old> → <new>  (<File>:<line>)`
+   (statics omit `#<oid>`). Enter = jump: seek to the record's `(tid, index)`, then
+   position on the nearest LINE AT/BEFORE it (the write belongs to that line; fall
+   FORWARD only if no LINE precedes), append one history entry. Esc closes. Note
+   `showing first 500 of N` when capped.
+5. Candidates parsed but zero hits → status row `no recorded writes for '<name>'`; no window.
+Help: the Source-focus help line gains `v var-history`; the overlay gains a `v` row and
+the `/` Tab toggle.
+
+### 13.6 Engine API additions
+```java
+List<ClassSite> classSites();                    // distinct FIRST_SEEN runtime classes + instance counts,
+                                                 // sorted by classBinary; built once, cached; immutable
+List<Instance> instancesOf(String classBinary, int cap);  // that class's instances ascending seq;
+                                                 // empty for unknown class or cap <= 0
+Instance creationOf(long objectId);              // the id's OBJECT_FIRST_SEEN position, or null
+List<FieldWriteHit> fieldWrites(String fileName, String fieldName, int cap); // §13.5 rule, ascending seq
+record ClassSite(String classBinary, long instanceCount) {}
+record Instance(long objectId, long seq, int tid, long index) {}
+record FieldWriteHit(long seq, int tid, long index, long ownerId, String ownerClass,
+                     String fieldName, boolean isStatic, String before, String after,
+                     String fileName, int line) {}
+```
+All built by ONE additional lazy full pass over all threads' records (one shared builder,
+cached), mirroring `methodSites()`. `before`/`after` are rendered display strings
+(ValueRenderer; §2.3 runtime-tag rules for ref-typed fields, blob strings resolved).
+`fileName`/`line` come from the write site. The pass also records, per object id, its
+FIRST_SEEN `(seq, tid, index)` for `creationOf`.
+
+### 13.7 Pure TUI helpers (unit-tested, terminal-free)
+- `InstanceBrowse` — §13.2 regex filter + flatten + cap (mirrors `MethodBrowse`).
+- `FieldDecl` — §13.5 declaration parser.
+- The §13.1 scroll rule is exercised through the existing `adjustScroll` with persistent
+  state; pin it with a test if `adjustScroll` moves/changes.

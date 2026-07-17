@@ -125,6 +125,16 @@ public final class Engine implements AutoCloseable {
     private List<MethodSite> methodSitesCache;
     private Map<Integer, List<Call>> callsBySite;
 
+    // Lazily built once on first classSites()/instancesOf()/creationOf()/fieldWrites() call
+    // (§13.6, one shared full pass mirroring ensureMethodSites): per runtime class its
+    // OBJECT_FIRST_SEEN instances ascending by seq, per object id its creation position, and
+    // per field name its FIELD_WRITE positions (refs only — values render lazily at query time,
+    // a recording can hold millions of field writes).
+    private List<ClassSite> classSitesCache;
+    private Map<String, List<Instance>> instancesByClass;
+    private Map<Long, Instance> creationById;
+    private Map<String, List<WriteRef>> fieldWriteRefsByName;
+
     private Engine(final Recording recording) throws IOException {
         this.recording = recording;
         this.schemaVersion = recording.schemaVersion();
@@ -1070,6 +1080,194 @@ public final class Engine implements AutoCloseable {
                 .thenComparing(m -> m.methodName() == null ? "" : m.methodName()));
         this.callsBySite = bySite;
         this.methodSitesCache = List.copyOf(sites);
+    }
+
+    // ---- instance & field-write browse (§13.6) ----
+
+    /**
+     * The distinct runtime classes the recording registered instances of (one entry per
+     * {@code OBJECT_FIRST_SEEN} runtime class), each with its total instance count, sorted by
+     * {@code classBinary} (§13.6). Built once on first use and cached; the returned list is
+     * immutable.
+     */
+    public List<ClassSite> classSites() {
+        ensureInstanceIndex();
+        return classSitesCache;
+    }
+
+    /**
+     * The first {@code cap} instances of the given runtime class across all threads, ascending
+     * by global {@code seq} (§13.6). Returns an empty list for an unknown class or a non-positive
+     * {@code cap}. Shares the per-class instance index with {@link #classSites()}, built once on
+     * first use.
+     *
+     * @param classBinary a runtime class binary name (typically from {@link ClassSite#classBinary()})
+     * @param cap the maximum number of instances to return
+     */
+    public List<Instance> instancesOf(final String classBinary, final int cap) {
+        ensureInstanceIndex();
+        List<Instance> all = instancesByClass.get(classBinary);
+        if (all == null || cap <= 0) {
+            return List.of();
+        }
+        return List.copyOf(all.subList(0, Math.min(cap, all.size())));
+    }
+
+    /**
+     * The position of an object id's {@code OBJECT_FIRST_SEEN} record — the "jump to creation"
+     * target of the instance explore window (§13.3/§13.6) — or {@code null} when the recording
+     * never registered that id.
+     */
+    public Instance creationOf(final long objectId) {
+        ensureInstanceIndex();
+        return creationById.get(objectId);
+    }
+
+    /**
+     * Every {@code FIELD_WRITE} to a field named {@code fieldName} whose owner class belongs to
+     * source file {@code fileName}, ascending by global {@code seq}, stopping at {@code cap} hits
+     * (§13.5). "Belongs to" is the outermost-simple-name rule: the owner class binary's text
+     * after the last {@code .}, cut at the first {@code $}, plus {@code ".java"} must equal
+     * {@code fileName} — so inner/nested classes match their enclosing file. Old/new values are
+     * rendered at query time exactly as the reader dump renders them (per-slot runtime tags of
+     * reference-typed fields, blob strings resolved).
+     *
+     * @param fileName the source file to match owners against, e.g. {@code Foo.java}
+     * @param fieldName the bare field name to look up
+     * @param cap the maximum number of hits to return
+     */
+    public List<FieldWriteHit> fieldWrites(final String fileName, final String fieldName, final int cap) {
+        ensureInstanceIndex();
+        List<WriteRef> refs = fieldWriteRefsByName.get(fieldName);
+        if (refs == null || fileName == null || cap <= 0) {
+            return List.of();
+        }
+        List<FieldWriteHit> out = new ArrayList<>();
+        for (WriteRef w : refs) {
+            if (out.size() >= cap) {
+                break;
+            }
+            Rec r = rec(w.tid(), w.index());
+            Site s = recording.site(r.location());
+            if (s == null) {
+                continue;
+            }
+            String ownerBinary = recording.symbolText(s.classSym());
+            if (!fileName.equals(outermostSimpleName(ownerBinary) + ".java")) {
+                continue;
+            }
+            out.add(new FieldWriteHit(
+                    r.seq(),
+                    w.tid(),
+                    w.index(),
+                    r.target(),
+                    ownerBinary,
+                    fieldName,
+                    s.isStatic() || r.isStatic(),
+                    renderer.render(r, true),
+                    renderer.render(r, false),
+                    s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
+                    s.line()));
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * The total number of {@code FIELD_WRITE}s {@link #fieldWrites} would match for
+     * {@code (fileName, fieldName)} with an unbounded cap — the {@code of N} in a capped
+     * variable-history note (§13.5). Walks the same index applying the same owner-file rule
+     * but renders nothing, so it stays cheap even against millions of writes.
+     *
+     * @param fileName the source file to match owners against, e.g. {@code Foo.java}
+     * @param fieldName the bare field name to look up
+     */
+    public long countFieldWrites(final String fileName, final String fieldName) {
+        ensureInstanceIndex();
+        List<WriteRef> refs = fieldWriteRefsByName.get(fieldName);
+        if (refs == null || fileName == null) {
+            return 0;
+        }
+        long n = 0;
+        for (WriteRef w : refs) {
+            Rec r = rec(w.tid(), w.index());
+            Site s = recording.site(r.location());
+            if (s == null) {
+                continue;
+            }
+            if (fileName.equals(outermostSimpleName(recording.symbolText(s.classSym())) + ".java")) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * The one additional lazy full pass over all threads' records behind the §13.6 API (mirrors
+     * {@link #ensureMethodSites()}): indexes every {@code OBJECT_FIRST_SEEN} by runtime class and
+     * by object id, and every {@code FIELD_WRITE} by field name (positions only).
+     */
+    private void ensureInstanceIndex() {
+        if (classSitesCache != null) {
+            return;
+        }
+        Map<String, List<Instance>> byClass = new HashMap<>();
+        Map<Long, Instance> byId = new HashMap<>();
+        Map<String, List<WriteRef>> writeRefs = new HashMap<>();
+        for (int tid : recording.threadIds()) {
+            long count = index(tid).count;
+            for (long i = 0; i < count; i++) {
+                Rec r = rec(tid, i);
+                if (r.type() == Format.OBJECT_FIRST_SEEN && r.target() != 0) {
+                    String cls = recording.symbolText(r.location());
+                    Instance inst = new Instance(r.target(), r.seq(), tid, i);
+                    byClass.computeIfAbsent(cls != null ? cls : "?", k -> new ArrayList<>()).add(inst);
+                    byId.merge(r.target(), inst, (a, b) -> a.seq() <= b.seq() ? a : b);
+                } else if (r.type() == Format.FIELD_WRITE) {
+                    Site s = recording.site(r.location());
+                    String field = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
+                    if (field != null) {
+                        writeRefs.computeIfAbsent(field, k -> new ArrayList<>())
+                                .add(new WriteRef(r.seq(), tid, i));
+                    }
+                }
+            }
+        }
+        Comparator<Instance> instOrder = Comparator
+                .comparingLong(Instance::seq)
+                .thenComparingInt(Instance::tid)
+                .thenComparingLong(Instance::index);
+        List<ClassSite> sites = new ArrayList<>(byClass.size());
+        for (Map.Entry<String, List<Instance>> e : byClass.entrySet()) {
+            e.getValue().sort(instOrder);
+            sites.add(new ClassSite(e.getKey(), e.getValue().size()));
+        }
+        sites.sort(Comparator.comparing(ClassSite::classBinary));
+        Comparator<WriteRef> refOrder = Comparator
+                .comparingLong(WriteRef::seq)
+                .thenComparingInt(WriteRef::tid)
+                .thenComparingLong(WriteRef::index);
+        for (List<WriteRef> list : writeRefs.values()) {
+            list.sort(refOrder);
+        }
+        this.instancesByClass = byClass;
+        this.creationById = byId;
+        this.fieldWriteRefsByName = writeRefs;
+        this.classSitesCache = List.copyOf(sites);
+    }
+
+    /**
+     * The §13.5 owner-file name part: the text after the last {@code .} of a binary name, cut at
+     * the first {@code $} — {@code com.ex.Foo$Inner} → {@code Foo} — so a nested class maps to its
+     * enclosing source file. (Contrast {@link Format#simpleName}, which keeps the innermost part.)
+     */
+    static String outermostSimpleName(final String binaryName) {
+        if (binaryName == null || binaryName.isEmpty()) {
+            return "?";
+        }
+        int dot = binaryName.lastIndexOf('.');
+        String tail = dot >= 0 ? binaryName.substring(dot + 1) : binaryName;
+        int dollar = tail.indexOf('$');
+        return dollar >= 0 ? tail.substring(0, dollar) : tail;
     }
 
     // ---- shared value/descriptor helpers ----

@@ -81,4 +81,35 @@ public final class ScrollMath {
     public static int center(final int target, final int height, final int fileLines) {
         return clampTop(target - height / 2, fileLines, height);
     }
+
+    /**
+     * Incremental edge-only list scrolling (§13.1), shared by every list window and modal result
+     * list: the scroll offset moves only when the selection would leave the visible rows —
+     * up to {@code sel} when the selection went above the viewport, down to
+     * {@code sel - height + 1} when it went below — and is otherwise left exactly where it was.
+     * Callers MUST pass the <em>persisted</em> previous offset (never a constant 0: recomputing
+     * from 0 each frame was the v1.1 bug that pinned a moving-up selection to the bottom row).
+     *
+     * <p>Unlike the 1-based source-line math above, this operates on 0-based list rows:
+     * {@code scroll} is the index of the first visible row and the result is clamped into
+     * {@code [0, max(0, total - height)]}.
+     *
+     * @param scroll the persisted previous scroll offset (0-based first visible row)
+     * @param sel the selected row index (0-based)
+     * @param height visible row count
+     * @param total total row count
+     * @return the new scroll offset
+     */
+    public static int adjustScroll(final int scroll, final int sel, final int height, final int total) {
+        if (height <= 0) {
+            return 0;
+        }
+        int s = scroll;
+        if (sel < s) {
+            s = sel;
+        } else if (sel >= s + height) {
+            s = sel - height + 1;
+        }
+        return Math.min(Math.max(s, 0), Math.max(0, total - height));
+    }
 }

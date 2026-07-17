@@ -65,4 +65,43 @@ final class ScrollMathTest {
         assertEquals(1, ScrollMath.center(1, 20, 100));
         assertEquals(81, ScrollMath.center(100, 20, 100));
     }
+
+    // ---- §13.1 edge-only list scrolling ----
+
+    @Test
+    void adjustScrollLeavesOffsetWhileSelectionVisible() {
+        // Selection anywhere inside [scroll, scroll+height) must not move the view.
+        assertEquals(20, ScrollMath.adjustScroll(20, 20, 5, 100));
+        assertEquals(20, ScrollMath.adjustScroll(20, 22, 5, 100));
+        assertEquals(20, ScrollMath.adjustScroll(20, 24, 5, 100));
+    }
+
+    @Test
+    void adjustScrollFollowsSelectionOffEitherEdge() {
+        assertEquals(19, ScrollMath.adjustScroll(20, 19, 5, 100)); // up: scroll to the selection
+        assertEquals(21, ScrollMath.adjustScroll(20, 25, 5, 100)); // down: selection on bottom row
+    }
+
+    @Test
+    void adjustScrollIsIncrementalNotRecomputedFromZero() {
+        // The v1.1 bug: recomputing from 0 each frame pinned a moving-up selection to the
+        // bottom row. From a persisted offset the selection walks up through the window and
+        // the view moves only when the selection reaches the top edge.
+        int scroll = ScrollMath.adjustScroll(0, 24, 5, 100); // jump to row 24 → view 20..24
+        assertEquals(20, scroll);
+        for (int sel = 23; sel >= 20; sel--) {
+            scroll = ScrollMath.adjustScroll(scroll, sel, 5, 100);
+            assertEquals(20, scroll); // selection climbs, view stays
+        }
+        assertEquals(19, ScrollMath.adjustScroll(scroll, 19, 5, 100)); // now the edge scrolls
+    }
+
+    @Test
+    void adjustScrollClampsToListBounds() {
+        assertEquals(0, ScrollMath.adjustScroll(-3, 0, 5, 100));
+        assertEquals(95, ScrollMath.adjustScroll(200, 99, 5, 100));
+        assertEquals(0, ScrollMath.adjustScroll(4, 0, 5, 3)); // fewer rows than the viewport
+        assertEquals(0, ScrollMath.adjustScroll(7, 2, 0, 10)); // degenerate height
+        assertEquals(0, ScrollMath.adjustScroll(0, 0, 5, 0)); // empty list
+    }
 }

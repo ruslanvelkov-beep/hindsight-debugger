@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.hindsight.reader.Format;
+import io.hindsight.reader.Rec;
+import io.hindsight.reader.Recording;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
@@ -28,10 +30,12 @@ final class EngineTest {
     private static final int IDX_ENTER_MAIN = 5;
     private static final int IDX_LINE10 = 6;
     private static final int IDX_LINE11 = 7;
+    private static final int IDX_WRITE_COUNT = 8;
     private static final int IDX_LINE12 = 9;
     private static final int IDX_ENTER_HELPER = 10;
     private static final int IDX_LINE20 = 12;
     private static final int IDX_LINE21 = 14;
+    private static final int IDX_WRITE_BALANCE = 15;
     private static final int IDX_EXIT_HELPER = 16;
     private static final int IDX_LINE13 = 17;
     private static final int IDX_LINE11_AGAIN = 18;
@@ -527,6 +531,176 @@ final class EngineTest {
         r.rec(1, Format.METHOD_EXIT, 0, Format.TAG_VOID, 0, siteBeta, 0, 0, 0);  // seq 10
         r.rec(1, Format.METHOD_ENTER, 0, 0, 0, siteAlpha, 0, 0, 0); // seq 11, t1 alpha #2
         r.rec(1, Format.METHOD_EXIT, 0, Format.TAG_VOID, 0, siteAlpha, 0, 0, 0); // seq 12
+        return r.write();
+    }
+
+    // ---- §13.6: classSites / instancesOf / creationOf / fieldWrites ----
+
+    @Test
+    void classSitesDistinctCountsSorted(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(buildInstances(dir))) {
+            List<ClassSite> sites = e.classSites();
+            assertEquals(2, sites.size()); // distinct runtime classes, not one entry per instance
+            assertEquals(new ClassSite("com.ex.Bar", 1L), sites.get(0)); // sorted by classBinary
+            assertEquals(new ClassSite("com.ex.Foo", 3L), sites.get(1));
+            assertEquals(sites, e.classSites()); // cached: repeated calls return a stable list
+        }
+    }
+
+    @Test
+    void instancesOfAscendingSeqAndCapped(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(buildInstances(dir))) {
+            List<Instance> foos = e.instancesOf("com.ex.Foo", 10);
+            assertEquals(
+                    List.of(
+                            new Instance(10L, 5L, 1, 2),
+                            new Instance(30L, 7L, 1, 3),
+                            new Instance(40L, 8L, 2, 3)),
+                    foos,
+                    "ascending by seq across threads");
+
+            assertEquals(foos.subList(0, 2), e.instancesOf("com.ex.Foo", 2)); // capped
+            assertTrue(e.instancesOf("com.ex.Nope", 10).isEmpty()); // unknown class
+            assertTrue(e.instancesOf("com.ex.Foo", 0).isEmpty()); // cap <= 0
+        }
+    }
+
+    @Test
+    void creationOfRoundTripsToFirstSeenAndNullForUnknown(@TempDir final Path dir) throws IOException {
+        Path built = buildInstances(dir);
+        try (Engine e = Engine.open(built);
+                Recording probe = Recording.open(built)) {
+            Instance c = e.creationOf(30L);
+            assertEquals(new Instance(30L, 7L, 1, 3), c);
+
+            // Round-trip: the position really is that object's OBJECT_FIRST_SEEN record.
+            Rec first = probe.recordAt(c.tid(), c.index());
+            assertEquals(Format.OBJECT_FIRST_SEEN, first.type());
+            assertEquals(30L, first.target());
+            assertEquals(c.seq(), first.seq());
+
+            assertNull(e.creationOf(999L)); // unknown id
+        }
+    }
+
+    @Test
+    void fieldWritesRenderTheSyntheticScenarioWrites(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            // Static write Foo.COUNT: 0 -> 5 (idx 8, seq 9); owner com.ex.Foo → Foo.java.
+            List<FieldWriteHit> count = e.fieldWrites("Foo.java", "COUNT", 10);
+            assertEquals(1, count.size());
+            FieldWriteHit c = count.get(0);
+            assertEquals(9L, c.seq());
+            assertEquals(1, c.tid());
+            assertEquals(IDX_WRITE_COUNT, c.index());
+            assertEquals(0L, c.ownerId()); // statics carry no owner object
+            assertEquals("com.ex.Foo", c.ownerClass());
+            assertEquals("COUNT", c.fieldName());
+            assertTrue(c.isStatic());
+            assertEquals("0", c.before());
+            assertEquals("5", c.after());
+            assertEquals("Foo.java", c.fileName());
+            assertEquals(11, c.line());
+
+            // Instance write Bar#100.balance: 1000 -> 900 (idx 15, seq 16); the owner class
+            // com.ex.Bar belongs to Bar.java even though the write SITE's file is Foo.java.
+            List<FieldWriteHit> bal = e.fieldWrites("Bar.java", "balance", 10);
+            assertEquals(1, bal.size());
+            FieldWriteHit b = bal.get(0);
+            assertEquals(16L, b.seq());
+            assertEquals(1, b.tid());
+            assertEquals(IDX_WRITE_BALANCE, b.index());
+            assertEquals(100L, b.ownerId());
+            assertEquals("com.ex.Bar", b.ownerClass());
+            assertEquals("balance", b.fieldName());
+            assertFalse(b.isStatic());
+            assertEquals("1000", b.before());
+            assertEquals("900", b.after());
+            assertEquals("Foo.java", b.fileName()); // fileName/line come from the write site
+            assertEquals(21, b.line());
+
+            // Owner-file rule: balance's owner does NOT belong to the queried Foo.java.
+            assertTrue(e.fieldWrites("Foo.java", "balance", 10).isEmpty());
+            assertTrue(e.fieldWrites("Foo.java", "nope", 10).isEmpty()); // unknown field
+            assertTrue(e.fieldWrites("Foo.java", "COUNT", 0).isEmpty()); // cap <= 0
+
+            // countFieldWrites applies the same owner-file rule, cap-free (§13.5 "of N").
+            assertEquals(1L, e.countFieldWrites("Foo.java", "COUNT"));
+            assertEquals(1L, e.countFieldWrites("Bar.java", "balance"));
+            assertEquals(0L, e.countFieldWrites("Foo.java", "balance"));
+            assertEquals(0L, e.countFieldWrites("Foo.java", "nope"));
+            assertEquals(0L, e.countFieldWrites(null, "COUNT"));
+        }
+    }
+
+    @Test
+    void fieldWritesInnerClassOwnerMatchesEnclosingFile(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(buildInstances(dir))) {
+            // Both Foo$Inner.y writes match Foo.java; the same-named Zed.y write is excluded.
+            List<FieldWriteHit> ys = e.fieldWrites("Foo.java", "y", 10);
+            assertEquals(2, ys.size());
+            assertEquals(9L, ys.get(0).seq());
+            assertEquals(1, ys.get(0).tid());
+            assertEquals("com.ex.Foo$Inner", ys.get(0).ownerClass());
+            assertEquals(30L, ys.get(0).ownerId());
+            assertEquals(11L, ys.get(1).seq()); // ascending by seq across threads
+            assertEquals(2, ys.get(1).tid());
+
+            // The excluded foreign-owner write is reachable under its own file.
+            List<FieldWriteHit> zed = e.fieldWrites("Zed.java", "y", 10);
+            assertEquals(1, zed.size());
+            assertEquals(10L, zed.get(0).seq());
+            assertNull(zed.get(0).fileName()); // its site carries no file symbol
+
+            // The cap stops the walk.
+            assertEquals(ys.subList(0, 1), e.fieldWrites("Foo.java", "y", 1));
+
+            // A reference-typed String write renders via the §2.3 runtime tags + blob path.
+            List<FieldWriteHit> names = e.fieldWrites("Foo.java", "name", 10);
+            assertEquals(1, names.size());
+            assertEquals("null", names.get(0).before());
+            assertEquals("\"hi\"", names.get(0).after());
+            assertEquals(10L, names.get(0).ownerId());
+            assertFalse(names.get(0).isStatic());
+        }
+    }
+
+    /**
+     * A recording with three {@code com.ex.Foo} instances (two on t1, one on t2, interleaved)
+     * and one {@code com.ex.Bar} instance, plus field writes exercising the §13.5 owner-file
+     * rule: two inner-class writes (owner {@code com.ex.Foo$Inner} → {@code Foo.java}), one
+     * foreign-owner write with the same field name (owner {@code com.ex.Zed}), and a
+     * reference-typed String write (owner {@code com.ex.Foo}) exercising the §2.3 per-slot
+     * runtime tags and blob-string rendering.
+     */
+    private static Path buildInstances(final Path dir) throws IOException {
+        SyntheticRecording r = new SyntheticRecording(dir);
+        int file = r.sym("FILE", "Foo.java");
+        int clsInner = r.sym("CLASS", "com.ex.Foo$Inner");
+        int clsZed = r.sym("CLASS", "com.ex.Zed");
+        int clsFoo = r.sym("CLASS", "com.ex.Foo");
+        int fieldY = r.sym("FIELD", "y");
+        int fieldName = r.sym("FIELD", "name");
+        int siteInnerY = r.fieldSite(clsInner, file, 33, fieldY, "I", false);
+        int siteZedY = r.fieldSite(clsZed, 0, 7, fieldY, "I", false);
+        int siteFooName = r.fieldSite(clsFoo, file, 12, fieldName, "Ljava/lang/String;", false);
+
+        int inline = SyntheticRecording.flags(Format.KIND_INLINE, Format.KIND_INLINE, 0);
+
+        r.threadStart(1, "t1", 1L, 0L); // seq 1,2  t1 idx 0,1
+        r.threadStart(2, "t2", 2L, 0L); // seq 3,4  t2 idx 0,1
+        r.firstSeen(1, 10L, "com.ex.Foo"); // seq 5,  t1 idx 2
+        r.firstSeen(2, 20L, "com.ex.Bar"); // seq 6,  t2 idx 2
+        r.firstSeen(1, 30L, "com.ex.Foo"); // seq 7,  t1 idx 3
+        r.firstSeen(2, 40L, "com.ex.Foo"); // seq 8,  t2 idx 3
+        r.rec(1, Format.FIELD_WRITE, inline, Format.TAG_INT, 0, siteInnerY, 30L, 1, 2); // seq 9,  t1 idx 4
+        r.rec(2, Format.FIELD_WRITE, inline, Format.TAG_INT, 0, siteZedY, 99L, 5, 6); //   seq 10, t2 idx 4
+        r.rec(2, Format.FIELD_WRITE, inline, Format.TAG_INT, 0, siteInnerY, 30L, 2, 3); // seq 11, t2 idx 5
+        long hi = r.blobUtf8(1, "hi");
+        // Ref-typed field write, null -> "hi": before runtime tag NULL in the aux idx byte,
+        // after runtime tag STRING in the tag byte (FORMAT.md §2.3).
+        r.rec(1, Format.FIELD_WRITE, SyntheticRecording.flags(Format.KIND_NONE, Format.KIND_BLOB, 0),
+                Format.TAG_STRING, Format.TAG_NULL, siteFooName, 10L, 0, hi); //           seq 12, t1 idx 5
         return r.write();
     }
 
