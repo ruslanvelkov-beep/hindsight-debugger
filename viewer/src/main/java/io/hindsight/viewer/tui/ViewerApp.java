@@ -21,6 +21,7 @@ import io.hindsight.viewer.engine.Local;
 import io.hindsight.viewer.engine.ObjectNode;
 import io.hindsight.viewer.engine.RecordInfo;
 import io.hindsight.viewer.engine.StepResult;
+import io.hindsight.viewer.engine.Value;
 import io.hindsight.viewer.highlight.JavaHighlighter;
 import io.hindsight.viewer.source.SourcePath;
 import java.io.IOException;
@@ -68,10 +69,12 @@ import java.util.regex.PatternSyntaxException;
  *   <li><b>Modal lists scroll incrementally</b> (§13.1): every dialog/overlay list
  *       persists its scroll offset and adjusts it edge-only via
  *       {@link ScrollMath#adjustScroll}, resetting to 0 on open/query/mode change.
- *   <li><b>Instance browse & explore</b> (§13.2/§13.3): {@code Tab} in the {@code /}
- *       dialog toggles calls ↔ instances ({@link InstanceBrowse}); Enter on an
- *       instance opens the explore overlay (a dedicated {@link TreeView}) without
- *       moving the cursor.
+ *   <li><b>Instance browse</b> (§13.2/§14.1/§14.2): {@code Tab} in the {@code /}
+ *       dialog toggles calls ↔ instances ({@link InstanceBrowse}, whose query also
+ *       accepts {@code <regex>#<id>}/{@code #<id>}); the instance rows themselves are
+ *       expandable object-tree roots (a dedicated {@link TreeView}) resolved as-of
+ *       the current cursor, and {@code g} jumps to the selected row's owning
+ *       instance's first mention while the dialog stays open.
  *   <li><b>Source-line cursor + variable history</b> (§13.4/§13.5): the Source
  *       window keeps a cursor line (rendered in the gutter while focused) that
  *       ↑/↓ move; {@code v} parses it via {@link FieldDecl} and lists the matching
@@ -103,7 +106,12 @@ public final class ViewerApp {
      * Live state of an open modal dialog: a query, its result rows + jump targets, a note, and a
      * persistent scroll offset (§13.1 — adjusted incrementally each frame, reset to 0 on open, on
      * query change and on the §13.2 mode toggle). The {@code METHOD} kind carries the calls ↔
-     * instances mode flag; in instances mode {@code instanceRows} mirrors {@code rows}.
+     * instances mode flag; in instances mode the result rows are the roots of {@code instanceTree}
+     * (§14.2, expanded in place; {@code instanceRows} holds the backing per-root instances and
+     * {@code rows} mirrors their labels for the empty/no-matches checks), {@code hcol} is the
+     * tree's horizontal scroll, and {@code listActive} tracks whether the last key went to the
+     * result list — when it did, {@code g}/{@code <}/{@code >} act on the list instead of typing
+     * into the query (the §14.2 g-vs-typing rule; any query edit hands them back to the query).
      */
     private static final class SearchDialog {
         final DialogKind kind;
@@ -111,37 +119,16 @@ public final class ViewerApp {
         List<String> rows = List.of();
         List<long[]> targets = List.of();
         List<InstanceBrowse.Row> instanceRows = List.of();
+        TreeView instanceTree;
         String note = "";
         int sel;
         int scroll;
+        int hcol;
         boolean instancesMode;
+        boolean listActive;
 
         SearchDialog(final DialogKind kind) {
             this.kind = kind;
-        }
-    }
-
-    /**
-     * Live state of the §13.3 instance explore overlay: one object id shown as an expandable tree
-     * (a dedicated {@link TreeView}) under two action rows, resolved as-of the seq captured in the
-     * title at open time (the cursor cannot move while it is open). {@code sel} runs over ALL rows
-     * (0 = {@code [jump to creation]}, 1 = {@code [close]}, 2+ = tree rows); {@code scroll} is the
-     * §13.1 persistent offset.
-     */
-    private static final class ExploreWindow {
-        final long objectId;
-        final String label;
-        final String title;
-        final TreeView tree;
-        int sel;
-        int scroll;
-        int hcol;
-
-        ExploreWindow(final long objectId, final String label, final String title, final TreeView tree) {
-            this.objectId = objectId;
-            this.label = label;
-            this.title = title;
-            this.tree = tree;
         }
     }
 
@@ -182,9 +169,12 @@ public final class ViewerApp {
     private boolean helpOverlay;
     private boolean quitConfirm;
     private SearchDialog dialog;
-    private ExploreWindow explore;
     private VarHistoryWindow varHist;
     private TerminalPosition cursorPos;
+
+    // §14.4: the Locals selection's value/descriptor, captured by renderLocals for the info line.
+    private Value localsSelValue;
+    private String localsSelDescriptor;
 
     // Source window state.
     private int srcTop = 1;
@@ -310,9 +300,6 @@ public final class ViewerApp {
         if (dialog != null) {
             drawDialog(g, cols, rows);
         }
-        if (explore != null) {
-            drawExplore(g, cols, rows);
-        }
         if (varHist != null) {
             drawVarHistory(g, cols, rows);
         }
@@ -398,8 +385,9 @@ public final class ViewerApp {
         List<String> lines = src.get();
         List<List<JavaHighlighter.Span>> spans =
                 highlightCache.computeIfAbsent(fileKey, k -> highlighter.highlight(lines));
-        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, sf == frames.size() - 1,
-                sourceCursorLine());
+        // §14.5: an unrecorded frame's line gets the frame-line highlight, never the exec one.
+        boolean exec = sf == frames.size() - 1 && frame.recorded();
+        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, exec, sourceCursorLine());
     }
 
     private void renderBrowse(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -530,7 +518,18 @@ public final class ViewerApp {
         }
         stackSel = clamp(stackSel, 0, Math.max(0, rows.size() - 1));
         stackScroll = ScrollMath.adjustScroll(stackScroll, stackSel, ih, rows.size());
-        drawRows(g, ix, iy, iw, ih, rows, stackSel, stackScroll, stackHcol, true);
+        // §14.5: unrecorded (capture-only) frames render DIM, same row text; selection as usual.
+        for (int r = 0; r < ih; r++) {
+            int idx = stackScroll + r;
+            if (idx < 0 || idx >= rows.size()) {
+                continue;
+            }
+            boolean s = idx == stackSel;
+            boolean recorded = frames.get(frames.size() - 1 - idx).recorded();
+            put(g, ix, iy + r, HScroll.clip(rows.get(idx), stackHcol, iw),
+                    s ? Palette.SELECTION_FG : (recorded ? Palette.FG : Palette.DIM),
+                    s ? Palette.SELECTION_BG : Palette.BG, false);
+        }
     }
 
     private void renderLocals(final TextGraphics g, final Layout.Rect rect) {
@@ -544,12 +543,34 @@ public final class ViewerApp {
         if (iw <= 0 || ih <= 0) {
             return;
         }
-        List<Local> locals = engine.locals(engine.selectedFrame());
+        localsSelValue = null;
+        localsSelDescriptor = null;
+        List<Frame> frames = engine.stack();
+        int sf = engine.selectedFrame();
+        Frame sel = sf >= 0 && sf < frames.size() ? frames.get(sf) : null;
+        if (sel != null && !sel.recorded()) {
+            // §14.5: a capture-only frame has no reconstructable locals.
+            localsTree.setRoots(List.of());
+            put(g, ix, iy, clip("(unrecorded frame — no locals)", iw), Palette.DIM, Palette.BG, false);
+            return;
+        }
+        List<Local> locals = engine.locals(sf);
         List<ObjectNode> roots = new ArrayList<>();
         for (Local l : locals) {
             roots.add(ObjectNode.of(l.name() + " = " + l.value().display(), l.value()));
         }
         localsTree.setRoots(roots);
+        // §14.4: remember the selected row's value (and, for a top-level local, its descriptor)
+        // so renderStatus can name its full type while Locals is focused.
+        List<TreeView.Row> treeRows = localsTree.rows();
+        if (!treeRows.isEmpty()) {
+            TreeView.Row row = treeRows.get(localsTree.selection());
+            localsSelValue = row.node().value();
+            int rootIdx = localsTree.selectedRootIndex();
+            if (row.depth() == 0 && rootIdx >= 0 && rootIdx < locals.size()) {
+                localsSelDescriptor = locals.get(rootIdx).descriptor();
+            }
+        }
         drawTree(g, ix, iy, iw, ih, localsTree, localsHcol);
     }
 
@@ -579,9 +600,38 @@ public final class ViewerApp {
     }
 
     private void renderStatus(final TextGraphics g, final int cols, final int row, final RecordInfo ri) {
-        String pos = "seq " + ri.seq() + DOT + "t" + ri.tid() + DOT + ri.siteText();
+        String pos = positionText(ri);
         String line = status.isEmpty() ? pos : status + "   —   " + pos;
         put(g, 0, row, clipPad(line, cols), Palette.FG, Palette.BG, false);
+    }
+
+    /**
+     * The focus-sensitive position part of the status row (§14.4): the selected instance's full
+     * class + id while the {@code /} dialog is in instances mode, the selected Locals row's full
+     * type while Locals is focused, and the compact record info everywhere else.
+     */
+    private String positionText(final RecordInfo ri) {
+        if (dialog != null && dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
+            InstanceBrowse.Row row = selectedInstanceRow();
+            if (row != null) {
+                return (row.classBinary() != null ? row.classBinary() : "?") + "#" + row.objectId();
+            }
+        } else if (dialog == null && focus == Win.LOCALS) {
+            String type = TypeName.of(localsSelValue, localsSelDescriptor, recording::objectClassName);
+            if (type != null) {
+                return type;
+            }
+        }
+        return "seq " + ri.seq() + DOT + "t" + ri.tid() + DOT + ri.siteText();
+    }
+
+    /** The instance owning the selected row of the instances-mode result tree (§14.2), or null. */
+    private InstanceBrowse.Row selectedInstanceRow() {
+        if (dialog == null || dialog.instanceTree == null || dialog.instanceRows.isEmpty()) {
+            return null;
+        }
+        int root = dialog.instanceTree.selectedRootIndex();
+        return root >= 0 && root < dialog.instanceRows.size() ? dialog.instanceRows.get(root) : null;
     }
 
     private void renderHelp(final TextGraphics g, final int cols, final int row) {
@@ -739,7 +789,7 @@ public final class ViewerApp {
         String hint = switch (dialog.kind) {
             case FILE -> "class[:line] | path.java[:line]   ↵ open  Esc close";
             case METHOD -> dialog.instancesMode
-                    ? "↑↓ select  ↵ explore  ⇥ calls  Esc close"
+                    ? "↑↓ move  →/↵ expand  ← collapse  g first-mention  Esc close"
                     : "↑↓ select  ↵ jump  ⇥ instances  Esc close";
             case OBJECT -> "↑↓ select  ↵ jump  Esc close";
         };
@@ -763,6 +813,10 @@ public final class ViewerApp {
                     Palette.DIM, Palette.DIALOG_BG, false);
             return;
         }
+        if (dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
+            drawInstanceTree(g, ix, listTop, iw, listH);
+            return;
+        }
         dialog.sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
         // §13.1: adjust the persisted offset incrementally — never recompute from 0.
         dialog.scroll = ScrollMath.adjustScroll(dialog.scroll, dialog.sel, listH, dialog.rows.size());
@@ -778,51 +832,27 @@ public final class ViewerApp {
     }
 
     /**
-     * The §13.3 instance explore overlay: two action rows and the object tree, drawn as a centered
-     * modal like {@link #drawDialog}, with §13.1 persistent scrolling over ALL rows.
+     * The §14.2 instances-mode result list: each instance row is the root of an in-place
+     * expandable object tree, rendered Locals-style (glyphs + indentation) with the §13.1
+     * edge-only scrolling the {@link TreeView} provides. Children are re-fetched from the
+     * engine on every draw, so expanded trees re-resolve as-of the cursor's current seq.
      */
-    private void drawExplore(final TextGraphics g, final int cols, final int rows) {
-        int w = clamp(cols - 6, 24, 74);
-        int h = clamp(rows - 6, 8, 20);
-        int x = Math.max(0, (cols - w) / 2);
-        int y = Math.max(0, (rows - h) / 2);
-        g.setForegroundColor(Palette.FG);
-        g.setBackgroundColor(Palette.DIALOG_BG);
-        g.disableModifiers(SGR.BOLD);
-        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
-        drawBox(g, new Layout.Rect(x, y, w, h), explore.title, Palette.DIALOG_BG, Palette.FOCUS, true);
-        int ix = x + 1;
-        int iy = y + 1;
-        int iw = w - 2;
-        int hintRow = y + h - 2;
-        put(g, ix, hintRow, clip("↑↓ move  →/↵ expand  ← collapse  <> hscroll  Esc close", iw),
-                Palette.DIM, Palette.DIALOG_BG, false);
-        int listH = hintRow - iy;
-        List<String> text = exploreRows();
-        explore.sel = clamp(explore.sel, 0, text.size() - 1);
-        explore.scroll = ScrollMath.adjustScroll(explore.scroll, explore.sel, listH, text.size());
+    private void drawInstanceTree(final TextGraphics g, final int ix, final int iy, final int iw, final int listH) {
+        TreeView tree = dialog.instanceTree;
+        List<TreeView.Row> rows = tree.rows();
+        tree.ensureVisible(listH, rows.size());
         for (int r = 0; r < listH; r++) {
-            int idx = explore.scroll + r;
-            if (idx >= text.size()) {
+            int idx = tree.scroll() + r;
+            if (idx >= rows.size()) {
                 break;
             }
-            boolean s = idx == explore.sel;
-            put(g, ix, iy + r, HScroll.clip(text.get(idx), explore.hcol, iw),
+            TreeView.Row row = rows.get(idx);
+            String glyph = row.expandable() ? (row.expanded() ? "▾ " : "▸ ") : "  ";
+            String text = "  ".repeat(row.depth()) + glyph + row.node().label();
+            boolean s = idx == tree.selection();
+            put(g, ix, iy + r, clipPad(HScroll.clip(text, dialog.hcol, iw), iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
-    }
-
-    /** All explore rows top to bottom: the two §13.3 action rows, then the flattened tree. */
-    private List<String> exploreRows() {
-        List<TreeView.Row> treeRows = explore.tree.rows();
-        List<String> out = new ArrayList<>(treeRows.size() + 2);
-        out.add("[jump to creation]");
-        out.add("[close]");
-        for (TreeView.Row r : treeRows) {
-            String glyph = r.expandable() ? (r.expanded() ? "▾ " : "▸ ") : "  ";
-            out.add("  ".repeat(r.depth()) + glyph + r.node().label());
-        }
-        return out;
     }
 
     /** The §13.5 variable-history overlay, drawn as a centered modal like {@link #drawDialog}. */
@@ -877,8 +907,8 @@ public final class ViewerApp {
             "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
             "v                     variable history for the Source cursor line",
             "/  .  F               browse calls/instances / find object / open file",
-            "Tab in /              toggle calls ↔ instances; ↵ on an instance opens",
-            "                      the explore window ([jump to creation] / [close])",
+            "Tab in /              toggle calls ↔ instances; instance rows expand",
+            "                      in place — g jumps to the instance's first mention",
             "?  F1                 toggle this help",
             "q  Ctrl+C             quit (q asks to confirm)",
             "",
@@ -949,10 +979,6 @@ public final class ViewerApp {
             }
             if (dialog != null) {
                 handleDialog(k);
-                return;
-            }
-            if (explore != null) {
-                handleExplore(k);
                 return;
             }
             if (varHist != null) {
@@ -1288,6 +1314,9 @@ public final class ViewerApp {
 
     private void openDialog(final DialogKind kind) {
         dialog = new SearchDialog(kind);
+        if (kind == DialogKind.METHOD) {
+            dialog.instanceTree = new TreeView(engine::children);
+        }
         recomputeDialog();
     }
 
@@ -1295,9 +1324,9 @@ public final class ViewerApp {
         KeyType t = k.getKeyType();
         if (t == KeyType.Escape) {
             dialog = null;
-        } else if (t == KeyType.Enter) {
-            jumpDialog();
-        } else if (t == KeyType.Tab) {
+            return;
+        }
+        if (t == KeyType.Tab) {
             // §13.2: Tab toggles calls ↔ instances (query kept; selection and scroll reset).
             if (dialog.kind == DialogKind.METHOD) {
                 dialog.instancesMode = !dialog.instancesMode;
@@ -1305,6 +1334,13 @@ public final class ViewerApp {
                 dialog.scroll = 0;
                 recomputeDialog();
             }
+            return;
+        }
+        if (dialog.kind == DialogKind.METHOD && dialog.instancesMode && handleInstancesKey(k)) {
+            return;
+        }
+        if (t == KeyType.Enter) {
+            jumpDialog();
         } else if (t == KeyType.ArrowUp) {
             dialog.sel = Math.max(0, dialog.sel - 1);
         } else if (t == KeyType.ArrowDown) {
@@ -1325,6 +1361,79 @@ public final class ViewerApp {
                 recomputeDialog();
             }
         }
+    }
+
+    /**
+     * Keys the §14.2 instances-mode result tree consumes; returns {@code false} when the key
+     * should fall through to query editing. Arrow keys and Enter always drive the tree (they are
+     * not typable) and mark the list active; {@code g}/{@code <}/{@code >} act on the tree only
+     * while the list is active — i.e. the last non-typing key went to the list — so they remain
+     * typable in the query until the user starts navigating results (any query edit deactivates
+     * the list again via {@link #recomputeInstanceResults}).
+     */
+    private boolean handleInstancesKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        TreeView tree = dialog.instanceTree;
+        if (t == KeyType.ArrowUp) {
+            tree.moveUp(1);
+            dialog.listActive = true;
+            return true;
+        }
+        if (t == KeyType.ArrowDown) {
+            tree.moveDown(1);
+            dialog.listActive = true;
+            return true;
+        }
+        if (t == KeyType.ArrowRight || t == KeyType.Enter) {
+            // §14.2: Enter is the expand toggle only — it never jumps and never closes.
+            tree.expandOrDescend();
+            dialog.listActive = true;
+            return true;
+        }
+        if (t == KeyType.ArrowLeft) {
+            tree.collapseOrParent();
+            dialog.listActive = true;
+            return true;
+        }
+        boolean listKeys = dialog.listActive && !dialog.instanceRows.isEmpty();
+        if (listKeys && isChar(k, '<')) {
+            dialog.hcol = Math.max(0, dialog.hcol - HSTEP);
+            return true;
+        }
+        if (listKeys && isChar(k, '>')) {
+            dialog.hcol += HSTEP;
+            return true;
+        }
+        if (listKeys && isChar(k, 'g')) {
+            jumpToFirstMention();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The {@code g} key of the instances-mode {@code /} dialog (§14.2): move the cursor to the
+     * OWNING instance of the selected row (the root of its subtree) — seek to its
+     * {@code OBJECT_FIRST_SEEN}, advance to the nearest following LINE (the §11.7 jump pattern),
+     * one history entry — and keep the dialog open; the expanded trees re-resolve against the
+     * new seq on the next draw. If the engine has no first-mention record (defensive), report
+     * and stay put.
+     */
+    private void jumpToFirstMention() {
+        InstanceBrowse.Row row = selectedInstanceRow();
+        if (row == null) {
+            return;
+        }
+        Instance c = engine.firstMentionOf(row.objectId());
+        if (c == null) {
+            status = "no first mention recorded for " + row.display();
+            return;
+        }
+        engine.seek(c.tid(), c.index());
+        engine.stepInto();
+        afterMove();
+        appendHistory();
+        status = "jumped to first mention of " + row.display() + " (seq " + c.seq() + ")";
     }
 
     private void recomputeDialog() {
@@ -1376,25 +1485,45 @@ public final class ViewerApp {
         }
     }
 
-    /** The §13.2 instances mode of the {@code /} dialog: regex over runtime class binary names. */
+    /**
+     * The §13.2/§14.1 instances mode of the {@code /} dialog: regex over runtime class binary
+     * names, optionally narrowed to one exact object id by a {@code #<digits>} query suffix.
+     * Every recompute (open, query edit, mode toggle) rebuilds the §14.2 result tree from
+     * scratch, dropping expansion/selection/scroll state and handing {@code g}/{@code <}/{@code >}
+     * back to the query.
+     */
     private void recomputeInstanceResults() {
-        String q = dialog.query.toString();
         dialog.targets = List.of();
+        dialog.listActive = false;
+        dialog.hcol = 0;
+        dialog.instanceTree.clearExpansion();
+        String q = dialog.query.toString();
         if (q.isEmpty()) {
             dialog.rows = List.of();
             dialog.instanceRows = List.of();
+            dialog.instanceTree.setRoots(List.of());
             dialog.note = "";
             return;
         }
         try {
+            // §14.1: an id query must see EVERY instance of a matching class, not the first CAP —
+            // the one demanded id may be arbitrarily late in the class's instance list.
+            int perClassCap =
+                    InstanceBrowse.parseQuery(q).objectId() != null ? Integer.MAX_VALUE : InstanceBrowse.CAP;
             InstanceBrowse.Result res = InstanceBrowse.filter(
-                    engine.classSites(), cls -> engine.instancesOf(cls, InstanceBrowse.CAP), q, InstanceBrowse.CAP);
+                    engine.classSites(), cls -> engine.instancesOf(cls, perClassCap), q, InstanceBrowse.CAP);
             List<String> rows = new ArrayList<>(res.rows().size());
+            List<ObjectNode> roots = new ArrayList<>(res.rows().size());
             for (InstanceBrowse.Row r : res.rows()) {
-                rows.add("seq " + r.seq() + DOT + "t" + r.tid() + DOT + r.display());
+                String label = "seq " + r.seq() + DOT + "t" + r.tid() + DOT + r.display();
+                rows.add(label);
+                // §14.2: the row itself is an expandable object-tree root (label unchanged).
+                roots.add(new ObjectNode(
+                        label, new Value.Ref(r.objectId(), r.display()), r.objectId() != 0));
             }
             dialog.rows = rows;
             dialog.instanceRows = res.rows();
+            dialog.instanceTree.setRoots(roots);
             long shown = rows.size();
             dialog.note = res.totalMatches() > shown
                     ? "showing first " + shown + " of " + res.totalMatches()
@@ -1402,6 +1531,7 @@ public final class ViewerApp {
         } catch (PatternSyntaxException e) {
             dialog.rows = List.of();
             dialog.instanceRows = List.of();
+            dialog.instanceTree.setRoots(List.of());
             dialog.note = "invalid regex";
             status = "invalid regex: " + describe(e);
         }
@@ -1485,13 +1615,6 @@ public final class ViewerApp {
             return;
         }
         int sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
-        if (dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
-            // §13.2: Enter on an instance does NOT move the cursor — it opens the explore window.
-            InstanceBrowse.Row row = dialog.instanceRows.get(sel);
-            dialog = null;
-            openExplore(row.objectId(), row.display());
-            return;
-        }
         long[] target = dialog.targets.get(sel);
         DialogKind kind = dialog.kind;
         dialog = null;
@@ -1517,91 +1640,6 @@ public final class ViewerApp {
         engine.stepInto();
         afterMove();
         appendHistory();
-    }
-
-    // ---- instance explore window (§13.3) ----
-
-    /** Opens the explore overlay for an object id; the execution cursor does not move. */
-    private void openExplore(final long objectId, final String label) {
-        ExploreWindow w = new ExploreWindow(
-                objectId,
-                label,
-                label + "  (as of seq " + engine.currentSeq() + ")",
-                new TreeView(engine::children));
-        w.tree.setRoots(List.of(engine.objectTree(objectId)));
-        explore = w;
-    }
-
-    /** One key while the explore overlay is open — it consumes all keys, like a dialog (§13.3). */
-    private void handleExplore(final KeyStroke k) {
-        KeyType t = k.getKeyType();
-        if (t == KeyType.Escape) {
-            explore = null;
-            return;
-        }
-        if (isCtrlC(k)) {
-            running = false;
-            return;
-        }
-        int total = 2 + explore.tree.rows().size();
-        if (t == KeyType.ArrowUp) {
-            explore.sel = Math.max(0, explore.sel - 1);
-        } else if (t == KeyType.ArrowDown) {
-            explore.sel = Math.min(total - 1, explore.sel + 1);
-        } else if (isChar(k, '<')) {
-            explore.hcol = Math.max(0, explore.hcol - HSTEP);
-        } else if (isChar(k, '>')) {
-            explore.hcol += HSTEP;
-        } else if (t == KeyType.ArrowRight) {
-            if (explore.sel >= 2) {
-                exploreTreeOp(true);
-            }
-        } else if (t == KeyType.ArrowLeft) {
-            if (explore.sel >= 2) {
-                exploreTreeOp(false);
-            }
-        } else if (t == KeyType.Enter) {
-            if (explore.sel == 0) {
-                jumpToCreation();
-            } else if (explore.sel == 1) {
-                explore = null;
-            } else {
-                exploreTreeOp(true);
-            }
-        }
-    }
-
-    /** Expand/collapse the tree row under the overall selection, then re-sync the selection. */
-    private void exploreTreeOp(final boolean expand) {
-        TreeView tree = explore.tree;
-        tree.toFirst();
-        tree.moveDown(explore.sel - 2);
-        if (expand) {
-            tree.expandOrDescend();
-        } else {
-            tree.collapseOrParent();
-        }
-        explore.sel = 2 + tree.selection();
-    }
-
-    /**
-     * The {@code [jump to creation]} action (§13.3): close, seek to the {@code OBJECT_FIRST_SEEN},
-     * advance to the nearest following LINE (the §11.7 jump pattern), one history entry. If the
-     * engine has no creation record (defensive), report and stay open.
-     */
-    private void jumpToCreation() {
-        Instance c = engine.creationOf(explore.objectId);
-        if (c == null) {
-            status = "no creation record for " + explore.label;
-            return;
-        }
-        String label = explore.label;
-        explore = null;
-        engine.seek(c.tid(), c.index());
-        engine.stepInto();
-        afterMove();
-        appendHistory();
-        status = "jumped to creation of " + label + " (seq " + c.seq() + ")";
     }
 
     // ---- variable history (§13.5) ----

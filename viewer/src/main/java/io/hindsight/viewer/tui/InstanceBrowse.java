@@ -13,15 +13,17 @@ import java.util.regex.PatternSyntaxException;
 
 /**
  * The pure filter behind the "browse instances" mode of the {@code /} dialog
- * (VIEWER.md §13.2), mirroring {@link MethodBrowse}: a case-insensitive regex is
- * matched ({@code find()}) against every {@link ClassSite}'s runtime class binary
+ * (VIEWER.md §13.2/§14.1), mirroring {@link MethodBrowse}: a case-insensitive regex
+ * is matched ({@code find()}) against every {@link ClassSite}'s runtime class binary
  * name, and the matching classes' instances are flattened into one list of rows
- * ascending by {@code seq}, capped.
+ * ascending by {@code seq}, capped. A query of the form {@code <regex>#<digits>}
+ * (or bare {@code #<digits>}) additionally restricts the rows to the one exact
+ * object id (§14.1).
  *
  * <p>Kept terminal-free and engine-free (the per-class instances arrive through a
  * {@link Function} the caller wires to {@code Engine.instancesOf}) so the regex
- * matching, the cross-class seq merge, and the cap-with-total bookkeeping are all
- * unit-testable against synthetic {@link ClassSite}s.
+ * matching, the id parsing, the cross-class seq merge, and the cap-with-total
+ * bookkeeping are all unit-testable against synthetic {@link ClassSite}s.
  */
 public final class InstanceBrowse {
 
@@ -29,10 +31,17 @@ public final class InstanceBrowse {
     public static final int CAP = 500;
 
     /**
-     * One flattened instance row: the {@code OBJECT_FIRST_SEEN} position, the object id the
-     * explore window opens on, and the {@code SimpleClass#id} label.
+     * One flattened instance row: the {@code OBJECT_FIRST_SEEN} position, the object id whose
+     * tree the row expands into (§14.2), the runtime class binary name (for the §14.4 info
+     * line; may be {@code null} for an unknown class), and the {@code SimpleClass#id} label.
      */
-    public record Row(long seq, int tid, long index, long objectId, String display) {}
+    public record Row(long seq, int tid, long index, long objectId, String classBinary, String display) {}
+
+    /**
+     * A parsed instances-mode query (§14.1): the class-regex part plus the exact object id the
+     * query demands, or {@code null} when the query is a plain regex.
+     */
+    public record Query(String regex, Long objectId) {}
 
     /**
      * A completed filter.
@@ -57,42 +66,76 @@ public final class InstanceBrowse {
     }
 
     /**
+     * Parses an instances-mode query into its class-regex and optional exact-id parts (§14.1):
+     * when the text after the LAST {@code #} is non-empty and digits-only, that suffix is the
+     * demanded object id and everything before the {@code #} is the class regex (empty for the
+     * bare {@code #<digits>} form — it matches any class). A {@code #} not followed by
+     * digits-only text stays part of the regex.
+     */
+    public static Query parseQuery(final String query) {
+        int hash = query.lastIndexOf('#');
+        if (hash >= 0) {
+            String digits = query.substring(hash + 1);
+            if (!digits.isEmpty() && digits.chars().allMatch(c -> c >= '0' && c <= '9')) {
+                try {
+                    return new Query(query.substring(0, hash), Long.valueOf(digits));
+                } catch (NumberFormatException e) {
+                    // Overflows a long — no object id can match; treat the whole text as regex.
+                }
+            }
+        }
+        return new Query(query, null);
+    }
+
+    /**
      * Filters {@code sites} by a case-insensitive regex over each class's {@link #matchString} and
      * flattens the matching classes' instances (fetched via {@code instancesProvider}) into one
      * list ascending by {@code (seq, tid, index)}, keeping at most {@code cap} rows (§13.2).
+     * When the query carries an exact object id (§14.1, see {@link #parseQuery}), only instances
+     * with that id are listed and {@code totalMatches} counts exactly those.
      *
-     * <p>{@code totalMatches} is the exact sum of matching classes'
+     * <p>Otherwise {@code totalMatches} is the exact sum of matching classes'
      * {@link ClassSite#instanceCount()} so the caller can render a "showing first {@code cap} of N"
      * note even though only {@code cap} rows are materialised. For the global first {@code cap}
      * rows to be correct, {@code instancesProvider} must return at least the first {@code cap}
-     * instances of each class (as {@code Engine.instancesOf} does when asked for {@code cap}).
+     * instances of each class (as {@code Engine.instancesOf} does when asked for {@code cap});
+     * for an id query it should return ALL instances of each class, or a late instance is missed.
      *
      * @param sites the distinct first-seen runtime classes (typically {@code Engine.classSites()})
      * @param instancesProvider maps a class binary name to its instances, ascending by seq
-     * @param regex the user's query, interpreted case-insensitively; matched with {@code find()}
+     * @param query the user's query: a case-insensitive regex, optionally suffixed {@code #<id>}
      * @param cap the maximum rows to return (a non-positive cap yields no rows)
      * @return the filter result
-     * @throws PatternSyntaxException if {@code regex} is not a valid regular expression
+     * @throws PatternSyntaxException if the query's regex part is not a valid regular expression
      */
     public static Result filter(
             final List<ClassSite> sites,
             final Function<String, List<Instance>> instancesProvider,
-            final String regex,
+            final String query,
             final int cap) {
-        Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
+        Query q = parseQuery(query);
+        Pattern pattern = Pattern.compile(q.regex(), Pattern.CASE_INSENSITIVE);
         long total = 0;
         List<Row> all = new ArrayList<>();
         for (ClassSite site : sites) {
             if (!pattern.matcher(matchString(site)).find()) {
                 continue;
             }
-            total += site.instanceCount();
+            if (q.objectId() == null) {
+                total += site.instanceCount();
+            }
             List<Instance> instances = instancesProvider.apply(site.classBinary());
             if (instances != null) {
                 for (Instance i : instances) {
-                    all.add(new Row(i.seq(), i.tid(), i.index(), i.objectId(), display(site, i)));
+                    if (q.objectId() != null && i.objectId() != q.objectId()) {
+                        continue;
+                    }
+                    all.add(new Row(i.seq(), i.tid(), i.index(), i.objectId(), site.classBinary(), display(site, i)));
                 }
             }
+        }
+        if (q.objectId() != null) {
+            total = all.size();
         }
         all.sort(Comparator.comparingLong(Row::seq)
                 .thenComparingInt(Row::tid)

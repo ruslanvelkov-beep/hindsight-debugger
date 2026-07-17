@@ -15,7 +15,10 @@ import java.util.function.Function;
 import java.util.regex.PatternSyntaxException;
 import org.junit.jupiter.api.Test;
 
-/** Tests the regex filter + cross-class seq merge + cap of the instance browser (VIEWER.md §13.2). */
+/**
+ * Tests the regex filter + cross-class seq merge + cap of the instance browser (VIEWER.md
+ * §13.2) and the {@code <regex>#<id>} / {@code #<id>} exact-id query forms (§14.1).
+ */
 final class InstanceBrowseTest {
 
     private static final ClassSite ALPHA = new ClassSite("com.foo.Alpha", 2);
@@ -87,5 +90,66 @@ final class InstanceBrowseTest {
     void invalidRegexThrows() {
         assertThrows(PatternSyntaxException.class,
                 () -> InstanceBrowse.filter(SITES, instances(), "(", InstanceBrowse.CAP));
+    }
+
+    // ---- §14.1 instance search by id ----
+
+    @Test
+    void parseQuerySplitsIdForms() {
+        assertEquals(new InstanceBrowse.Query("Bytes", 240L), InstanceBrowse.parseQuery("Bytes#240"));
+        assertEquals(new InstanceBrowse.Query("", 240L), InstanceBrowse.parseQuery("#240"));
+        // A # not followed by digits-only text stays part of the regex.
+        assertEquals(new InstanceBrowse.Query("foo#bar", null), InstanceBrowse.parseQuery("foo#bar"));
+        assertEquals(new InstanceBrowse.Query("#", null), InstanceBrowse.parseQuery("#"));
+        // Only the LAST # can carry the id; the earlier # stays in the regex.
+        assertEquals(new InstanceBrowse.Query("foo#12", 34L), InstanceBrowse.parseQuery("foo#12#34"));
+        // An id that overflows a long cannot match any instance — the whole text is regex.
+        assertEquals(new InstanceBrowse.Query("Bytes#99999999999999999999", null),
+                InstanceBrowse.parseQuery("Bytes#99999999999999999999"));
+        assertEquals(new InstanceBrowse.Query("plain", null), InstanceBrowse.parseQuery("plain"));
+    }
+
+    @Test
+    void regexWithIdListsOnlyThatInstance() {
+        // "alpha" matches Alpha AND Alpha$Inner; #12 exists only in Alpha.
+        InstanceBrowse.Result res = InstanceBrowse.filter(SITES, instances(), "alpha#12", InstanceBrowse.CAP);
+        assertEquals(1, res.rows().size());
+        assertEquals("Alpha#12", res.rows().get(0).display());
+        assertEquals(12, res.rows().get(0).objectId());
+        assertEquals("com.foo.Alpha", res.rows().get(0).classBinary());
+        assertEquals(1, res.totalMatches());
+        assertFalse(res.truncated());
+    }
+
+    @Test
+    void bareIdMatchesAnyClass() {
+        InstanceBrowse.Result res = InstanceBrowse.filter(SITES, instances(), "#13", InstanceBrowse.CAP);
+        assertEquals(1, res.rows().size());
+        assertEquals("Inner#13", res.rows().get(0).display());
+        assertEquals("com.foo.Alpha$Inner", res.rows().get(0).classBinary());
+        assertEquals(1, res.totalMatches());
+    }
+
+    @Test
+    void hashNotFollowedByDigitsStaysRegex() {
+        // "Alpha#?$" is a plain regex (optional literal # then end): it matches com.foo.Alpha
+        // but not com.foo.Alpha$Inner, and no id restriction applies.
+        InstanceBrowse.Result res = InstanceBrowse.filter(SITES, instances(), "Alpha#?$", InstanceBrowse.CAP);
+        assertEquals(2, res.rows().size());
+        assertEquals("Alpha#11", res.rows().get(0).display());
+        assertEquals("Alpha#12", res.rows().get(1).display());
+        assertEquals(2, res.totalMatches());
+    }
+
+    @Test
+    void idQueryWithNoMatchYieldsEmpty() {
+        InstanceBrowse.Result byClass = InstanceBrowse.filter(SITES, instances(), "gamma#12", InstanceBrowse.CAP);
+        assertTrue(byClass.rows().isEmpty());
+        assertEquals(0, byClass.totalMatches());
+        assertFalse(byClass.truncated());
+        InstanceBrowse.Result byId = InstanceBrowse.filter(SITES, instances(), "#999", InstanceBrowse.CAP);
+        assertTrue(byId.rows().isEmpty());
+        assertEquals(0, byId.totalMatches());
+        assertFalse(byId.truncated());
     }
 }

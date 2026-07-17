@@ -147,12 +147,14 @@ final class EngineTest {
             assertEquals("com.ex.Foo", outer.classBinary());
             assertEquals("main", outer.methodName());
             assertTrue(outer.isStatic());
+            assertTrue(outer.recorded());
             assertEquals(12, outer.currentLine()); // call-site line, not entry line
 
             Frame inner = stack.get(1);
             assertEquals(IDX_ENTER_HELPER, inner.enterIndex());
             assertEquals("helper", inner.methodName());
             assertFalse(inner.isStatic());
+            assertTrue(inner.recorded());
             assertEquals(21, inner.currentLine()); // the cursor line
             assertEquals("Foo.java", inner.fileName());
 
@@ -534,7 +536,7 @@ final class EngineTest {
         return r.write();
     }
 
-    // ---- §13.6: classSites / instancesOf / creationOf / fieldWrites ----
+    // ---- §13.6: classSites / instancesOf / firstMentionOf / fieldWrites ----
 
     @Test
     void classSitesDistinctCountsSorted(@TempDir final Path dir) throws IOException {
@@ -566,11 +568,11 @@ final class EngineTest {
     }
 
     @Test
-    void creationOfRoundTripsToFirstSeenAndNullForUnknown(@TempDir final Path dir) throws IOException {
+    void firstMentionOfRoundTripsToFirstSeenAndNullForUnknown(@TempDir final Path dir) throws IOException {
         Path built = buildInstances(dir);
         try (Engine e = Engine.open(built);
                 Recording probe = Recording.open(built)) {
-            Instance c = e.creationOf(30L);
+            Instance c = e.firstMentionOf(30L);
             assertEquals(new Instance(30L, 7L, 1, 3), c);
 
             // Round-trip: the position really is that object's OBJECT_FIRST_SEEN record.
@@ -579,7 +581,7 @@ final class EngineTest {
             assertEquals(30L, first.target());
             assertEquals(c.seq(), first.seq());
 
-            assertNull(e.creationOf(999L)); // unknown id
+            assertNull(e.firstMentionOf(999L)); // unknown id
         }
     }
 

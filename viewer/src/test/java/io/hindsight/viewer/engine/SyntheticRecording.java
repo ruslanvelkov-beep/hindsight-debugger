@@ -15,16 +15,18 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * Test-only builder that assembles a schema-3 recording directory byte-by-byte
- * from FORMAT.md, tailored for engine tests: it exposes per-thread record indices
- * (so a test can assert exact frame/step positions) and writes snapshot payloads
- * with the schema-2/3 {@code form} byte plus LINE records. It deliberately has no
- * dependency on the writer — if the engine reconstructs from this, it reconstructs
- * from the spec.
+ * Test-only builder that assembles a schema-3 (default) or schema-4 recording
+ * directory byte-by-byte from FORMAT.md, tailored for engine tests: it exposes
+ * per-thread record indices (so a test can assert exact frame/step positions) and
+ * writes snapshot payloads with the schema-2/3 {@code form} byte, LINE records
+ * and — for schema 4 — STACK_SNAPSHOT captures over §3 STACK blobs. It
+ * deliberately has no dependency on the writer — if the engine reconstructs from
+ * this, it reconstructs from the spec.
  */
 final class SyntheticRecording {
 
     private final Path dir;
+    private final int schema;
     private final StringBuilder symbols = new StringBuilder();
     private final StringBuilder rtSymbols = new StringBuilder();
     private final StringBuilder sites = new StringBuilder();
@@ -36,7 +38,13 @@ final class SyntheticRecording {
     private long nextSeq = 1;
 
     SyntheticRecording(final Path dir) {
+        this(dir, 3);
+    }
+
+    /** Builder for a specific manifest schema — pass 4 for recordings with stack captures. */
+    SyntheticRecording(final Path dir, final int schema) {
         this.dir = dir;
+        this.schema = schema;
     }
 
     // ---- symbols (§4) ----
@@ -163,6 +171,37 @@ final class SyntheticRecording {
         return blobRaw(tid, b.array(), Format.BLOB_SNAPSHOT);
     }
 
+    /**
+     * One frame of a §3 STACK payload (schema 4), innermost-first. {@code classSym}/
+     * {@code methodSym}/{@code fileSym} are rt-symbol ids (kinds RTCLASS/METHODNAME/FILENAME);
+     * {@code fileSym} 0 = unknown source file; {@code line} -1/0 = unknown.
+     */
+    record CapFrame(int classSym, int methodSym, int fileSym, int line) {}
+
+    /** Writes a §3 STACK blob (schema 4: 2-byte count, then 16-byte frames) and returns its offset. */
+    long blobStack(final int tid, final List<CapFrame> frames) {
+        ByteBuffer b = ByteBuffer.allocate(2 + frames.size() * Format.STACK_FRAME_SIZE)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        b.putShort((short) frames.size());
+        for (CapFrame f : frames) {
+            b.putInt(f.classSym());
+            b.putInt(f.methodSym());
+            b.putInt(f.fileSym());
+            b.putInt(f.line());
+        }
+        return blobRaw(tid, b.array(), Format.BLOB_STACK);
+    }
+
+    /**
+     * Emits a §2.1 STACK_SNAPSHOT record (schema 4) whose {@code after} points at a fresh
+     * STACK blob holding {@code frames} (innermost-first); returns the record index.
+     */
+    int stackSnapshot(final int tid, final List<CapFrame> frames) {
+        long offset = blobStack(tid, frames);
+        return rec(tid, Format.STACK_SNAPSHOT, flags(Format.KIND_NONE, Format.KIND_BLOB, 0),
+                0, 0, 0, 0, 0, offset);
+    }
+
     /** Writes a container snapshot blob (MAP/SET/LIST/ARRAY) and returns its offset. */
     long snapshotContainer(final int tid, final int classSym, final int form, final long totalSize,
             final int logicalCount, final List<Entry> entries) {
@@ -184,7 +223,7 @@ final class SyntheticRecording {
     Path write() throws IOException {
         Files.createDirectories(dir);
         Files.writeString(dir.resolve("manifest.properties"),
-                "schema=3\nrecorder=synthetic-test\njvm=test\npid=0\nstartEpochMillis=0\nargs=test\n");
+                "schema=" + schema + "\nrecorder=synthetic-test\njvm=test\npid=0\nstartEpochMillis=0\nargs=test\n");
         Files.writeString(dir.resolve("symbols.tsv"), symbols.toString());
         Files.writeString(dir.resolve("rt-symbols.tsv"), rtSymbols.toString());
         Files.writeString(dir.resolve("sites.tsv"), sites.toString());

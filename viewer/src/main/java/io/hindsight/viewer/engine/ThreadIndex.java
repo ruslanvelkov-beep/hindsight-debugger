@@ -21,7 +21,10 @@ package io.hindsight.viewer.engine;
  * structure that stepping binary-searches over; it is empty when the recording had
  * {@code lines=false}. {@code timeSyncIndices}/{@code timeSyncMillis} let
  * {@link #timeAt} answer "wall-clock at record i" from the nearest preceding
- * {@code TIME_SYNC} without a linear scan.
+ * {@code TIME_SYNC} without a linear scan. {@code stackSnapshotIndices} is the
+ * ascending list of {@code STACK_SNAPSHOT} record indices (schema 4, VIEWER.md
+ * §14.5) — the §14.5 stack merge binary-searches it for the nearest capture at or
+ * before the cursor; it is empty for schema ≤ 3 recordings.
  *
  * <p>These are {@code int}/{@code long} arrays rather than objects because a thread
  * can hold millions of records; the index must stay compact.
@@ -37,6 +40,7 @@ final class ThreadIndex {
     final long[] lineIndices;
     final long[] timeSyncIndices;
     final long[] timeSyncMillis;
+    final long[] stackSnapshotIndices;
     final String threadName;
 
     ThreadIndex(
@@ -49,6 +53,7 @@ final class ThreadIndex {
             final long[] lineIndices,
             final long[] timeSyncIndices,
             final long[] timeSyncMillis,
+            final long[] stackSnapshotIndices,
             final String threadName) {
         this.tid = tid;
         this.count = count;
@@ -59,6 +64,7 @@ final class ThreadIndex {
         this.lineIndices = lineIndices;
         this.timeSyncIndices = timeSyncIndices;
         this.timeSyncMillis = timeSyncMillis;
+        this.stackSnapshotIndices = stackSnapshotIndices;
         this.threadName = threadName;
     }
 

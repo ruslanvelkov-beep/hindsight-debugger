@@ -662,3 +662,87 @@ FIRST_SEEN `(seq, tid, index)` for `creationOf`.
 - `FieldDecl` — §13.5 declaration parser.
 - The §13.1 scroll rule is exercised through the existing `adjustScroll` with persistent
   state; pin it with a test if `adjustScroll` moves/changes.
+
+## 14. v1.4 additions & changes
+
+Authoritative over conflicting earlier text (§13 above all). Everything not mentioned is
+unchanged. Requires reader/engine support for schema-4 recordings (FORMAT.md §2.1/§3
+STACK_SNAPSHOT); schema ≤ 3 recordings must keep working with every feature that does not
+need captures.
+
+### 14.1 Instance search by id
+In the `/` dialog's instances mode the query additionally accepts:
+- `<regex>#<digits>` — the class part is matched as before (case-insensitive `find()`
+  over class binary names) AND only the instance whose objectId equals `<digits>` is
+  listed (e.g. `Bytes#240`);
+- bare `#<digits>` — that objectId in ANY class.
+A `#` NOT followed by digits-only text keeps being treated as part of the regex. The cap
+note logic is unchanged. Implemented in the pure `InstanceBrowse` helper (unit-tested).
+
+### 14.2 In-place instance exploration; `g` = go to first mention
+The §13.3 explore window is REMOVED. In instances mode the result rows themselves become
+expandable object-tree roots, Locals-style, inside the dialog list:
+- each instance row (label unchanged: `seq <N> · t<tid> · <SimpleClass>#<id>`) expands
+  lazily via `engine.objectTree(id)` / `engine.children`, resolved as-of the CURRENT
+  cursor seq; ↑/↓ move over the flattened rows, →/↵ expand (on expandable rows),
+  ← collapse, `<`/`>` hscroll, §13.1 scrolling;
+- `g` on ANY row acts on the selected row's OWNING instance (the root of its subtree):
+  the cursor moves to the instance's first mention — `engine.firstMentionOf(id)`, seek to
+  its `(tid, index)`, advance to the nearest FOLLOWING LINE (§11.7 jump pattern), ONE
+  history entry, status `jumped to first mention of <SimpleClass>#<id> (seq <N>)` — and
+  the dialog STAYS OPEN (the screen behind it re-renders at the new position; expanded
+  trees re-resolve as-of the new seq). The user closes the dialog with Esc when done.
+- Enter therefore no longer jumps/closes in instances mode — it is the tree expand
+  toggle. Calls mode is entirely unchanged (Enter jumps and closes).
+- Editing the query or toggling the mode rebuilds the list and drops expansion state.
+Dialog hint (instances mode): `↑↓ move  →/↵ expand  ← collapse  g first-mention  Esc close`.
+
+### 14.3 "Creation" renamed to "first mention"
+`OBJECT_FIRST_SEEN` marks when the recorder first NOTICED an object — often long after
+its construction (recording starts mid-life, nested discovery, ...). All API and UI text
+changes accordingly: engine `creationOf(long)` is RENAMED to `firstMentionOf(long)`
+(same contract), and no user-facing text may say "creation".
+
+### 14.4 Info-line type information
+The status row's position part becomes focus-sensitive:
+- Source Code focused (or any other window not listed below): unchanged — the compact
+  record info (`seq · t · site`).
+- Locals focused: the FULL type of the selected row's value, e.g.
+  `com.hedera.pbj.runtime.io.buffer.Bytes#240` for refs (runtime class binary name via
+  the recording's first-seen class, `?#id` when unknown), `java.lang.String` for
+  strings, the primitive tag name (`int`, `boolean`, ...) for inline values, `null` /
+  `void` / `<absent>` otherwise. Unrecorded-frame placeholder rows show nothing special.
+- `/` dialog open in instances mode: the full class binary name + `#id` of the selected
+  row's owning instance.
+A transient status message still takes precedence exactly as today (`msg — position`).
+
+### 14.5 Unrecorded (grey) stack frames — schema 4
+For schema-4 recordings the engine merges the reconstructed (recorded) stack with the
+thread's nearest STACK_SNAPSHOT at/before the cursor:
+- `Frame` gains a `boolean recorded` component. `stack()` returns, outermost-first: the
+  UNRECORDED caller frames (grey), then the recorded frames exactly as today (innermost
+  last). Unrecorded frames carry classBinary/methodName/fileName/line from the capture,
+  `enterIndex = -1`, `descriptor = ""`, `isStatic = false`.
+- Merge rule: let C be the capture's frames innermost-first and R_out the OUTERMOST
+  recorded frame. Scan C from innermost for the first frame equal to R_out by
+  (classBinary, methodName); if found at k, the unrecorded frames are C[k+1..] (R_out's
+  callers). If the recorded stack is empty, ALL of C is unrecorded context. If no match,
+  ALL of C is appended as unrecorded context below the recorded frames (stale-but-useful
+  approximation; exactness is only guaranteed at the capture record itself). No capture
+  at/before the cursor (or schema ≤ 3) → no unrecorded frames.
+- `selectFrame` accepts unrecorded frames. `locals(f)` of an unrecorded frame is empty.
+- TUI: unrecorded rows render DIM (grey), same layout (`Class.method (File:line)`); they
+  are selectable; selecting one drives the Source window through the normal frame path
+  (SourcePath resolution by classBinary/fileName, centered on the frame line with the
+  frame-line highlight) and the Locals window shows `(unrecorded frame — no locals)`.
+  The exec highlight and stepping semantics are untouched (stepping still operates on
+  the execution cursor, not the selected frame).
+
+### 14.6 Engine API deltas
+```java
+record Frame(..., boolean recorded)              // §14.5; all construction sites updated
+Instance firstMentionOf(long objectId);          // renamed from creationOf (§14.3)
+```
+The engine parses STACK_SNAPSHOT records during index construction (per-thread ascending
+capture positions) and exposes the merge only through stack() — no new public stack API.
+The reader owns the STACK payload parsing (`CapturedFrame` records).

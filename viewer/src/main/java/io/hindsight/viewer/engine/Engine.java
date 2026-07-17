@@ -18,6 +18,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 
@@ -125,14 +126,14 @@ public final class Engine implements AutoCloseable {
     private List<MethodSite> methodSitesCache;
     private Map<Integer, List<Call>> callsBySite;
 
-    // Lazily built once on first classSites()/instancesOf()/creationOf()/fieldWrites() call
+    // Lazily built once on first classSites()/instancesOf()/firstMentionOf()/fieldWrites() call
     // (§13.6, one shared full pass mirroring ensureMethodSites): per runtime class its
-    // OBJECT_FIRST_SEEN instances ascending by seq, per object id its creation position, and
-    // per field name its FIELD_WRITE positions (refs only — values render lazily at query time,
-    // a recording can hold millions of field writes).
+    // OBJECT_FIRST_SEEN instances ascending by seq, per object id its first-mention position,
+    // and per field name its FIELD_WRITE positions (refs only — values render lazily at query
+    // time, a recording can hold millions of field writes).
     private List<ClassSite> classSitesCache;
     private Map<String, List<Instance>> instancesByClass;
-    private Map<Long, Instance> creationById;
+    private Map<Long, Instance> firstMentionById;
     private Map<String, List<WriteRef>> fieldWriteRefsByName;
 
     private Engine(final Recording recording) throws IOException {
@@ -173,6 +174,7 @@ public final class Engine implements AutoCloseable {
         List<Long> lineList = new ArrayList<>();
         List<Long> tsIdx = new ArrayList<>();
         List<Long> tsMs = new ArrayList<>();
+        List<Long> capIdx = new ArrayList<>();
         String threadName = null;
 
         for (int i = 0; i < count; i++) {
@@ -212,6 +214,8 @@ public final class Engine implements AutoCloseable {
                     } else if (type == Format.TIME_SYNC) {
                         tsIdx.add((long) i);
                         tsMs.add(r.after());
+                    } else if (type == Format.STACK_SNAPSHOT) {
+                        capIdx.add((long) i); // §14.5 capture positions, ascending
                     }
                 }
             }
@@ -219,7 +223,7 @@ public final class Engine implements AutoCloseable {
         }
 
         return new ThreadIndex(tid, count, depth, frameEnter, matchingExit, parentEnter,
-                toLongArray(lineList), toLongArray(tsIdx), toLongArray(tsMs), threadName);
+                toLongArray(lineList), toLongArray(tsIdx), toLongArray(tsMs), toLongArray(capIdx), threadName);
     }
 
     private void indexObjectEvent(final Rec r, final int tid, final int index) {
@@ -549,9 +553,13 @@ public final class Engine implements AutoCloseable {
         return moveTo(cursorTid, target);
     }
 
-    /** Select which frame the Source/Locals windows display; does not move the cursor (§2.3). */
+    /**
+     * Select which frame the Source/Locals windows display; does not move the cursor (§2.3).
+     * Unrecorded (capture-only) frames are selectable too (§14.5) — {@link #locals} simply
+     * yields nothing for them.
+     */
     public boolean selectFrame(final int frameIndex) {
-        if (frameIndex < 0 || frameIndex >= ctx.size()) {
+        if (frameIndex < 0 || frameIndex >= publicFrames.size()) {
             return false;
         }
         selectedFrame = frameIndex;
@@ -589,9 +597,14 @@ public final class Engine implements AutoCloseable {
         return new StepResult(true, "");
     }
 
-    // ---- frames (§2.3) ----
+    // ---- frames (§2.3, §14.5) ----
 
-    /** The call stack at the cursor, outermost first. */
+    /**
+     * The call stack at the cursor, outermost first. For schema-4 recordings the recorded
+     * frames are preceded by the unrecorded (grey) caller frames derived from the thread's
+     * nearest {@code STACK_SNAPSHOT} at/before the cursor (§14.5); the innermost recorded
+     * frame is always last.
+     */
     public List<Frame> stack() {
         return publicFrames;
     }
@@ -614,6 +627,9 @@ public final class Engine implements AutoCloseable {
         Collections.reverse(enters); // outermost first
         int m = enters.size();
         int cursorLine = ci >= 0 && rec(cursorTid, ci).type() == Format.LINE ? lineNumberAt(cursorTid, ci) : -1;
+
+        List<Frame> unrecorded = unrecordedFrames(ti, ci, enters);
+        int u = unrecorded.size();
 
         List<FrameCtx> list = new ArrayList<>(m);
         for (int k = 0; k < m; k++) {
@@ -649,12 +665,81 @@ public final class Engine implements AutoCloseable {
                     asOf = enterK;
                 }
             }
-            Frame f = new Frame(k, enterK, er.location(), cls, meth, desc, file, currentLine, stat);
+            Frame f = new Frame(u + k, enterK, er.location(), cls, meth, desc, file, currentLine, stat, true);
             list.add(new FrameCtx(f, asOf));
         }
         this.ctx = list;
-        this.publicFrames = list.stream().map(FrameCtx::frame).toList();
-        this.selectedFrame = Math.max(0, m - 1);
+        List<Frame> merged = new ArrayList<>(u + m);
+        merged.addAll(unrecorded);
+        for (FrameCtx fc : list) {
+            merged.add(fc.frame());
+        }
+        this.publicFrames = List.copyOf(merged);
+        this.selectedFrame = Math.max(0, merged.size() - 1);
+    }
+
+    /**
+     * The §14.5 unrecorded (grey) caller frames for the cursor position, outermost-first:
+     * the thread's nearest {@code STACK_SNAPSHOT} at/before the cursor is scanned
+     * innermost-first for the first frame equal to the outermost recorded frame by
+     * {@code (classBinary, methodName)}; the capture frames above the match (its callers)
+     * become unrecorded context. With an empty recorded stack, or when no capture frame
+     * matches (stale-but-useful approximation), the whole capture is unrecorded context.
+     * Empty for schema ≤ 3 recordings or when the thread has no capture yet.
+     */
+    private List<Frame> unrecordedFrames(final ThreadIndex ti, final int ci, final List<Integer> enters) {
+        if (schemaVersion < 4 || ti.stackSnapshotIndices.length == 0 || ci < 0) {
+            return List.of();
+        }
+        List<Recording.CapturedFrame> capture = captureAtOrBefore(ti, ci);
+        if (capture.isEmpty()) {
+            return List.of();
+        }
+        int from = 0;
+        if (!enters.isEmpty()) {
+            Site s = recording.site(rec(ti.tid, enters.get(0)).location());
+            String outClass = s != null ? recording.symbolText(s.classSym()) : null;
+            String outMethod = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
+            for (int k = 0; k < capture.size(); k++) {
+                Recording.CapturedFrame cf = capture.get(k);
+                if (Objects.equals(cf.classBinary(), outClass) && Objects.equals(cf.methodName(), outMethod)) {
+                    from = k + 1; // C[k] is R_out itself; its callers are C[k+1..]
+                    break;
+                }
+            }
+        }
+        List<Frame> out = new ArrayList<>(capture.size() - from);
+        for (int i = capture.size() - 1; i >= from; i--) { // innermost-first → outermost-first
+            Recording.CapturedFrame cf = capture.get(i);
+            out.add(new Frame(out.size(), -1, 0, cf.classBinary(), cf.methodName(), "",
+                    cf.fileName(), cf.line(), false, false));
+        }
+        return out;
+    }
+
+    /** Resolved frames (innermost-first) of the nearest {@code STACK_SNAPSHOT} at/before {@code ci}, else empty. */
+    private List<Recording.CapturedFrame> captureAtOrBefore(final ThreadIndex ti, final int ci) {
+        long[] caps = ti.stackSnapshotIndices;
+        int lo = 0;
+        int hi = caps.length - 1;
+        int ans = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (caps[mid] <= ci) {
+                ans = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if (ans < 0) {
+            return List.of();
+        }
+        try {
+            return recording.stackAt(ti.tid, rec(ti.tid, caps[ans]).after());
+        } catch (IOException e) {
+            return List.of(); // torn capture blob (truncated tail) → no unrecorded context
+        }
     }
 
     private int lineNumberAt(final int tid, final long index) {
@@ -668,12 +753,14 @@ public final class Engine implements AutoCloseable {
      * Reconstruct frame {@code frameIndex}'s locals as-of the cursor: seed parameter slots
      * from the frame's {@code ARG} records (slot 0 = {@code this} for instance methods), then
      * apply {@code LOCAL_WRITE} records up to the frame's as-of index, latest value per slot.
+     * An unrecorded (capture-only) frame has no locals — the list is empty (§14.5).
      */
     public List<Local> locals(final int frameIndex) {
-        if (frameIndex < 0 || frameIndex >= ctx.size()) {
+        int unrecorded = publicFrames.size() - ctx.size();
+        if (frameIndex < 0 || frameIndex >= publicFrames.size() || frameIndex < unrecorded) {
             return List.of();
         }
-        FrameCtx fc = ctx.get(frameIndex);
+        FrameCtx fc = ctx.get(frameIndex - unrecorded);
         Frame frame = fc.frame();
         ThreadIndex ti = index(cursorTid);
         int enter = frame.enterIndex();
@@ -1114,13 +1201,14 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
-     * The position of an object id's {@code OBJECT_FIRST_SEEN} record — the "jump to creation"
-     * target of the instance explore window (§13.3/§13.6) — or {@code null} when the recording
-     * never registered that id.
+     * The position of an object id's {@code OBJECT_FIRST_SEEN} record — the "go to first
+     * mention" target of the instance-browse dialog (§13.6/§14.2, renamed from
+     * {@code creationOf} per §14.3) — or {@code null} when the recording never registered
+     * that id.
      */
-    public Instance creationOf(final long objectId) {
+    public Instance firstMentionOf(final long objectId) {
         ensureInstanceIndex();
-        return creationById.get(objectId);
+        return firstMentionById.get(objectId);
     }
 
     /**
@@ -1250,7 +1338,7 @@ public final class Engine implements AutoCloseable {
             list.sort(refOrder);
         }
         this.instancesByClass = byClass;
-        this.creationById = byId;
+        this.firstMentionById = byId;
         this.fieldWriteRefsByName = writeRefs;
         this.classSitesCache = List.copyOf(sites);
     }

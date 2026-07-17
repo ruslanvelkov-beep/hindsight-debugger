@@ -28,7 +28,7 @@ final class EngineRealRecordingTest {
 
     private static final Path REAL = Path.of(
             "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/"
-                    + "hedera-node/test-clients/build/hindsight/recordings/transfer-7");
+                    + "hedera-node/test-clients/build/hindsight/recordings/transfer-11");
 
     @Test
     void stepsThroughRealRecordingWithoutThrowing() throws IOException {
@@ -37,6 +37,7 @@ final class EngineRealRecordingTest {
         try (Engine e = Engine.open(REAL);
                 Recording probe = Recording.open(REAL)) {
             assertNotNull(e.threads());
+            assertEquals(3, e.schemaVersion(), "transfer-11 is a schema-3 recording");
             assertTrue(cursorIsOnLine(e, probe), "initial cursor should sit on a LINE record");
 
             for (int i = 0; i < 100; i++) {
@@ -44,6 +45,8 @@ final class EngineRealRecordingTest {
                 List<Frame> stack = e.stack();
                 assertNotNull(stack);
                 for (int f = 0; f < stack.size(); f++) {
+                    assertTrue(stack.get(f).recorded(),
+                            "a schema-3 recording must yield only recorded frames (§14.5)");
                     assertNotNull(e.locals(f));
                 }
                 RecordInfo info = e.recordInfo();
@@ -135,10 +138,10 @@ final class EngineRealRecordingTest {
 
     /**
      * Exercises the v1.3 instance/field-write API ({@code classSites}, {@code instancesOf},
-     * {@code creationOf}, {@code fieldWrites}) against the real recording: the class index must be
-     * sorted and every instance must point at a real {@code OBJECT_FIRST_SEEN} record, creation
-     * lookups must round-trip, and a field-write query seeded from a real {@code FIELD_WRITE}
-     * record must find that exact record again, ascending by seq.
+     * {@code firstMentionOf}, {@code fieldWrites}) against the real recording: the class index
+     * must be sorted and every instance must point at a real {@code OBJECT_FIRST_SEEN} record,
+     * first-mention lookups must round-trip, and a field-write query seeded from a real
+     * {@code FIELD_WRITE} record must find that exact record again, ascending by seq.
      */
     @Test
     void v13InstanceAndFieldWriteApiOnRealRecording() throws IOException {
@@ -177,8 +180,8 @@ final class EngineRealRecordingTest {
             Instance first = instances.get(0);
             assertEquals(List.of(first), e.instancesOf(biggest.classBinary(), 1), "cap 1 truncates");
 
-            // --- creationOf(): round-trips the first instance ---
-            assertEquals(first, e.creationOf(first.objectId()));
+            // --- firstMentionOf(): round-trips the first instance ---
+            assertEquals(first, e.firstMentionOf(first.objectId()));
 
             // --- fieldWrites(): seeded from the lowest-seq resolvable FIELD_WRITE, so the seed
             //     is by construction the first hit of its own (file, field) query ---
