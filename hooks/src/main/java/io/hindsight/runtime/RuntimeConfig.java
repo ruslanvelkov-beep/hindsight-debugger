@@ -26,10 +26,23 @@ public final class RuntimeConfig {
 
     /**
      * Emit a shallow snapshot of every object the first time it is seen (§7) — the baseline
-     * from which later field writes evolve the object's reconstructable state. Depth-1:
-     * objects first seen as nested references inside a snapshot get no snapshot of their own.
+     * from which later field writes evolve the object's reconstructable state. How far the
+     * baselines chase nested references is governed by {@link #snapshotDepth}.
      */
     public boolean snapshotFirstSeen = true;
+
+    /**
+     * Nested-baseline snapshot depth (§7, recorder ≥ v1.3). Every dump runs at a nesting
+     * level; the triggering dump (first-sight baseline or sampling refresh) is level 1.
+     * Objects newly registered while dumping at level {@code L} always get
+     * {@code OBJECT_FIRST_SEEN}; when {@code L < snapshotDepth} they also receive a baseline
+     * dump of their own, at level {@code L + 1} (queue-driven off the pending first-seen
+     * list — never recursive). Levels count <em>dumps</em>, not field hops: depth 2 means
+     * "objects discovered inside a snapshot get their own snapshot; objects discovered inside
+     * THAT one get first-seen only". {@code 1} reproduces the pre-v1.3 depth-1 containment.
+     * Must be ≥ 1.
+     */
+    public int snapshotDepth = 2;
 
     /** Per-thread record chunk size in KiB (§9). */
     public int recordBufKB = 256;

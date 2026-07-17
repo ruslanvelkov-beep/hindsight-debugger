@@ -77,6 +77,9 @@ public final class Wire {
     /** Max instance fields / elements / map entries captured by one snapshot payload (§3). */
     public static final int SNAPSHOT_MAX_FIELDS = 64;
 
+    /** Max container-valued fields re-dumped by one sampling refresh (§7, recorder ≥ v1.3). */
+    public static final int SNAPSHOT_MAX_CONTAINER_REDUMPS = 16;
+
     // ---------- snapshot payload forms (§3, schema 2) ----------
 
     public static final int SNAPSHOT_FORM_FIELDS = 0;

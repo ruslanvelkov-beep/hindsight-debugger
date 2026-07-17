@@ -76,6 +76,14 @@ public final class AgentConfig {
     /** Binary-name prefixes excluded entirely; wins over the other lists. */
     public final List<String> exclude;
 
+    /**
+     * Binary-name prefixes whose packages are OPENED to the hooks module for reflective
+     * snapshots without being instrumented (§10 {@code snapshotOpen}) — data/model classes
+     * (PBJ records and the like) that are deliberately outside the instrumentation scope but
+     * whose field contents the §7 dumps must be able to read.
+     */
+    public final List<String> snapshotOpen;
+
     /** Start recording at premain; defaults false when a trigger is configured. */
     public final boolean autostart;
 
@@ -93,6 +101,9 @@ public final class AgentConfig {
 
     /** Baseline snapshot of every object at first sight (§7). */
     public final boolean snapshotFirstSeen;
+
+    /** Nested-baseline snapshot depth (§7); must be ≥ 1, and 1 reproduces pre-v1.3 behaviour. */
+    public final int snapshotDepth;
 
     /** Emit LINE records at each source line (FULL scope only) — the §7 execution-flow backbone. */
     public final boolean lines;
@@ -121,12 +132,14 @@ public final class AgentConfig {
             List<String> include,
             List<String> callsOnly,
             List<String> exclude,
+            List<String> snapshotOpen,
             boolean autostart,
             String triggerClass,
             String triggerMethod,
             int maxString,
             int snapshotEvery,
             boolean snapshotFirstSeen,
+            int snapshotDepth,
             boolean lines,
             boolean branches,
             int recordBufKB,
@@ -139,12 +152,14 @@ public final class AgentConfig {
         this.include = include;
         this.callsOnly = callsOnly;
         this.exclude = exclude;
+        this.snapshotOpen = snapshotOpen;
         this.autostart = autostart;
         this.triggerClass = triggerClass;
         this.triggerMethod = triggerMethod;
         this.maxString = maxString;
         this.snapshotEvery = snapshotEvery;
         this.snapshotFirstSeen = snapshotFirstSeen;
+        this.snapshotDepth = snapshotDepth;
         this.lines = lines;
         this.branches = branches;
         this.recordBufKB = recordBufKB;
@@ -193,6 +208,7 @@ public final class AgentConfig {
         }
         final List<String> callsOnly = parseList(pairs.remove("callsOnly"), "callsOnly");
         final List<String> exclude = parseList(pairs.remove("exclude"), "exclude");
+        final List<String> snapshotOpen = parseList(pairs.remove("snapshotOpen"), "snapshotOpen");
 
         final String trigger = pairs.remove("trigger");
         String triggerClass = null;
@@ -214,6 +230,7 @@ public final class AgentConfig {
         final int maxString = parseInt(remove(pairs, "maxString", "512"), "maxString", 0);
         final int snapshotEvery = parseInt(remove(pairs, "snapshotEvery", "8192"), "snapshotEvery", 0);
         final boolean snapshotFirstSeen = parseBoolean(remove(pairs, "snapshotFirstSeen", "true"), "snapshotFirstSeen");
+        final int snapshotDepth = parseInt(remove(pairs, "snapshotDepth", "2"), "snapshotDepth", 1);
         final boolean lines = parseBoolean(remove(pairs, "lines", "true"), "lines");
         final boolean branches = parseBoolean(remove(pairs, "branches", "true"), "branches");
         final int recordBufKB = parseInt(remove(pairs, "recordBufKB", "256"), "recordBufKB", 1);
@@ -231,12 +248,14 @@ public final class AgentConfig {
                 include,
                 callsOnly,
                 exclude,
+                snapshotOpen,
                 autostart,
                 triggerClass,
                 triggerMethod,
                 maxString,
                 snapshotEvery,
                 snapshotFirstSeen,
+                snapshotDepth,
                 lines,
                 branches,
                 recordBufKB,
@@ -283,11 +302,13 @@ public final class AgentConfig {
                 + ", include=" + include
                 + ", callsOnly=" + callsOnly
                 + ", exclude=" + exclude
+                + ", snapshotOpen=" + snapshotOpen
                 + ", autostart=" + autostart
                 + ", trigger=" + (triggerClass == null ? "none" : triggerClass + "#" + triggerMethod)
                 + ", maxString=" + maxString
                 + ", snapshotEvery=" + snapshotEvery
                 + ", snapshotFirstSeen=" + snapshotFirstSeen
+                + ", snapshotDepth=" + snapshotDepth
                 + ", lines=" + lines
                 + ", branches=" + branches
                 + ", recordBufKB=" + recordBufKB

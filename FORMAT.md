@@ -5,12 +5,14 @@ agent configuration grammar. Implementations in `hooks/`, `agent/`, and `reader/
 conform to this document exactly. Schema version: **3**.
 
 Scope: method enter/exit (+args, +return/throw), local-variable writes, field writes
-(before → after), object identity (+array length), 1-level shallow snapshots (with
-container unfolding), string/boxed/enum values, source-line flow, and conditional-branch
-conditions. NOT captured: array element stores, monitor events, allocation events
-(first-seen records subsume them). Schema history: 1 = base; 2 = snapshot `form` byte +
-first-seen display names; 3 = LINE/BRANCH records + array length in first-seen. The reader
-accepts all three.
+(before → after), object identity (+array length), bounded-depth shallow snapshots (with
+container and array unfolding), string/boxed/enum values, source-line flow, and
+conditional-branch conditions. NOT captured: array element stores, monitor events,
+allocation events (first-seen records subsume them). Schema history: 1 = base; 2 =
+snapshot `form` byte + first-seen display names; 3 = LINE/BRANCH records + array length
+in first-seen. The reader accepts all three. Recorder ≥ v1.3 additionally emits nested
+baseline snapshots and container-refresh snapshots (§7) — a purely behavioural addition
+(more records of existing types), NOT a schema change.
 
 ## 1. Recording directory
 
@@ -128,7 +130,7 @@ payload: len bytes
 
 `UTF8` payload: raw UTF-8 bytes (already truncated).
 
-`SNAPSHOT` payload (1-level shallow dump, schema 2):
+`SNAPSHOT` payload (bounded shallow dump — one level per payload, §7 depth rules; schema 2):
 
 ```
 classSym  : 4 bytes  — rt-symbol id of runtime class
@@ -222,25 +224,38 @@ like the consensus node; revisit if plugin-style loaders enter scope.
 
 ## 7. Snapshots
 
-Two triggers, same payload (reflective 1-level dump per §3):
+Two triggers, same payload (reflective bounded dump per §3):
 
 1. **First sight** (`snapshotFirstSeen`, default on): every object receives a baseline
    `SNAPSHOT` immediately after its `OBJECT_FIRST_SEEN` — the state from which later
-   recorded field writes evolve the object. Depth-1 containment: objects first seen as
-   *nested references inside* a snapshot get ids and `OBJECT_FIRST_SEEN` records but no
-   snapshot of their own (no transitive graph dumps). Arrays are never snapshotted
-   (no fields; contents are out of v1 scope).
+   recorded field writes evolve the object.
 2. **Sampling refresh** (`snapshotEvery`): with probability `1/snapshotEvery` per
-   object-id resolution (cheap counter + xorshift, per-thread), the worker re-snapshots
-   the resolved object — refreshing long-lived objects whose state drifted via
-   uninstrumented code. `snapshotEvery=0` disables.
+   object-id resolution (cheap countdown re-armed from a per-thread xorshift), the
+   worker re-snapshots the resolved object — refreshing long-lived objects whose state
+   drifted via uninstrumented code (container mutations above all). `snapshotEvery=0`
+   disables. A refresh dump of a FIELDS-form object additionally re-dumps the current
+   contents of up to 16 of its direct **container-valued** fields (map/set/list/array),
+   even when those containers are already registered — the checkpoint that makes
+   evolving collections inspectable (recorder ≥ v1.3).
+
+**Depth** (`snapshotDepth`, default 2, recorder ≥ v1.3): every dump runs at a nesting
+level; the triggering dump is level 1. Objects newly registered while dumping at level
+`L` (nested references) always get `OBJECT_FIRST_SEEN`; when `L < snapshotDepth` they
+also receive a baseline dump of their own, at level `L+1` (queue-driven off the pending
+first-seen list — never recursive). Levels count *dumps*, not field hops: depth 2 means
+"objects discovered inside a snapshot get their own snapshot; objects discovered inside
+THAT one get first-seen only". `snapshotDepth=1` reproduces the pre-v1.3 depth-1
+containment.
 
 Payload shape by object kind — plain objects dump fields; `java.base` maps, sets,
-lists/collections and all arrays are UNFOLDED into their elements (§3 forms); enums are
-never snapshotted (§6). Classes with no accessible fields produce no snapshot record.
+lists/collections and **all arrays** are UNFOLDED into their elements (§3 forms; arrays
+as ARRAY-form payloads with element values per §2.4, 64-entry cap, true length in
+`totalSize` — unfolded since the schema-2/3 recorders). Enums are never snapshotted (§6). Classes with no accessible fields produce no snapshot record.
 Reflection failures (inaccessible module, hidden class) silently skip. Snapshot values
-never recurse: nested refs become object ids, nested strings become UTF8 blob entries,
-everything else per §2.4.
+never recurse *within one payload*: nested refs become object ids, nested strings become
+UTF8 blob entries, everything else per §2.4. All dumps are bounded: ≤ 64 fields/entries
+per payload, ≤ 16 container re-dumps per refresh, nested fan-out bounded by the payload
+caps and the depth limit.
 
 ## 8. Hook API (bootstrap classpath, package `io.hindsight.hooks`)
 
@@ -293,7 +308,8 @@ first business record). `autostart=true` bypasses the trigger.
 
 `RuntimeConfig` (plain fields, constructed by the agent, hooks-module class):
 `Path outDir; int maxString; int snapshotEvery; boolean snapshotFirstSeen;
-int recordBufKB; int blobBufKB; long maxTotalMB; boolean autostart; int sweepMillis;`
+int snapshotDepth; int recordBufKB; int blobBufKB; long maxTotalMB; boolean autostart;
+int sweepMillis;`
 
 ## 9. Runtime architecture requirements
 
@@ -328,11 +344,13 @@ list-valued keys use `|` between elements. Keys:
 | `include` | required | package/class binary-name prefixes → FULL instrumentation (brackets + args + locals + fields) |
 | `callsOnly` | empty | prefixes → brackets + args only (no locals/fields) |
 | `exclude` | empty | prefixes excluded entirely; wins over include/callsOnly |
+| `snapshotOpen` | empty | prefixes whose packages are opened to the hooks module for reflective §7 snapshots WITHOUT instrumentation — for data/model classes (e.g. PBJ records) outside the instrumentation scope whose contents dumps must read |
 | `autostart` | `true` | start recording at premain |
 | `trigger` | none | `binary.class.Name#methodName` — first entry starts recording (implies `autostart=false` unless given) |
 | `maxString` | `512` | max recorded string length (chars) |
 | `snapshotEvery` | `8192` | §7 sampling refresh; `0` = off |
 | `snapshotFirstSeen` | `true` | §7 baseline snapshot of every object at first sight |
+| `snapshotDepth` | `2` | §7 nested-baseline depth; `1` = pre-v1.3 behaviour (must be ≥ 1) |
 | `lines` | `true` | emit LINE records at each source line (FULL scope) — §2.1 flow |
 | `branches` | `true` | emit BRANCH records at each conditional jump (FULL scope) — §2.1 condition values |
 | `recordBufKB` | `256` | per-thread record chunk |

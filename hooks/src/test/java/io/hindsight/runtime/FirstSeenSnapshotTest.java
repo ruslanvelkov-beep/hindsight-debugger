@@ -21,14 +21,15 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * First-sight baseline snapshots per FORMAT.md §7: every object gets a shallow SNAPSHOT
- * right after its OBJECT_FIRST_SEEN; objects first seen as nested references inside that
- * snapshot get ids but no snapshot of their own (depth-1 containment); maps/sets/lists/
- * arrays unfold into elements (§3 forms); enums carry their constant name instead; the
- * {@code snapshotFirstSeen} switch disables the whole behavior.
+ * right after its OBJECT_FIRST_SEEN; objects newly registered while a level-{@code L} dump
+ * executes always get first-seen and, while {@code L < snapshotDepth}, a baseline dump of
+ * their own at level {@code L + 1} ({@code snapshotDepth=1} pins the pre-v1.3 depth-1
+ * containment); maps/sets/lists/arrays unfold into elements (§3 forms); enums carry their
+ * constant name instead; the {@code snapshotFirstSeen} switch disables the whole behavior.
  */
 class FirstSeenSnapshotTest {
 
-    /** Fixture with one primitive and one reference field — the reference is the depth-1 probe. */
+    /** Fixture with one primitive and one reference field — the reference is the nesting probe. */
     static final class Holder {
         int x = 7;
         Object ref = new Nested();
@@ -36,6 +37,19 @@ class FirstSeenSnapshotTest {
 
     static final class Nested {
         int y = 13;
+    }
+
+    /** Three-level chain probing the §7 depth rules: outer → mid → leaf. */
+    static final class Outer {
+        Object mid = new Mid();
+    }
+
+    static final class Mid {
+        Object leaf = new Leaf();
+    }
+
+    static final class Leaf {
+        int w = 21;
     }
 
     @TempDir
@@ -47,15 +61,20 @@ class FirstSeenSnapshotTest {
     }
 
     private Path bootWith(boolean firstSeen) {
+        return bootWith(firstSeen, new RuntimeConfig().snapshotDepth); // spec default (2)
+    }
+
+    private Path bootWith(boolean firstSeen, int depth) {
         final RuntimeConfig cfg = Recordings.config(tmp);
         cfg.snapshotFirstSeen = firstSeen;
+        cfg.snapshotDepth = depth;
         HindsightRuntime.boot(cfg);
         return HindsightRuntime.recordingDir();
     }
 
     @Test
     void baselineSnapshotFollowsFirstSeenWithDepthOneContainment() throws IOException {
-        final Path dir = bootWith(true);
+        final Path dir = bootWith(true, 1); // §7: depth 1 pins the pre-v1.3 behaviour
         final Holder holder = new Holder();
         HindsightRuntime.worker().recordLocalWriteObject(1, 0, holder);
         HindsightRuntime.shutdownForTests();
@@ -100,6 +119,90 @@ class FirstSeenSnapshotTest {
         assertNotNull(fields.get("ref"));
         assertEquals(Wire.KIND_OBJECT_ID, (int) fields.get("ref")[1]);
         assertEquals(nestedId, fields.get("ref")[2], "nested ref recorded as the nested object's id");
+    }
+
+    @Test
+    void defaultDepthTwoDumpsNestedObjectsAndStopsAtLevelThree() throws IOException {
+        final Path dir = bootWith(true); // spec default snapshotDepth = 2
+        HindsightRuntime.worker().recordLocalWriteObject(1, 0, new Outer());
+        HindsightRuntime.shutdownForTests();
+
+        final List<Recordings.Rec> recs = Recordings.parseAll(dir);
+        final List<Recordings.Rec> firstSeens = byType(recs, Wire.TYPE_OBJECT_FIRST_SEEN);
+        final List<Recordings.Rec> snapshots = byType(recs, Wire.TYPE_SNAPSHOT);
+        assertEquals(3, firstSeens.size(), "outer, mid and leaf are all first-seen");
+        assertEquals(2, snapshots.size(),
+                "depth 2: the triggering dump and its level-2 nested baselines only — leaf gets no dump");
+
+        // Level 1: the directly-referenced Outer; its payload names Mid's id.
+        final long outerId = byType(recs, Wire.TYPE_LOCAL_WRITE).get(0).after();
+        assertEquals(outerId, snapshots.get(0).target(), "the level-1 dump comes first");
+        final Map<String, long[]> outerFields = parseSnapshotFields(dir, snapshots.get(0).after());
+        assertEquals(Wire.KIND_OBJECT_ID, (int) outerFields.get("mid")[1]);
+        final long midId = outerFields.get("mid")[2];
+
+        // Level 2: Mid gets a baseline of its own; its payload names Leaf's id.
+        assertEquals(midId, snapshots.get(1).target(), "the nested object's own baseline dump");
+        final Map<String, long[]> midFields = parseSnapshotFields(dir, snapshots.get(1).after());
+        assertEquals(Wire.KIND_OBJECT_ID, (int) midFields.get("leaf")[1]);
+        final long leafId = midFields.get("leaf")[2];
+
+        // Level 3: Leaf was discovered inside a level-2 dump — first-seen only.
+        final Recordings.Rec leafFs = firstSeens.stream()
+                .filter(r -> r.target() == leafId)
+                .findFirst()
+                .orElseThrow();
+        assertTrue(snapshots.stream().noneMatch(r -> r.target() == leafId),
+                "an object discovered at level 3 gets no dump at depth 2");
+
+        // §2.1: every FIRST_SEEN strictly precedes the payloads referencing its id, and the
+        // thread file stays seq-monotonic through the queued (never recursive) nested dumps.
+        final Recordings.Rec midFs = firstSeens.stream()
+                .filter(r -> r.target() == midId)
+                .findFirst()
+                .orElseThrow();
+        assertTrue(midFs.seq() < snapshots.get(0).seq(), "Mid first-seen before Outer's payload names it");
+        assertTrue(leafFs.seq() < snapshots.get(1).seq(), "Leaf first-seen before Mid's payload names it");
+        long prev = -1;
+        for (final Recordings.Rec r : recs) {
+            assertTrue(r.seq() > prev, "thread file seq-monotonic");
+            prev = r.seq();
+        }
+    }
+
+    @Test
+    void objectArraysUnfoldAndFreshElementsGetTheirOwnBaselineAtDepthTwo() throws IOException {
+        final Path dir = bootWith(true); // spec default snapshotDepth = 2
+        HindsightRuntime.worker().recordLocalWriteObject(1, 0, new Object[] {new Nested(), null, 5});
+        HindsightRuntime.shutdownForTests();
+
+        final List<Recordings.Rec> recs = Recordings.parseAll(dir);
+        final List<Recordings.Rec> snapshots = byType(recs, Wire.TYPE_SNAPSHOT);
+        assertEquals(2, snapshots.size(), "the array's ARRAY-form dump plus the fresh element's baseline");
+
+        final long arrayId = byType(recs, Wire.TYPE_LOCAL_WRITE).get(0).after();
+        assertEquals(arrayId, snapshots.get(0).target());
+        final Unfolded u = parseUnfolded(dir, snapshots.get(0).after(), Wire.SNAPSHOT_FORM_ARRAY);
+        assertEquals(3, u.totalSize, "totalSize is the array length");
+        assertEquals(3, u.entries.size());
+        assertEquals(Wire.TAG_REF, (int) u.entries.get(0)[0], "fresh element recorded as an object id");
+        assertEquals(Wire.KIND_OBJECT_ID, (int) u.entries.get(0)[1]);
+        final long elementId = u.entries.get(0)[2];
+        assertEquals(Wire.TAG_NULL, (int) u.entries.get(1)[0], "null element");
+        assertEquals(Wire.KIND_NONE, (int) u.entries.get(1)[1]);
+        assertEquals(Wire.TAG_INT, (int) u.entries.get(2)[0], "boxed element inline with its primitive tag");
+        assertEquals(Wire.KIND_INLINE, (int) u.entries.get(2)[1]);
+        assertEquals(5L, u.entries.get(2)[2]);
+
+        // The fresh element: FIRST_SEEN before the array payload names it, own dump at level 2.
+        final Recordings.Rec elementFs = byType(recs, Wire.TYPE_OBJECT_FIRST_SEEN).stream()
+                .filter(r -> r.target() == elementId)
+                .findFirst()
+                .orElseThrow();
+        assertTrue(elementFs.seq() < snapshots.get(0).seq(), "element first-seen precedes the array dump");
+        assertEquals(elementId, snapshots.get(1).target(), "the element's own level-2 baseline");
+        final Map<String, long[]> elementFields = parseSnapshotFields(dir, snapshots.get(1).after());
+        assertEquals(13L, elementFields.get("y")[2]);
     }
 
     @Test

@@ -18,19 +18,22 @@ class AgentConfigTest {
     void parsesFullGrammar() {
         final AgentConfig c = AgentConfig.parse(
                 "hooks=/tmp/hooks.jar,outDir=/tmp/rec,include=com.hedera.|com.swirlds.merkle.,"
-                        + "callsOnly=com.swirlds.,exclude=com.hedera.internal.,autostart=false,"
-                        + "trigger=com.hedera.node.App#main,maxString=64,snapshotEvery=0,"
+                        + "callsOnly=com.swirlds.,exclude=com.hedera.internal.,"
+                        + "snapshotOpen=com.hedera.hapi.|com.hedera.pbj.,autostart=false,"
+                        + "trigger=com.hedera.node.App#main,maxString=64,snapshotEvery=0,snapshotDepth=3,"
                         + "recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true");
         assertEquals("/tmp/hooks.jar", c.hooksJar);
         assertEquals("/tmp/rec", c.outDir);
         assertEquals(List.of("com.hedera.", "com.swirlds.merkle."), c.include);
         assertEquals(List.of("com.swirlds."), c.callsOnly);
         assertEquals(List.of("com.hedera.internal."), c.exclude);
+        assertEquals(List.of("com.hedera.hapi.", "com.hedera.pbj."), c.snapshotOpen);
         assertFalse(c.autostart);
         assertEquals("com.hedera.node.App", c.triggerClass);
         assertEquals("main", c.triggerMethod);
         assertEquals(64, c.maxString);
         assertEquals(0, c.snapshotEvery);
+        assertEquals(3, c.snapshotDepth);
         assertEquals(8, c.recordBufKB);
         assertEquals(4, c.blobBufKB);
         assertEquals(100L, c.maxTotalMB);
@@ -45,12 +48,23 @@ class AgentConfigTest {
         assertNull(c.triggerClass);
         assertEquals(512, c.maxString);
         assertEquals(8192, c.snapshotEvery);
+        assertEquals(2, c.snapshotDepth, "§10: snapshotDepth defaults to 2");
         assertEquals(256, c.recordBufKB);
         assertEquals(128, c.blobBufKB);
         assertEquals(204_800L, c.maxTotalMB);
         assertFalse(c.debug);
         assertTrue(c.callsOnly.isEmpty());
         assertTrue(c.exclude.isEmpty());
+        assertTrue(c.snapshotOpen.isEmpty(), "§10: snapshotOpen defaults to empty");
+    }
+
+    @Test
+    void snapshotOpenPrefixMatchingIsPlainStartsWith() {
+        final List<String> prefixes = List.of("com.hedera.hapi.", "com.hedera.pbj.");
+        assertTrue(SnapshotOpenTransformer.matches(prefixes, "com.hedera.hapi.node.base.AccountID"));
+        assertTrue(SnapshotOpenTransformer.matches(prefixes, "com.hedera.pbj.runtime.OneOf"));
+        assertFalse(SnapshotOpenTransformer.matches(prefixes, "com.hedera.node.app.workflows.IngestWorkflow"));
+        assertFalse(SnapshotOpenTransformer.matches(List.of(), "com.hedera.hapi.node.base.AccountID"));
     }
 
     @Test
@@ -77,6 +91,10 @@ class AgentConfigTest {
         assertThrows(IllegalArgumentException.class, () -> AgentConfig.parse("hooks=h.jar,include=a.,"));
         assertThrows(IllegalArgumentException.class, () -> AgentConfig.parse("hooks=h.jar,include=a.,hooks=x.jar"));
         assertThrows(IllegalArgumentException.class, () -> AgentConfig.parse("hooks=h.jar,include=a.,recordBufKB=0"));
+        assertThrows(IllegalArgumentException.class,
+                () -> AgentConfig.parse("hooks=h.jar,include=a.,snapshotDepth=0"), "snapshotDepth must be >= 1");
+        assertThrows(IllegalArgumentException.class,
+                () -> AgentConfig.parse("hooks=h.jar,include=a.,snapshotDepth=deep"));
     }
 
     @Test

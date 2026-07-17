@@ -55,7 +55,15 @@ public final class ThreadWorker {
     // ---- snapshot sampling state (§7): cheap countdown re-armed from a xorshift PRNG ----
     private long xorshiftState;
     private long snapshotCountdown;
-    private boolean inSnapshot;
+
+    /**
+     * Nesting level of the snapshot dump currently executing on this thread (§7): 0 = no dump
+     * in progress, 1 = a triggering dump (first-sight baseline or sampling refresh), and a
+     * baseline dump of an object discovered at level {@code L} runs at {@code L + 1}. Non-zero
+     * doubles as the reentrancy guard the old {@code inSnapshot} boolean provided: while any
+     * dump runs, the sampling countdown must not fire and queued dumps must not start.
+     */
+    private int dumpLevel;
 
     // ---- scratch slots for the single-value encoder (single-threaded by ownership) ----
     private int encKind;
@@ -245,14 +253,24 @@ public final class ThreadWorker {
     private long[] pendingFsIds = new long[4];
     private long[] pendingFsSeqs = new long[4];
     private Object[] pendingFsObjects = new Object[4];
+    private int[] pendingFsLevels = new int[4];
     private int pendingFsCount;
+
+    // ---- pending baseline dumps (§7 depth rules): objects whose FIRST_SEEN is out but whose
+    // ---- own dump must wait for the outermost drain loop — dumps are never recursive.
+    private long[] pendingDumpIds = new long[4];
+    private Object[] pendingDumpObjects = new Object[4];
+    private int[] pendingDumpLevels = new int[4];
+    private int pendingDumpCount;
 
     /**
      * Called by {@link ObjectIdRegistry} from inside its map-bin lock: reserves the record's
      * {@code seq} (strictly lower than any later reference, §2.1) without doing any I/O.
      * Always invoked on this worker's own thread (the registering thread). The strong
      * reference to the object is short-lived: it is cleared by the drain that immediately
-     * follows on the same thread.
+     * follows on the same thread. The entry carries its §7 discovery level: an object
+     * registered while a level-{@code L} dump is executing is discovered at {@code L + 1}
+     * (top-level registrations, {@code dumpLevel} 0, are discovered at level 1).
      */
     synchronized void notePendingFirstSeen(long id, Object obj) {
         if (pendingFsCount == pendingFsIds.length) {
@@ -261,44 +279,92 @@ public final class ThreadWorker {
             pendingFsIds = java.util.Arrays.copyOf(pendingFsIds, pendingFsCount * 2);
             pendingFsSeqs = java.util.Arrays.copyOf(pendingFsSeqs, pendingFsCount * 2);
             pendingFsObjects = java.util.Arrays.copyOf(pendingFsObjects, pendingFsCount * 2);
+            pendingFsLevels = java.util.Arrays.copyOf(pendingFsLevels, pendingFsCount * 2);
         }
         pendingFsIds[pendingFsCount] = id;
         pendingFsSeqs[pendingFsCount] = rt.nextSeq();
         pendingFsObjects[pendingFsCount] = obj;
+        pendingFsLevels[pendingFsCount] = dumpLevel + 1;
         pendingFsCount++;
     }
 
     /**
      * Materialises reserved first-seen records; called right after the bin lock is released.
      *
-     * <p>Reentrant by design: the §7 first-sight snapshot emitted here resolves nested field
-     * references, each of which notes-and-drains its own first-seen through this same method
-     * (with the snapshot suppressed by {@code inSnapshot} — depth-1 containment). Entries are
+     * <p>Reentrant by design: a §7 baseline snapshot resolves nested field references, each of
+     * which notes-and-drains its own first-seen through this same method. Entries are
      * therefore <em>popped before processing</em>, so a nested drain only ever sees its own
-     * additions, and FIFO order keeps per-thread-file records in ascending seq order.
+     * additions, and FIFO order keeps per-thread-file records in ascending seq order — the
+     * reserved FIRST_SEEN seq must reach the file before any later-seq record this thread
+     * emits.
+     *
+     * <p>Dumps are decoupled from FIRST_SEEN emission (§7 depth rules): an entry discovered at
+     * level {@code M} queues a baseline dump of its own iff {@code M ≤ snapshotDepth} and
+     * first-sight snapshots are on. The queue is only run by the <em>outermost</em> drain
+     * ({@code dumpLevel} 0); a drain re-entered from inside a dump merely appends, and the
+     * outer loop picks the additions up — dumping is queue-driven, never recursive.
      */
     synchronized void drainPendingFirstSeen() {
         while (pendingFsCount > 0) {
             final long seq = pendingFsSeqs[0];
             final long id = pendingFsIds[0];
             final Object obj = pendingFsObjects[0];
+            final int level = pendingFsLevels[0];
             pendingFsCount--;
             System.arraycopy(pendingFsSeqs, 1, pendingFsSeqs, 0, pendingFsCount);
             System.arraycopy(pendingFsIds, 1, pendingFsIds, 0, pendingFsCount);
             System.arraycopy(pendingFsObjects, 1, pendingFsObjects, 0, pendingFsCount);
+            System.arraycopy(pendingFsLevels, 1, pendingFsLevels, 0, pendingFsCount);
             pendingFsObjects[pendingFsCount] = null;
             emitObjectFirstSeenAt(seq, id, obj);
-            if (rt.snapshotFirstSeen && !inSnapshot) {
+            if (rt.snapshotFirstSeen && level <= rt.snapshotDepth) {
                 // §7: baseline snapshot at first sight; later field writes evolve it.
-                inSnapshot = true;
-                try {
-                    emitSnapshot(obj, id);
+                enqueuePendingDump(id, obj, level);
+            }
+        }
+        if (dumpLevel == 0) {
+            runPendingDumps();
+        }
+    }
+
+    private void enqueuePendingDump(long id, Object obj, int level) {
+        if (pendingDumpCount == pendingDumpIds.length) {
+            pendingDumpIds = java.util.Arrays.copyOf(pendingDumpIds, pendingDumpCount * 2);
+            pendingDumpObjects = java.util.Arrays.copyOf(pendingDumpObjects, pendingDumpCount * 2);
+            pendingDumpLevels = java.util.Arrays.copyOf(pendingDumpLevels, pendingDumpCount * 2);
+        }
+        pendingDumpIds[pendingDumpCount] = id;
+        pendingDumpObjects[pendingDumpCount] = obj;
+        pendingDumpLevels[pendingDumpCount] = level;
+        pendingDumpCount++;
+    }
+
+    /**
+     * Executes queued baseline dumps FIFO until the queue is empty. Only ever entered with
+     * {@code dumpLevel} 0 (asserted by the callers' guards): while an entry's dump runs at its
+     * own level, nested registrations re-enter {@link #drainPendingFirstSeen}, which emits
+     * their FIRST_SEEN immediately and appends further dump entries this same loop consumes.
+     */
+    private void runPendingDumps() {
+        while (pendingDumpCount > 0) {
+            final long id = pendingDumpIds[0];
+            final Object obj = pendingDumpObjects[0];
+            final int level = pendingDumpLevels[0];
+            pendingDumpCount--;
+            System.arraycopy(pendingDumpIds, 1, pendingDumpIds, 0, pendingDumpCount);
+            System.arraycopy(pendingDumpObjects, 1, pendingDumpObjects, 0, pendingDumpCount);
+            System.arraycopy(pendingDumpLevels, 1, pendingDumpLevels, 0, pendingDumpCount);
+            pendingDumpObjects[pendingDumpCount] = null;
+            dumpLevel = level;
+            try {
+                emitSnapshot(obj, id);
+                if (level == 1) {
                     lastBaselineId = id; // suppress an immediate duplicate sampler snapshot
-                } catch (Throwable t) {
-                    HindsightRuntime.reportInternalError("first-seen-snapshot", t);
-                } finally {
-                    inSnapshot = false;
                 }
+            } catch (Throwable t) {
+                HindsightRuntime.reportInternalError("first-seen-snapshot", t);
+            } finally {
+                dumpLevel = 0;
             }
         }
     }
@@ -422,25 +488,38 @@ public final class ThreadWorker {
 
     /**
      * Object-id resolution with §7 snapshot sampling: roughly one resolution in
-     * {@code snapshotEvery} also emits a shallow SNAPSHOT of the object.
+     * {@code snapshotEvery} also emits a shallow SNAPSHOT of the object — a level-1 refresh
+     * dump, followed by the recorder-≥v1.3 container-field re-dumps and by baseline dumps of
+     * any objects the refresh discovered within the depth limit.
      */
     private long resolveObjectId(Object o) {
         final long id = ObjectIdRegistry.idFor(o, this);
         // If idFor's drain just emitted this object's first-sight baseline, a sampler
         // snapshot on the same resolution would be an immediate byte-equivalent duplicate.
-        final boolean justBaselined = id != 0 && id == lastBaselineId;
-        lastBaselineId = 0;
-        if (id != 0 && rt.snapshotEvery > 0 && !inSnapshot && --snapshotCountdown <= 0) {
+        // Only the OUTERMOST resolution may consume (and clear) the marker: nested
+        // resolutions from level-2+ queued dumps run through here before the outer
+        // resolution returns, and clearing unconditionally would wipe the marker they
+        // did not set — re-enabling exactly the duplicate this suppresses.
+        final boolean justBaselined;
+        if (dumpLevel == 0) {
+            justBaselined = id != 0 && id == lastBaselineId;
+            lastBaselineId = 0;
+        } else {
+            justBaselined = false;
+        }
+        if (id != 0 && rt.snapshotEvery > 0 && dumpLevel == 0 && --snapshotCountdown <= 0) {
             rearmSnapshotCountdown();
             if (!justBaselined) {
-                inSnapshot = true; // nested resolutions inside the dump must not snapshot again
                 try {
+                    dumpLevel = 1; // nested resolutions inside the dump must not snapshot again
                     emitSnapshot(o, id);
+                    refreshContainerFields(o);
                 } catch (Throwable t) {
                     HindsightRuntime.reportInternalError("snapshot", t);
                 } finally {
-                    inSnapshot = false;
+                    dumpLevel = 0;
                 }
+                runPendingDumps(); // §7 depth rules: baselines of objects the refresh discovered
             }
         }
         return id;
@@ -448,6 +527,15 @@ public final class ThreadWorker {
 
     /** Object id whose first-sight baseline the drain emitted last; consumed by the sampler. */
     private long lastBaselineId;
+
+    /**
+     * Test seam: primes the §7 sampling countdown so the next {@code snapshotEvery > 0}
+     * object-id resolution fires a refresh dump deterministically — the xorshift re-arm makes
+     * the natural countdown impossible to force from a test. Same-thread use only.
+     */
+    synchronized void forceSnapshotCountdownForTests(long value) {
+        this.snapshotCountdown = value;
+    }
 
     private void rearmSnapshotCountdown() {
         long x = xorshiftState;
@@ -494,6 +582,64 @@ public final class ThreadWorker {
         return cls.getModule() == Object.class.getModule();
     }
 
+    /** True when §3/§7 unfold {@code v} into elements: arrays and {@code java.base} maps/collections. */
+    private static boolean isUnfoldedContainer(Object v) {
+        final Class<?> c = v.getClass();
+        return c.isArray()
+                || ((v instanceof java.util.Map || v instanceof java.util.Collection) && isJavaBase(c));
+    }
+
+    /**
+     * §7 trigger 2, container refresh (recorder ≥ v1.3): after a sampling-refresh dump of a
+     * FIELDS-form object, re-dump the <em>current</em> contents of up to
+     * {@link Wire#SNAPSHOT_MAX_CONTAINER_REDUMPS} of its direct container-valued fields
+     * ({@code java.base} maps/sets/lists and arrays) — even when those containers are already
+     * registered. Container mutations run inside uninstrumented {@code java.base} code, so
+     * without this checkpoint a long-lived collection's contents drift invisibly between its
+     * first-sight baseline and the end of the recording. Each re-dump is an ordinary SNAPSHOT
+     * record for the container's id, executed at level 2: objects newly discovered inside it
+     * get FIRST_SEEN always and a dump of their own only when {@code 2 < snapshotDepth}.
+     * Called only from the refresh path with {@code dumpLevel} 1; objects that themselves
+     * unfold are skipped — their refresh dump already IS their contents.
+     */
+    private void refreshContainerFields(Object o) {
+        if (o instanceof Enum<?> || isUnfoldedContainer(o)) {
+            return;
+        }
+        final Field[] plan = SNAPSHOT_PLANS.get(o.getClass());
+        int redumps = 0;
+        for (final Field f : plan) {
+            if (redumps >= Wire.SNAPSHOT_MAX_CONTAINER_REDUMPS) {
+                break;
+            }
+            if (f.getType().isPrimitive()) {
+                continue;
+            }
+            final Object v;
+            try {
+                v = f.get(o);
+            } catch (Throwable t) {
+                continue; // reflection failures silently skip (§7)
+            }
+            if (v == null || !isUnfoldedContainer(v)) {
+                continue;
+            }
+            redumps++;
+            final int outerLevel = dumpLevel;
+            dumpLevel = 2; // the container re-dump runs at level 2 (§7)
+            try {
+                final long containerId = ObjectIdRegistry.idFor(v, this);
+                if (containerId != 0) {
+                    emitSnapshot(v, containerId);
+                }
+            } catch (Throwable t) {
+                HindsightRuntime.reportInternalError("container-refresh", t);
+            } finally {
+                dumpLevel = outerLevel;
+            }
+        }
+    }
+
     /** Unfolded §3 payload (forms MAP/SET/LIST/ARRAY): totalSize, then up to 64 elements. */
     private void emitUnfoldedSnapshot(Object o, long id, Class<?> cls, int form) {
         final int cap = Wire.SNAPSHOT_MAX_FIELDS;
@@ -502,14 +648,18 @@ public final class ThreadWorker {
                 ByteBuffer.allocate(11 + cap * entryBytes).order(ByteOrder.LITTLE_ENDIAN);
         payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, cls.getName()));
         payload.put((byte) form);
+        payload.putInt(0); // totalSize — patched below; size() itself can throw on drifted views
+        payload.putShort((short) 0); // count — patched below
         int included = 0;
-        // Iteration reads another thread's possibly-mutating structure: exceptions
-        // (ConcurrentModification and friends) keep whatever was collected so far.
+        int total = 0;
+        // Iteration reads another thread's possibly-mutating structure — and a drifted view
+        // (e.g. a stale ArrayList$SubList after structural modification of its backing list,
+        // exactly what a §7 container refresh re-dumps) throws from size() before yielding a
+        // single element. Both placeholders are written BEFORE the try so any throw still
+        // leaves a well-formed §3 payload with whatever was collected.
         try {
             if (form == Wire.SNAPSHOT_FORM_ARRAY) {
-                final int total = java.lang.reflect.Array.getLength(o);
-                payload.putInt(total);
-                payload.putShort((short) 0); // patched below
+                total = java.lang.reflect.Array.getLength(o);
                 for (int i = 0; i < total && included < cap; i++) {
                     encodeRef(java.lang.reflect.Array.get(o, i));
                     putSnapshotEntry(payload);
@@ -517,8 +667,7 @@ public final class ThreadWorker {
                 }
             } else if (form == Wire.SNAPSHOT_FORM_MAP) {
                 final java.util.Map<?, ?> m = (java.util.Map<?, ?>) o;
-                payload.putInt(m.size());
-                payload.putShort((short) 0);
+                total = m.size();
                 for (final java.util.Map.Entry<?, ?> e : m.entrySet()) {
                     if (included >= cap) {
                         break;
@@ -531,8 +680,7 @@ public final class ThreadWorker {
                 }
             } else {
                 final java.util.Collection<?> c = (java.util.Collection<?>) o;
-                payload.putInt(c.size());
-                payload.putShort((short) 0);
+                total = c.size();
                 for (final Object e : c) {
                     if (included >= cap) {
                         break;
@@ -545,7 +693,8 @@ public final class ThreadWorker {
         } catch (Throwable t) {
             // keep the elements collected before the failure
         }
-        payload.putShort(9, (short) included); // classSym(4) + form(1) + totalSize(4)
+        payload.putInt(5, Math.max(total, included)); // classSym(4) + form(1)
+        payload.putShort(9, (short) included); // ... + totalSize(4)
         final long offset = writeBlobEntry(Wire.BLOB_KIND_SNAPSHOT, payload.array(), payload.position());
         if (offset >= 0) {
             emit(Wire.TYPE_SNAPSHOT, Wire.KIND_BLOB << Wire.AFTER_KIND_SHIFT, 0, 0, 0, id, 0, offset);

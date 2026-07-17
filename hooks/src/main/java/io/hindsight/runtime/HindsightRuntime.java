@@ -214,6 +214,7 @@ public final class HindsightRuntime {
         final int maxString;
         final int snapshotEvery;
         final boolean snapshotFirstSeen;
+        final int snapshotDepth;
 
         /** Global monotonic sequence, starts at 1 (§2); one getAndIncrement per record. */
         final AtomicLong seq = new AtomicLong(1);
@@ -232,6 +233,7 @@ public final class HindsightRuntime {
             this.maxString = Math.max(0, cfg.maxString);
             this.snapshotEvery = Math.max(0, cfg.snapshotEvery);
             this.snapshotFirstSeen = cfg.snapshotFirstSeen;
+            this.snapshotDepth = Math.max(1, cfg.snapshotDepth); // §7/§10: must be ≥ 1
             this.dir = resolveRecordingDir(cfg.outDir.toAbsolutePath());
             writeManifest(dir, cfg, System.currentTimeMillis());
             this.symbols = new RuntimeSymbols(dir);
@@ -424,6 +426,7 @@ public final class HindsightRuntime {
                 + ",maxString=" + cfg.maxString
                 + ",snapshotEvery=" + cfg.snapshotEvery
                 + ",snapshotFirstSeen=" + cfg.snapshotFirstSeen
+                + ",snapshotDepth=" + cfg.snapshotDepth
                 + ",recordBufKB=" + cfg.recordBufKB
                 + ",blobBufKB=" + cfg.blobBufKB
                 + ",maxTotalMB=" + cfg.maxTotalMB

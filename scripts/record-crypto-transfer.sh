@@ -42,6 +42,10 @@ READER_BIN="$HINDSIGHT_DIR/reader/build/install/reader/bin/reader"
 INCLUDE='com.hedera.node.app.|com.swirlds.state.|org.hiero.consensus.transaction.'
 CALLS_ONLY='org.hiero.consensus.|org.hiero.base.crypto.|org.hiero.base.concurrent.|com.swirlds.component.framework.|com.swirlds.platform.|com.swirlds.virtualmap.|com.swirlds.merkledb.|com.hedera.node.app.hints.|com.hedera.node.app.history.|com.hedera.node.app.tss.'
 EXCLUDE='com.hedera.node.app.metrics.|com.hedera.node.app.blocks.impl.streaming.|com.hedera.node.app.grpc.impl.usage.'
+# PBJ model/state classes (AccountID, Account, TransactionBody, ...) are data, not code —
+# instrumenting them would drown the recording, but their packages must be OPEN to the
+# hooks module or their reflective snapshots silently come out empty (FORMAT.md §10).
+SNAPSHOT_OPEN='com.hedera.hapi.|com.hedera.pbj.'
 TRIGGER='com.hedera.node.app.workflows.ingest.IngestWorkflowImpl#submitTransaction'
 
 # Size the recording cap from actual free disk (leave 20 GiB headroom, cap at 100 GiB):
@@ -51,7 +55,13 @@ MAX_TOTAL_MB=$(( FREE_MB - 20480 ))
 (( MAX_TOTAL_MB > 102400 )) && MAX_TOTAL_MB=102400
 (( MAX_TOTAL_MB < 4096 )) && { echo "!! less than ~24 GiB free on disk; refusing to record"; exit 1; }
 
-AGENT_OPTS="hooks=$HOOKS_JAR,outDir=$OUT_DIR,include=$INCLUDE,callsOnly=$CALLS_ONLY,exclude=$EXCLUDE,trigger=$TRIGGER,maxString=512,snapshotEvery=8192,maxTotalMB=$MAX_TOTAL_MB,debug=true"
+# snapshotEvery=256: ~1 refresh per 256 object-id resolutions — frequent enough that
+# container contents are inspectable at checkpoints, still a rounding error in CPU/IO.
+# snapshotDepth=3: objects discovered inside a snapshot (account IDs, states, nested
+# containers) get their own baseline dump, one level further so PBJ wrapper cells are
+# readable too — Account(L1) -> AccountID(L2) -> OneOf holding the account number (L3)
+# (FORMAT.md §7).
+AGENT_OPTS="hooks=$HOOKS_JAR,outDir=$OUT_DIR,include=$INCLUDE,callsOnly=$CALLS_ONLY,exclude=$EXCLUDE,snapshotOpen=$SNAPSHOT_OPEN,trigger=$TRIGGER,maxString=512,snapshotEvery=256,snapshotDepth=3,maxTotalMB=$MAX_TOTAL_MB,debug=true"
 
 echo "==> Writing node0 jvmargs seam file"
 mkdir -p "$TEST_CLIENTS_DIR/build/hindsight"

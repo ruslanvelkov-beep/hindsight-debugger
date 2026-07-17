@@ -82,6 +82,7 @@ public final class HindsightAgent {
         runtimeConfig.maxString = config.maxString;
         runtimeConfig.snapshotEvery = config.snapshotEvery;
         runtimeConfig.snapshotFirstSeen = config.snapshotFirstSeen;
+        runtimeConfig.snapshotDepth = config.snapshotDepth;
         runtimeConfig.recordBufKB = config.recordBufKB;
         runtimeConfig.blobBufKB = config.blobBufKB;
         runtimeConfig.maxTotalMB = config.maxTotalMB;
@@ -125,6 +126,14 @@ public final class HindsightAgent {
                 .type(new ScopeMatcher(config))
                 .transform(transformer)
                 .installOn(inst);
+
+        // §10 snapshotOpen: data/model packages opened for reflective §7 snapshots without
+        // being instrumented — a pure side-effect transformer, no bytecode changes.
+        if (!config.snapshotOpen.isEmpty()) {
+            inst.addTransformer(
+                    new SnapshotOpenTransformer(config.snapshotOpen, inst, hooksAnchor.getModule(), log), false);
+            log.info("snapshot-open prefixes: " + config.snapshotOpen);
+        }
 
         log.info("instrumentation installed (include=" + config.include
                 + ", callsOnly=" + config.callsOnly
