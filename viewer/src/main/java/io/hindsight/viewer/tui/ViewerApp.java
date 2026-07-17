@@ -69,12 +69,18 @@ import java.util.regex.PatternSyntaxException;
  *   <li><b>Modal lists scroll incrementally</b> (§13.1): every dialog/overlay list
  *       persists its scroll offset and adjusts it edge-only via
  *       {@link ScrollMath#adjustScroll}, resetting to 0 on open/query/mode change.
- *   <li><b>Instance browse</b> (§13.2/§14.1/§14.2): {@code Tab} in the {@code /}
+ *   <li><b>Instance browse</b> (§13.2/§14.1/§14.2/§15.1): {@code Tab} in the {@code /}
  *       dialog toggles calls ↔ instances ({@link InstanceBrowse}, whose query also
- *       accepts {@code <regex>#<id>}/{@code #<id>}); the instance rows themselves are
+ *       accepts {@code <regex>#<id>}/{@code #<id>} and matches simple class names
+ *       unless qualified with {@code .}/{@code $}); the instance rows themselves are
  *       expandable object-tree roots (a dedicated {@link TreeView}) resolved as-of
- *       the current cursor, and {@code g} jumps to the selected row's owning
+ *       the current cursor, and {@code f} jumps to the selected row's owning
  *       instance's first mention while the dialog stays open.
+ *   <li><b>Search-dialog focus model + persistence</b> (§15.2–§15.5): the {@code /}
+ *       dialog has explicit QUERY/LIST foci (the query line edits vs. the numbered,
+ *       counted result list navigates; {@code /} returns to the query), and its one
+ *       {@link SearchDialog} instance survives closing, so reopening restores the
+ *       whole dialog state.
  *   <li><b>Source-line cursor + variable history</b> (§13.4/§13.5): the Source
  *       window keeps a cursor line (rendered in the gutter while focused) that
  *       ↑/↓ move; {@code v} parses it via {@link FieldDecl} and lists the matching
@@ -102,16 +108,24 @@ public final class ViewerApp {
         METHOD, OBJECT, FILE
     }
 
+    /** Which part of the {@code /} dialog receives keys (§15.2): the query line or the result list. */
+    private enum DialogFocus {
+        QUERY, LIST
+    }
+
     /**
-     * Live state of an open modal dialog: a query, its result rows + jump targets, a note, and a
-     * persistent scroll offset (§13.1 — adjusted incrementally each frame, reset to 0 on open, on
-     * query change and on the §13.2 mode toggle). The {@code METHOD} kind carries the calls ↔
-     * instances mode flag; in instances mode the result rows are the roots of {@code instanceTree}
-     * (§14.2, expanded in place; {@code instanceRows} holds the backing per-root instances and
-     * {@code rows} mirrors their labels for the empty/no-matches checks), {@code hcol} is the
-     * tree's horizontal scroll, and {@code listActive} tracks whether the last key went to the
-     * result list — when it did, {@code g}/{@code <}/{@code >} act on the list instead of typing
-     * into the query (the §14.2 g-vs-typing rule; any query edit hands them back to the query).
+     * Live state of an open modal dialog: a query, its result rows + jump targets, a note (the
+     * §15.3 count line for the {@code /} kind, the bottom cap note otherwise), and a persistent
+     * scroll offset (§13.1 — adjusted incrementally each frame, reset to 0 on open, on query
+     * change and on the §13.2 mode toggle). The {@code METHOD} kind carries the calls ↔ instances
+     * mode flag and the §15.2 QUERY/LIST focus (which replaced the §14.2 list-active heuristic);
+     * in instances mode the result rows are the roots of {@code instanceTree} (§14.2, expanded in
+     * place; {@code instanceRows} holds the backing per-root instances and {@code rows} mirrors
+     * their labels for the empty/no-matches checks) and {@code hcol} is the tree's horizontal
+     * scroll. {@code listViewH} is the list's visible row count, captured at render so LIST-focus
+     * paging (§15.2 Ctrl-F/Ctrl-B, PgDn/PgUp) knows the page size. The {@code /} instance of this
+     * class outlives its closing (§15.5): {@code ViewerApp.searchDialog} keeps it across
+     * Esc/reopen so mode, query, results, selection, scroll, expansion and focus all survive.
      */
     private static final class SearchDialog {
         final DialogKind kind;
@@ -125,7 +139,8 @@ public final class ViewerApp {
         int scroll;
         int hcol;
         boolean instancesMode;
-        boolean listActive;
+        DialogFocus focus = DialogFocus.QUERY;
+        int listViewH = 1;
 
         SearchDialog(final DialogKind kind) {
             this.kind = kind;
@@ -169,6 +184,8 @@ public final class ViewerApp {
     private boolean helpOverlay;
     private boolean quitConfirm;
     private SearchDialog dialog;
+    // §15.5: the one persistent `/` dialog — kept across Esc/close so reopening restores it.
+    private SearchDialog searchDialog;
     private VarHistoryWindow varHist;
     private TerminalPosition cursorPos;
 
@@ -317,8 +334,7 @@ public final class ViewerApp {
 
     private void renderSource(final TextGraphics g, final Layout.Rect rect) {
         boolean focused = focus == Win.SOURCE;
-        String title = browseMode ? "Source Code [c] — " + browseName : "Source Code [c]";
-        drawBox(g, rect, title, Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
+        drawBox(g, rect, sourceTitle(), Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
         int ix = rect.col() + 1;
         int iy = rect.row() + 1;
         int iw = rect.width() - 2;
@@ -332,6 +348,26 @@ public final class ViewerApp {
         } else {
             renderExecSource(g, ix, iy, iw, ih);
         }
+    }
+
+    /**
+     * The Source window title (§15.7): browse mode keeps {@code Source Code [c] — <fileName>};
+     * exec mode appends the SELECTED frame's {@code SimpleClass.method} after exactly ten spaces
+     * (clipped by the border like any title), or nothing when there is no frame.
+     */
+    private String sourceTitle() {
+        if (browseMode) {
+            return "Source Code [c] — " + browseName;
+        }
+        Frame f = selectedFrameOrNull();
+        return f == null ? "Source Code [c]" : "Source Code [c]" + " ".repeat(10) + FrameText.simple(f);
+    }
+
+    /** The currently selected stack frame — recorded or unrecorded (§14.5) — or {@code null}. */
+    private Frame selectedFrameOrNull() {
+        List<Frame> frames = engine.stack();
+        int sf = engine.selectedFrame();
+        return sf >= 0 && sf < frames.size() ? frames.get(sf) : null;
     }
 
     private void renderExecSource(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -606,9 +642,11 @@ public final class ViewerApp {
     }
 
     /**
-     * The focus-sensitive position part of the status row (§14.4): the selected instance's full
-     * class + id while the {@code /} dialog is in instances mode, the selected Locals row's full
-     * type while Locals is focused, and the compact record info everywhere else.
+     * The focus-sensitive position part of the status row (§14.4/§15.6): the selected instance's
+     * full class + id while the {@code /} dialog is in instances mode, the selected Locals row's
+     * full type while Locals is focused, the selected stack frame's fully-qualified
+     * {@code Class.method} while Stack is focused (grey §14.5 frames included), and the compact
+     * record info everywhere else (or as fallback when the focused window has no selection).
      */
     private String positionText(final RecordInfo ri) {
         if (dialog != null && dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
@@ -620,6 +658,11 @@ public final class ViewerApp {
             String type = TypeName.of(localsSelValue, localsSelDescriptor, recording::objectClassName);
             if (type != null) {
                 return type;
+            }
+        } else if (dialog == null && focus == Win.STACK) {
+            Frame f = selectedFrameOrNull();
+            if (f != null) {
+                return FrameText.qualified(f); // §15.6
             }
         }
         return "seq " + ri.seq() + DOT + "t" + ri.tid() + DOT + ri.siteText();
@@ -783,25 +826,36 @@ public final class ViewerApp {
             case OBJECT -> "query: ";
         };
         put(g, ix, iy, clipPad(prompt + dialog.query, iw), Palette.FG, Palette.DIALOG_BG, false);
-        cursorPos = new TerminalPosition(Math.min(x + w - 2, ix + prompt.length() + dialog.query.length()), iy);
+        if (dialog.kind != DialogKind.METHOD || dialog.focus == DialogFocus.QUERY) {
+            // §15.2: the terminal cursor sits on the query line only in QUERY focus; it stays
+            // hidden (cursorPos == null) while the `/` dialog's LIST has the focus.
+            cursorPos = new TerminalPosition(Math.min(x + w - 2, ix + prompt.length() + dialog.query.length()), iy);
+        }
 
         int hintRow = y + h - 2;
         String hint = switch (dialog.kind) {
             case FILE -> "class[:line] | path.java[:line]   ↵ open  Esc close";
-            case METHOD -> dialog.instancesMode
-                    ? "↑↓ move  →/↵ expand  ← collapse  g first-mention  Esc close"
-                    : "↑↓ select  ↵ jump  ⇥ instances  Esc close";
+            case METHOD -> searchHint();
             case OBJECT -> "↑↓ select  ↵ jump  Esc close";
         };
         put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
+        int listTop = iy + 2;
         int listBottom = hintRow;
-        if (!dialog.note.isEmpty()) {
+        if (dialog.kind == DialogKind.METHOD) {
+            // §15.3: the count line (or "invalid regex") sits DIM directly under the query; it
+            // replaced the bottom cap note, so the list always runs down to the hint row.
+            if (!dialog.note.isEmpty()) {
+                put(g, ix, iy + 1, clip(dialog.note, iw), Palette.DIM, Palette.DIALOG_BG, false);
+            }
+        } else if (!dialog.note.isEmpty()) {
             listBottom = hintRow - 1;
             put(g, ix, listBottom, clip(dialog.note, iw), Palette.DIM, Palette.DIALOG_BG, false);
         }
-        int listTop = iy + 2;
         int listH = listBottom - listTop;
+        if (dialog.kind == DialogKind.METHOD) {
+            dialog.listViewH = Math.max(1, listH); // §15.2: page size for Ctrl-F/Ctrl-B, PgDn/PgUp
+        }
 
         if (dialog.kind == DialogKind.FILE) {
             put(g, ix, listTop, clip("Opens a file in browse mode; press o to return to execution.", iw),
@@ -817,6 +871,7 @@ public final class ViewerApp {
             drawInstanceTree(g, ix, listTop, iw, listH);
             return;
         }
+        boolean numbered = dialog.kind == DialogKind.METHOD; // §15.4: `/` rows only
         dialog.sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
         // §13.1: adjust the persisted offset incrementally — never recompute from 0.
         dialog.scroll = ScrollMath.adjustScroll(dialog.scroll, dialog.sel, listH, dialog.rows.size());
@@ -826,9 +881,24 @@ public final class ViewerApp {
                 break;
             }
             boolean s = idx == dialog.sel;
-            put(g, ix, listTop + r, clipPad(dialog.rows.get(idx), iw),
+            String text = numbered
+                    ? DialogFormat.number(idx, dialog.rows.size()) + dialog.rows.get(idx)
+                    : dialog.rows.get(idx);
+            put(g, ix, listTop + r, clipPad(text, iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
+    }
+
+    /** The `/` dialog's hint line, reflecting the active §15.2 focus and the mode. */
+    private String searchHint() {
+        if (dialog.focus == DialogFocus.QUERY) {
+            return dialog.instancesMode
+                    ? "type to filter  ↑↓ results  ⇥ calls  ^U clear  Esc close"
+                    : "type to filter  ↑↓ results  ⇥ instances  ^U clear  Esc close";
+        }
+        return dialog.instancesMode
+                ? "↑↓ move  →/↵ expand  ← collapse  f first-mention  / query  Esc close"
+                : "↑↓ select  ↵ jump  ^F/^B page  g/G  / query  Esc close";
     }
 
     /**
@@ -836,11 +906,15 @@ public final class ViewerApp {
      * expandable object tree, rendered Locals-style (glyphs + indentation) with the §13.1
      * edge-only scrolling the {@link TreeView} provides. Children are re-fetched from the
      * engine on every draw, so expanded trees re-resolve as-of the cursor's current seq.
+     * Root rows carry the §15.4 {@code 1.}–{@code N.} numbers; child rows carry a blank
+     * prefix of the same width so they stay indented under their root; the whole row —
+     * prefix included — participates in the {@code <}/{@code >} horizontal scroll.
      */
     private void drawInstanceTree(final TextGraphics g, final int ix, final int iy, final int iw, final int listH) {
         TreeView tree = dialog.instanceTree;
         List<TreeView.Row> rows = tree.rows();
         tree.ensureVisible(listH, rows.size());
+        int roots = dialog.instanceRows.size();
         for (int r = 0; r < listH; r++) {
             int idx = tree.scroll() + r;
             if (idx >= rows.size()) {
@@ -848,10 +922,23 @@ public final class ViewerApp {
             }
             TreeView.Row row = rows.get(idx);
             String glyph = row.expandable() ? (row.expanded() ? "▾ " : "▸ ") : "  ";
-            String text = "  ".repeat(row.depth()) + glyph + row.node().label();
+            String prefix = row.depth() == 0
+                    ? DialogFormat.number(rootOrdinal(row.key()), roots)
+                    : DialogFormat.childPad(roots);
+            String text = prefix + "  ".repeat(row.depth()) + glyph + row.node().label();
             boolean s = idx == tree.selection();
             put(g, ix, iy + r, clipPad(HScroll.clip(text, dialog.hcol, iw), iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+        }
+    }
+
+    /** The 0-based root index a tree row's structural key starts with ({@code "2/0/1"} → 2). */
+    private static int rootOrdinal(final String key) {
+        int slash = key.indexOf('/');
+        try {
+            return Integer.parseInt(slash < 0 ? key : key.substring(0, slash));
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 
@@ -907,8 +994,8 @@ public final class ViewerApp {
             "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
             "v                     variable history for the Source cursor line",
             "/  .  F               browse calls/instances / find object / open file",
-            "Tab in /              toggle calls ↔ instances; instance rows expand",
-            "                      in place — g jumps to the instance's first mention",
+            "Tab in /              toggle calls ↔ instances;  ↑↓ enters the result",
+            "                      list, / returns to the query, f = first mention",
             "?  F1                 toggle this help",
             "q  Ctrl+C             quit (q asks to confirm)",
             "",
@@ -1313,32 +1400,40 @@ public final class ViewerApp {
     // ---- dialogs (§9, §11.7, §11.8) ----
 
     private void openDialog(final DialogKind kind) {
-        dialog = new SearchDialog(kind);
         if (kind == DialogKind.METHOD) {
-            dialog.instanceTree = new TreeView(engine::children);
+            // §15.5: the `/` dialog is persistent — reopening restores mode, query, results,
+            // selection, scroll, expansion and focus exactly (expanded trees still re-resolve
+            // as-of the current seq at render time). `.`/`F` stay transient below.
+            if (searchDialog == null) {
+                searchDialog = new SearchDialog(kind);
+                searchDialog.instanceTree = new TreeView(engine::children);
+                dialog = searchDialog;
+                recomputeDialog();
+            } else {
+                dialog = searchDialog;
+            }
+            return;
         }
+        dialog = new SearchDialog(kind);
         recomputeDialog();
     }
 
     private void handleDialog(final KeyStroke k) {
-        KeyType t = k.getKeyType();
-        if (t == KeyType.Escape) {
+        if (k.getKeyType() == KeyType.Escape) {
+            // §15.2: Esc closes from either focus; §15.5: searchDialog keeps the `/` state.
             dialog = null;
             return;
         }
-        if (t == KeyType.Tab) {
-            // §13.2: Tab toggles calls ↔ instances (query kept; selection and scroll reset).
-            if (dialog.kind == DialogKind.METHOD) {
-                dialog.instancesMode = !dialog.instancesMode;
-                dialog.sel = 0;
-                dialog.scroll = 0;
-                recomputeDialog();
-            }
-            return;
+        if (dialog.kind == DialogKind.METHOD) {
+            handleSearchDialog(k);
+        } else {
+            handleTransientDialog(k);
         }
-        if (dialog.kind == DialogKind.METHOD && dialog.instancesMode && handleInstancesKey(k)) {
-            return;
-        }
+    }
+
+    /** Keys of the transient {@code .}/{@code F} dialogs (§9/§11.8) — unchanged by §15.2. */
+    private void handleTransientDialog(final KeyStroke k) {
+        KeyType t = k.getKeyType();
         if (t == KeyType.Enter) {
             jumpDialog();
         } else if (t == KeyType.ArrowUp) {
@@ -1364,60 +1459,159 @@ public final class ViewerApp {
     }
 
     /**
-     * Keys the §14.2 instances-mode result tree consumes; returns {@code false} when the key
-     * should fall through to query editing. Arrow keys and Enter always drive the tree (they are
-     * not typable) and mark the list active; {@code g}/{@code <}/{@code >} act on the tree only
-     * while the list is active — i.e. the last non-typing key went to the list — so they remain
-     * typable in the query until the user starts navigating results (any query edit deactivates
-     * the list again via {@link #recomputeInstanceResults}).
+     * Keys of the {@code /} dialog under the §15.2 focus model (which replaced the §14.2
+     * list-active heuristic): Tab toggles calls ↔ instances from either focus (§13.2 — query
+     * kept, selection/scroll/expansion reset); everything else goes to the QUERY line or the
+     * result LIST depending on {@code dialog.focus}.
      */
-    private boolean handleInstancesKey(final KeyStroke k) {
-        KeyType t = k.getKeyType();
-        TreeView tree = dialog.instanceTree;
-        if (t == KeyType.ArrowUp) {
-            tree.moveUp(1);
-            dialog.listActive = true;
-            return true;
+    private void handleSearchDialog(final KeyStroke k) {
+        if (k.getKeyType() == KeyType.Tab) {
+            dialog.instancesMode = !dialog.instancesMode;
+            dialog.sel = 0;
+            dialog.scroll = 0;
+            recomputeDialog();
+            return;
         }
-        if (t == KeyType.ArrowDown) {
-            tree.moveDown(1);
-            dialog.listActive = true;
-            return true;
+        if (dialog.focus == DialogFocus.QUERY) {
+            handleSearchQueryKey(k);
+        } else {
+            handleSearchListKey(k);
         }
-        if (t == KeyType.ArrowRight || t == KeyType.Enter) {
-            // §14.2: Enter is the expand toggle only — it never jumps and never closes.
-            tree.expandOrDescend();
-            dialog.listActive = true;
-            return true;
-        }
-        if (t == KeyType.ArrowLeft) {
-            tree.collapseOrParent();
-            dialog.listActive = true;
-            return true;
-        }
-        boolean listKeys = dialog.listActive && !dialog.instanceRows.isEmpty();
-        if (listKeys && isChar(k, '<')) {
-            dialog.hcol = Math.max(0, dialog.hcol - HSTEP);
-            return true;
-        }
-        if (listKeys && isChar(k, '>')) {
-            dialog.hcol += HSTEP;
-            return true;
-        }
-        if (listKeys && isChar(k, 'g')) {
-            jumpToFirstMention();
-            return true;
-        }
-        return false;
     }
 
     /**
-     * The {@code g} key of the instances-mode {@code /} dialog (§14.2): move the cursor to the
-     * OWNING instance of the selected row (the root of its subtree) — seek to its
-     * {@code OBJECT_FIRST_SEEN}, advance to the nearest following LINE (the §11.7 jump pattern),
-     * one history entry — and keep the dialog open; the expanded trees re-resolve against the
-     * new seq on the next draw. If the engine has no first-mention record (defensive), report
-     * and stay put.
+     * QUERY-focus keys (§15.2): printables edit, Backspace deletes one character, and
+     * Ctrl-Backspace clears the query with its results and count line in one stroke — with
+     * Ctrl-U and Ctrl-W accepted as portable synonyms, because on classic xterm-style
+     * encodings Ctrl-Backspace reaches lanterna as a plain {@code KeyType.Backspace}
+     * (indistinguishable from an unmodified one; only kitty-/win32-style terminals report
+     * the Ctrl modifier on Backspace). ↑/↓ hand the focus to the result list, performing
+     * the first move — only when there are results to move over.
+     */
+    private void handleSearchQueryKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
+            dialog.query.setLength(0);
+            dialog.sel = 0;
+            dialog.scroll = 0;
+            recomputeDialog(); // empties rows and note, so the §15.3 count line disappears too
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (dialog.query.length() > 0) {
+                dialog.query.deleteCharAt(dialog.query.length() - 1);
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            }
+            return;
+        }
+        if (t == KeyType.ArrowUp || t == KeyType.ArrowDown) {
+            if (!dialog.rows.isEmpty()) {
+                // §15.2: the first arrow only ENTERS the list — the already-highlighted
+                // row stays selected; moving on entry would skip the first result.
+                dialog.focus = DialogFocus.LIST;
+            }
+            return;
+        }
+        if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= ' ') {
+                dialog.query.append(ch.charValue());
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            }
+        }
+    }
+
+    /**
+     * LIST-focus keys (§15.2): ↑/↓ move, Ctrl-F/Ctrl-B and PgDn/PgUp page, {@code g}/{@code G}
+     * jump to the first/last row; in instances mode →/↵ expand, ← collapses, {@code f} jumps to
+     * the selected row's owning instance's first mention (dialog stays open) and {@code <}/
+     * {@code >} horizontal-scroll the tree; in calls mode ↵ jumps and closes. {@code /} returns
+     * the focus to the query line; all other printables are deliberately ignored.
+     */
+    private void handleSearchListKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        int page = Math.max(1, dialog.listViewH - 1);
+        if (!ctrl && isChar(k, '/')) {
+            dialog.focus = DialogFocus.QUERY;
+            return;
+        }
+        if (t == KeyType.ArrowUp) {
+            moveSearchSelection(-1);
+            return;
+        }
+        if (t == KeyType.ArrowDown) {
+            moveSearchSelection(1);
+            return;
+        }
+        if (t == KeyType.PageUp || (ctrl && isChar(k, 'b'))) {
+            moveSearchSelection(-page);
+            return;
+        }
+        if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
+            moveSearchSelection(page);
+            return;
+        }
+        if (!ctrl && isChar(k, 'g')) {
+            if (dialog.instancesMode) {
+                dialog.instanceTree.toFirst();
+            } else {
+                dialog.sel = 0;
+            }
+            return;
+        }
+        if (!ctrl && isChar(k, 'G')) {
+            if (dialog.instancesMode) {
+                dialog.instanceTree.toLast();
+            } else {
+                dialog.sel = Math.max(0, dialog.rows.size() - 1);
+            }
+            return;
+        }
+        if (dialog.instancesMode) {
+            TreeView tree = dialog.instanceTree;
+            if (t == KeyType.ArrowRight || t == KeyType.Enter) {
+                // §14.2: Enter is the expand toggle only — it never jumps and never closes.
+                tree.expandOrDescend();
+            } else if (t == KeyType.ArrowLeft) {
+                tree.collapseOrParent();
+            } else if (!ctrl && isChar(k, 'f')) {
+                jumpToFirstMention(); // §15.2: the §14.2 first-mention jump moved from g to f
+            } else if (isChar(k, '<')) {
+                dialog.hcol = Math.max(0, dialog.hcol - HSTEP);
+            } else if (isChar(k, '>')) {
+                dialog.hcol += HSTEP;
+            }
+        } else if (t == KeyType.Enter) {
+            jumpDialog(); // calls mode: jump and close (unchanged)
+        }
+    }
+
+    /** Moves the LIST selection by {@code delta} rows in whichever mode's list is showing. */
+    private void moveSearchSelection(final int delta) {
+        if (dialog.instancesMode) {
+            if (delta < 0) {
+                dialog.instanceTree.moveUp(-delta);
+            } else {
+                dialog.instanceTree.moveDown(delta);
+            }
+        } else {
+            dialog.sel = clamp(dialog.sel + delta, 0, Math.max(0, dialog.rows.size() - 1));
+        }
+    }
+
+    /**
+     * The {@code f} key of the instances-mode {@code /} dialog (§14.2 semantics, rebound from
+     * {@code g} by §15.2): move the cursor to the OWNING instance of the selected row (the root
+     * of its subtree) — seek to its {@code OBJECT_FIRST_SEEN}, advance to the nearest following
+     * LINE (the §11.7 jump pattern), one history entry — and keep the dialog open; the expanded
+     * trees re-resolve against the new seq on the next draw. If the engine has no first-mention
+     * record (defensive), report and stay put.
      */
     private void jumpToFirstMention() {
         InstanceBrowse.Row row = selectedInstanceRow();
@@ -1443,6 +1637,10 @@ public final class ViewerApp {
                     recomputeInstanceResults();
                 } else {
                     recomputeMethodResults();
+                }
+                // §15.2: an empty result list cannot hold LIST focus — editing resumes.
+                if (dialog.rows.isEmpty()) {
+                    dialog.focus = DialogFocus.QUERY;
                 }
             }
             case OBJECT -> recomputeObjectResults();
@@ -1473,10 +1671,7 @@ public final class ViewerApp {
             }
             dialog.rows = rows;
             dialog.targets = targets;
-            long shown = rows.size();
-            dialog.note = res.totalMatches() > shown
-                    ? "showing first " + shown + " of " + res.totalMatches()
-                    : "";
+            dialog.note = DialogFormat.countLine(res.totalMatches(), rows.size()); // §15.3
         } catch (PatternSyntaxException e) {
             dialog.rows = List.of();
             dialog.targets = List.of();
@@ -1486,15 +1681,14 @@ public final class ViewerApp {
     }
 
     /**
-     * The §13.2/§14.1 instances mode of the {@code /} dialog: regex over runtime class binary
-     * names, optionally narrowed to one exact object id by a {@code #<digits>} query suffix.
-     * Every recompute (open, query edit, mode toggle) rebuilds the §14.2 result tree from
-     * scratch, dropping expansion/selection/scroll state and handing {@code g}/{@code <}/{@code >}
-     * back to the query.
+     * The §13.2/§14.1/§15.1 instances mode of the {@code /} dialog: regex over runtime class
+     * names (simple names for an unqualified query — {@link InstanceBrowse}), optionally narrowed
+     * to one exact object id by a {@code #<digits>} query suffix. Every recompute (open, query
+     * edit, mode toggle) rebuilds the §14.2 result tree from scratch, dropping
+     * expansion/selection/scroll state.
      */
     private void recomputeInstanceResults() {
         dialog.targets = List.of();
-        dialog.listActive = false;
         dialog.hcol = 0;
         dialog.instanceTree.clearExpansion();
         String q = dialog.query.toString();
@@ -1524,10 +1718,7 @@ public final class ViewerApp {
             dialog.rows = rows;
             dialog.instanceRows = res.rows();
             dialog.instanceTree.setRoots(roots);
-            long shown = rows.size();
-            dialog.note = res.totalMatches() > shown
-                    ? "showing first " + shown + " of " + res.totalMatches()
-                    : "";
+            dialog.note = DialogFormat.countLine(res.totalMatches(), rows.size()); // §15.3
         } catch (PatternSyntaxException e) {
             dialog.rows = List.of();
             dialog.instanceRows = List.of();

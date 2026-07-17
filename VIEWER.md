@@ -746,3 +746,66 @@ Instance firstMentionOf(long objectId);          // renamed from creationOf (§1
 The engine parses STACK_SNAPSHOT records during index construction (per-thread ascending
 capture positions) and exposes the merge only through stack() — no new public stack API.
 The reader owns the STACK payload parsing (`CapturedFrame` records).
+
+## 15. v1.5 additions & changes
+
+Authoritative over conflicting earlier text (§13, §14). Everything not mentioned is
+unchanged. All items are TUI-side except where noted.
+
+### 15.1 Instance matching: simple name by default
+In instances mode, a query containing NO `.` and NO `$` is matched (case-insensitive
+`find()`) against each class's SIMPLE name — the binary name's segment after the last
+`.` and after the last `$` — so `VirtualMapStateImpl` no longer matches its inner class
+`...VirtualMapStateImpl$MerkleReadableStates`. A query containing `.` or `$` matches the
+FULL binary name as before (explicit qualification intent). The §14.1 `#<id>` forms
+compose with this rule (the class part follows it). Pure `InstanceBrowse`, unit-tested.
+
+### 15.2 Search-dialog focus model
+The `/` dialog gains two explicit focus states:
+- **QUERY focus** (initial): the terminal cursor sits on the query line; printable keys
+  edit the query, Backspace deletes; **Ctrl-Backspace or Ctrl-U** clears the query, the
+  results and the §15.3 count line in one stroke. Pressing ↑ or ↓ switches to LIST focus.
+- **LIST focus**: the terminal cursor is hidden. ↑/↓ move the selection; **Ctrl-F/Ctrl-B**
+  (and PgDn/PgUp) page; **`g`/`G`** jump to the first/last row; in instances mode →/↵
+  expand and ← collapse tree rows, and **`f`** jumps to the selected row's owning
+  instance's FIRST MENTION (the §14.2 semantics previously on `g`: one history entry,
+  dialog stays open); in calls mode ↵ jumps and closes (unchanged). Pressing **`/`**
+  returns to QUERY focus (cursor reappears on the query line, editing resumes). Other
+  printable keys are ignored in LIST focus.
+Esc closes the dialog from either focus. The hint line reflects the active focus. §14.2's
+list-active heuristic is superseded by this explicit model.
+
+### 15.3 Result count line
+A DIM (grey) line directly under the query shows `<N> results` — or
+`showing first 500 of <N>` when capped (this replaces the previous bottom note) — and is
+absent whenever there are no results (empty query, no matches, or after Ctrl-Backspace).
+
+### 15.4 Numbered results
+Result rows are numbered `1.` .. `N.` in both modes (in instances mode only the ROOT
+rows carry numbers; expanded child rows stay indented and unnumbered under their root).
+
+### 15.5 Dialog state persistence
+The `/` dialog's complete state — mode, query text, results, selection, scroll,
+expansion (instances mode) and focus state — survives Esc: reopening with `/` restores
+it exactly. Expanded trees keep resolving as-of the CURRENT cursor seq at render time,
+so their contents may legitimately differ after the cursor moved. The `.` and `F`
+dialogs and the `v` window keep their transient behaviour.
+
+### 15.6 Info line: Stack focus
+With the Stack window focused, the status row's position part shows the SELECTED frame's
+fully-qualified name: `<full.binary.Class>.<method>` (unrecorded/grey frames included).
+The §14.4 Locals and instances-dialog rules are unchanged; every other focus keeps the
+compact record info. (The current seq stays reachable via the Records window's newest
+entry.)
+
+### 15.7 Source Code title context
+In exec mode the Source window title becomes
+`Source Code [c]          <SimpleClass>.<method>` — the SELECTED frame's simple class
+name and bare method name, separated from the fixed title by ten spaces — clipped by the
+border as usual. Browse mode keeps `Source Code [c] — <fileName>`.
+
+### 15.8 Empty-payload rendering (engine/recorder alignment)
+Recorder ≥ v1.5 emits EMPTY FIELDS payloads for genuinely field-less classes (FORMAT.md
+§3): the engine/TUI must render such an object as an empty expansion (`{}`-like: the
+node is non-expandable or expands to nothing) rather than `<No info available>`, which
+now specifically means "no snapshot observed at/before this seq".
