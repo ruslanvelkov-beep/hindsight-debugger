@@ -110,6 +110,20 @@ public final class HindsightAgent {
 
         final HindsightTransformer transformer = new HindsightTransformer(config, registry, log);
 
+        // §10 snapshotOpen: data/model packages opened for reflective §7 snapshots without
+        // being instrumented — a pure side-effect transformer plus an eager boot-layer pass.
+        // Deliberately BEFORE the AgentBuilder install: in attach mode instrumented code can
+        // run the moment installOn returns, and a dump racing the opens would cache an empty
+        // per-class snapshot plan permanently (ClassValue has no invalidation).
+        if (!config.snapshotOpen.isEmpty()) {
+            final SnapshotOpenTransformer opener =
+                    new SnapshotOpenTransformer(config.snapshotOpen, inst, hooksAnchor.getModule(), log);
+            inst.addTransformer(opener, false);
+            final int eager = opener.openBootLayerPackages();
+            log.info("snapshot-open prefixes: " + config.snapshotOpen
+                    + " (" + eager + " boot-layer packages opened eagerly)");
+        }
+
         new AgentBuilder.Default()
                 // Pure visitation: keeps the class's shape, avoids method-graph compilation
                 // and — crucially — any frame recomputation at transform time.
@@ -128,14 +142,6 @@ public final class HindsightAgent {
                 .type(new ScopeMatcher(config))
                 .transform(transformer)
                 .installOn(inst);
-
-        // §10 snapshotOpen: data/model packages opened for reflective §7 snapshots without
-        // being instrumented — a pure side-effect transformer, no bytecode changes.
-        if (!config.snapshotOpen.isEmpty()) {
-            inst.addTransformer(
-                    new SnapshotOpenTransformer(config.snapshotOpen, inst, hooksAnchor.getModule(), log), false);
-            log.info("snapshot-open prefixes: " + config.snapshotOpen);
-        }
 
         log.info("instrumentation installed (include=" + config.include
                 + ", callsOnly=" + config.callsOnly

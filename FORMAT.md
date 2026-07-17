@@ -183,10 +183,13 @@ per entry (MAP: key entry then value entry, 2 per count; others: 1 per count):
   value   : 8 bytes  — per §2.4
 ```
 
-Schema 1 payloads have no `form` byte and are always FIELDS-shaped. A class with no
-accessible instance fields produces NO snapshot record at all (an empty dump carries
-no information). Enums are never snapshotted — their constant name travels in their
-`OBJECT_FIRST_SEEN` record (§6).
+Schema 1 payloads have no `form` byte and are always FIELDS-shaped. Recorder ≥ v1.5: a
+class that DECLARES no instance fields at all (and is not hidden or synthetic — capture
+less lambdas stay silent) produces an EMPTY FIELDS payload (`fieldCount = 0`), letting
+readers distinguish a genuinely stateless object (`{}`) from an unreadable one; a class
+whose declared fields are all inaccessible still produces NO snapshot record (earlier
+recorders emitted no record in either case). Enums are never snapshotted — their
+constant name travels in their `OBJECT_FIRST_SEEN` record (§6).
 
 ## 4. Symbols — `symbols.tsv`, `rt-symbols.tsv`
 
@@ -283,7 +286,8 @@ this — they are never object-registered and always travel by value (§2.4/§6)
 Payload shape by object kind — plain objects dump fields; `java.base` maps, sets,
 lists/collections and **all arrays** are UNFOLDED into their elements (§3 forms; arrays
 as ARRAY-form payloads with element values per §2.4, 64-entry cap, true length in
-`totalSize` — unfolded since the schema-2/3 recorders). Enums are never snapshotted (§6). Classes with no accessible fields produce no snapshot record.
+`totalSize` — unfolded since the schema-2/3 recorders). Enums are never snapshotted (§6).
+Field-less vs unreadable classes follow the §3 empty-payload rule (recorder ≥ v1.5).
 Reflection failures (inaccessible module, hidden class) silently skip. Snapshot values
 never recurse *within one payload*: nested refs become object ids, nested strings become
 UTF8 blob entries, everything else per §2.4. All dumps are bounded: ≤ 64 fields/entries
@@ -377,7 +381,7 @@ list-valued keys use `|` between elements. Keys:
 | `include` | required | package/class binary-name prefixes → FULL instrumentation (brackets + args + locals + fields) |
 | `callsOnly` | empty | prefixes → brackets + args only (no locals/fields) |
 | `exclude` | empty | prefixes excluded entirely; wins over include/callsOnly |
-| `snapshotOpen` | empty | prefixes whose packages are opened to the hooks module for reflective §7 snapshots WITHOUT instrumentation — for data/model classes (e.g. PBJ records) outside the instrumentation scope whose contents dumps must read |
+| `snapshotOpen` | empty | prefixes whose packages are opened to the hooks module for reflective §7 snapshots WITHOUT instrumentation — for data/model classes (e.g. PBJ records, `java.time`) outside the instrumentation scope whose contents dumps must read. Recorder ≥ v1.5: matching packages of every boot-layer module (incl. `java.base`) are opened EAGERLY at premain — classes there may load before any transform event — and later-defined modules keep being handled lazily on class load |
 | `autostart` | `true` | start recording at premain |
 | `trigger` | none | `binary.class.Name#methodName` — first entry starts recording (implies `autostart=false` unless given) |
 | `maxString` | `512` | max recorded string length (chars) |

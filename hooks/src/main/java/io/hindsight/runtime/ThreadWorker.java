@@ -679,7 +679,7 @@ public final class ThreadWorker {
         if (o instanceof Enum<?> || isUnfoldedContainer(o) || isJavaBaseWrapper(o)) {
             return;
         }
-        final Field[] plan = SNAPSHOT_PLANS.get(o.getClass());
+        final Field[] plan = SNAPSHOT_PLANS.get(o.getClass()).fields;
         int redumps = 0;
         for (final Field f : plan) {
             if (redumps >= Wire.SNAPSHOT_MAX_CONTAINER_REDUMPS) {
@@ -827,33 +827,67 @@ public final class ThreadWorker {
     }
 
     /**
-     * Per-class snapshot plan, resolved once: the accessible instance fields (subclass-first,
-     * superclasses included, capped at {@link Wire#SNAPSHOT_MAX_FIELDS}). Reflection —
-     * {@code getDeclaredFields} allocating fresh {@code Field} copies, {@code trySetAccessible}
-     * re-running the module access check — is far too expensive to repeat per <em>object</em>
-     * during the post-trigger first-sight burst; caching per class makes emission a plain
-     * {@code Field.get} loop. An empty plan (JPMS-closed or field-less class) means "emit no
-     * snapshot at all": an empty {@code {}} record carries zero information.
+     * Per-class §7 dump plan: the accessible instance fields plus the §3 field-less-vs-unreadable
+     * verdict (recorder ≥ v1.5), resolved once per class.
      */
-    private static final ClassValue<Field[]> SNAPSHOT_PLANS = new ClassValue<>() {
+    static final class SnapshotPlan {
+
+        /**
+         * Accessible instance fields, subclass-first, superclasses included, capped at
+         * {@link Wire#SNAPSHOT_MAX_FIELDS}; statics excluded.
+         */
+        final Field[] fields;
+
+        /**
+         * True iff an empty {@link #fields} must still produce an EMPTY §3 FIELDS payload
+         * ({@code fieldCount = 0}): the class declares no instance fields anywhere in its
+         * hierarchy and is neither hidden nor synthetic — a genuinely stateless object renders
+         * as {@code {}} (recorder ≥ v1.5; captureless lambdas stay silent). False with an empty
+         * plan means fields exist but none are readable (JPMS-closed module): NO record —
+         * unreadable must not masquerade as stateless.
+         */
+        final boolean emitEmpty;
+
+        SnapshotPlan(Field[] fields, boolean emitEmpty) {
+            this.fields = fields;
+            this.emitEmpty = emitEmpty;
+        }
+    }
+
+    /**
+     * Per-class snapshot plan, resolved once. Reflection — {@code getDeclaredFields} allocating
+     * fresh {@code Field} copies, {@code trySetAccessible} re-running the module access check —
+     * is far too expensive to repeat per <em>object</em> during the post-trigger first-sight
+     * burst; caching per class makes emission a plain {@code Field.get} loop. An empty plan
+     * splits per the §3 rule (recorder ≥ v1.5): a genuinely field-less class dumps an empty
+     * {@code {}} payload, a JPMS-closed class with unreadable fields emits no snapshot at all.
+     */
+    private static final ClassValue<SnapshotPlan> SNAPSHOT_PLANS = new ClassValue<>() {
         @Override
-        protected Field[] computeValue(Class<?> cls) {
+        protected SnapshotPlan computeValue(Class<?> cls) {
             final Field[] fields = new Field[Wire.SNAPSHOT_MAX_FIELDS];
             int n = 0;
+            boolean declaresInstanceFields = false;
+            boolean walkComplete = true;
             for (Class<?> c = cls; c != null && c != Object.class && n < fields.length; c = c.getSuperclass()) {
                 final Field[] declared;
                 try {
                     declared = c.getDeclaredFields();
                 } catch (Throwable t) {
+                    walkComplete = false; // an unenumerable hierarchy cannot be called field-less
                     break; // hidden class / hostile SecurityManager: take what we have
                 }
                 for (final Field f : declared) {
+                    if (Modifier.isStatic(f.getModifiers())) {
+                        continue; // §3: statics excluded, and they don't make a class stateful
+                    }
+                    declaresInstanceFields = true;
                     if (n >= fields.length) {
                         break;
                     }
                     boolean accessible;
                     try {
-                        accessible = !Modifier.isStatic(f.getModifiers()) && f.trySetAccessible();
+                        accessible = f.trySetAccessible();
                     } catch (Throwable t) {
                         accessible = false;
                     }
@@ -862,22 +896,32 @@ public final class ThreadWorker {
                     }
                 }
             }
-            return java.util.Arrays.copyOf(fields, n);
+            final boolean emitEmpty =
+                    !declaresInstanceFields && walkComplete && !cls.isHidden() && !cls.isSynthetic();
+            return new SnapshotPlan(java.util.Arrays.copyOf(fields, n), emitEmpty);
         }
     };
 
+    /** Test seam: the resolved §7 dump plan of {@code cls}. */
+    static SnapshotPlan snapshotPlanOf(Class<?> cls) {
+        return SNAPSHOT_PLANS.get(cls);
+    }
+
     private void emitFieldSnapshot(Object o, long id, Class<?> cls) {
-        final Field[] plan = SNAPSHOT_PLANS.get(cls);
-        if (plan.length == 0) {
-            return; // nothing accessible to dump — an empty snapshot carries no information
+        final SnapshotPlan plan = SNAPSHOT_PLANS.get(cls);
+        final Field[] fields = plan.fields;
+        if (fields.length == 0 && !plan.emitEmpty) {
+            // §3 (recorder ≥ v1.5): fields are declared but none are readable — no record;
+            // an unreadable object must not masquerade as a stateless {} one.
+            return;
         }
         final ByteBuffer payload =
-                ByteBuffer.allocate(7 + 14 * plan.length).order(ByteOrder.LITTLE_ENDIAN);
+                ByteBuffer.allocate(7 + 14 * fields.length).order(ByteOrder.LITTLE_ENDIAN);
         payload.putInt(rt.symbols.intern(RuntimeSymbols.Kind.RTCLASS, cls.getName()));
         payload.put((byte) Wire.SNAPSHOT_FORM_FIELDS);
         payload.putShort((short) 0); // fieldCount patched below once skips are known
         int included = 0;
-        for (final Field f : plan) {
+        for (final Field f : fields) {
             final Object v;
             try {
                 v = f.get(o);

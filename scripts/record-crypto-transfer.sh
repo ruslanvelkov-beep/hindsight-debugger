@@ -45,11 +45,16 @@ EXCLUDE='com.hedera.node.app.metrics.|com.hedera.node.app.blocks.impl.streaming.
 # PBJ model/state classes (AccountID, Account, TransactionBody, ...) are data, not code —
 # instrumenting them would drown the recording, but their packages must be OPEN to the
 # hooks module or their reflective snapshots silently come out empty (FORMAT.md §10).
-SNAPSHOT_OPEN='com.hedera.hapi.|com.hedera.pbj.'
+# com.swirlds. adds reflection (NOT instrumentation) for platform classes outside the
+# include scope; java.time. lives in java.base whose packages the agent opens eagerly
+# at premain (Instant & friends load before any transform event).
+SNAPSHOT_OPEN='com.hedera.hapi.|com.hedera.pbj.|com.swirlds.|java.time.'
 # OneOf cells hold the actual values of PBJ oneofs (e.g. an AccountID's account number)
 # and appear arbitrarily deep — always dump them regardless of snapshotDepth. Atomics and
 # StringBuilder/StringBuffer are always-dumped unconditionally (FORMAT.md §7).
-SNAPSHOT_ALWAYS='com.hedera.pbj.runtime.OneOf'
+# java.time values and swirlds state objects appear arbitrarily deep and are exactly
+# what recordings get inspected for — dump them regardless of snapshotDepth.
+SNAPSHOT_ALWAYS='com.hedera.pbj.runtime.OneOf|java.time.|com.swirlds.state.'
 TRIGGER='com.hedera.node.app.workflows.ingest.IngestWorkflowImpl#submitTransaction'
 
 # Size the recording cap from actual free disk (leave 20 GiB headroom, cap at 100 GiB):
