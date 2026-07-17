@@ -809,3 +809,107 @@ Recorder ≥ v1.5 emits EMPTY FIELDS payloads for genuinely field-less classes (
 §3): the engine/TUI must render such an object as an empty expansion (`{}`-like: the
 node is non-expandable or expands to nothing) rather than `<No info available>`, which
 now specifically means "no snapshot observed at/before this seq".
+
+## 16. v1.6 additions & changes
+
+Authoritative over conflicting earlier text (§13.5, §15). Everything not mentioned is
+unchanged. All items are TUI-side except the §16.7 engine additions.
+
+### 16.1 Variable-history window overhaul
+The `v` window (§13.5) changes:
+- **Width**: 75% of the terminal width — `w = clamp(cols*3/4, 40, cols-2)` (was a fixed
+  ≤74). Height rule unchanged.
+- **Horizontal scroll**: Left/Right arrows scroll it (step `HSTEP`); `<`/`>` no longer do
+  (they are freed here). ↑/↓ still move the selection.
+- **Paging/jumps** like the list windows: `Ctrl-F`/`Ctrl-B` (and PgDn/PgUp) page by
+  `viewH-1`; `g`/`Home` → first row, `G`/`End` → last row.
+- **Title**: `Variable history [v] — <N> entries · <scope>` where `<scope>` is
+  `this <SimpleClass>#<id>` when the this-instance filter is active, else `all instances`.
+  `<N>` is the number of rows currently shown (post-filter, pre-cap-note).
+- **Numbered rows**: each row is prefixed `1.` .. `N.` (right-aligned to the row count's
+  width, then the existing `seq … · … : old → new (File:line)` text), participating in the
+  Left/Right hscroll clip.
+- **`this`-instance filter (Tab)**: `Tab` toggles between *all instances* (every recorded
+  write of the field in the file — the §13.5 behaviour) and *this instance only* (writes
+  whose owner object id equals the ENCLOSING instance — the selected frame's `this` at the
+  moment `v` was pressed). The window remembers `fileName`, `fieldName` and `thisId`;
+  toggling re-queries via the §16.7 owner-filtered engine calls, resets selection/scroll,
+  and keeps the cap semantics (`showing first 500 of N` reflects the active scope). When
+  there is no enclosing instance (`thisId == 0`: static context, or browse mode), Tab is a
+  no-op and the title scope stays `all instances (no enclosing this)`.
+- Statics still render without `#id`; the this-filter naturally lists nothing for a static
+  field (owner id 0 ≠ any instance id) — acceptable, the toggle is for instance fields.
+Hint line updated: `↑↓ select  ←→ hscroll  ^F/^B pg  g/G ends  ⇥ this/all  ↵ jump  Esc`.
+
+### 16.2 Collapse Locals on frame switch / cross-thread jump
+Whenever the SELECTED STACK FRAME changes (`selectStackRow`) or a navigation lands in a
+DIFFERENT thread than the one previously shown (any `afterMove` where
+`engine.currentTid()` differs from the last shown tid — thread select, Records-list jump,
+search/first-mention/variable jumps into another thread), all Locals tree expansion is
+reset (`localsTree.clearExpansion()`), so the tree opens fresh rather than replaying a
+stale expansion path against unrelated locals. A plain in-thread step does NOT collapse
+(the reader is following state and wants the tree kept open).
+
+### 16.3 Records: jump to a record number — `j`
+With the Records window focused, `j` opens a small centered modal `Jump to record`:
+- a single input line accepting decimal digits (the global `seq` shown in the trail);
+  Backspace edits; Esc closes.
+- On Enter: resolve the seq via §16.7 `findSeq`. If found, close the dialog, position the
+  cursor on the nearest LINE at/before that record in its thread (the §13.5 landing rule),
+  `afterMove` + one history entry, status `jumped to seq <N> (t<tid>)`. If NOT found, the
+  dialog stays open and shows, on its own line, `no record with seq <N>` (dim/red); further
+  typing clears the error and lets the user retry.
+- Non-digit printables are ignored. The dialog consumes all keys while open (Ctrl-C still
+  the emergency quit).
+
+### 16.4 Source Code in-file search — `Alt-F`
+With the Source Code window focused (exec OR browse mode), `Alt-F` (Character `f` with
+`isAltDown`, mirroring the existing Alt-R) enters an incremental in-file search:
+- **Rendering**: the search field is drawn ON the Source title row, OVERWRITING the title,
+  starting at the title's own start column (`rect.col()+2`, where the class name begins)
+  and ending at `rect.col()+rect.width()-3` (the `]` sits two columns before the corner).
+  Style: black background, YELLOW letters; text is `[ Search: <query>]` right-padded to the
+  field width. When the current query has NO match the letters turn RED; with a match (or an
+  empty query) they stay yellow. The window border/corners are preserved.
+- **Matching**: case-insensitive substring over the shown file's lines (exec source or
+  browse lines). Occurrences are every line containing the query (one hit per line;
+  column of the first occurrence on that line is tracked for highlight). On each edit the
+  "current" occurrence is the FIRST at/after the current cursor line (wrapping to the top),
+  and the view scrolls so it is visible (`ScrollMath.center`), `srcCursor` set to it.
+- **Navigation**: `Enter` = next occurrence, `Shift-Enter` OR `Ctrl-Enter` = previous
+  (whichever the terminal delivers distinctly — `KeyType.Enter` with `isShiftDown`/
+  `isCtrlDown`); as a universal fallback that works on every terminal, `↓` = next and `↑` =
+  previous. Both directions CYCLE (next past the last → first; previous before the first →
+  last). Each move re-centers and updates `srcCursor`.
+- **Highlight**: the current occurrence's line carries the cursor/frame-line highlight
+  (§13.4); additionally the matched substring columns are shown reverse-video when the
+  match is within the visible horizontal window (best-effort — line highlight is the firm
+  requirement).
+- **Exit**: `Esc` leaves search mode and restores the normal title; the cursor stays on the
+  last focused occurrence. Backspace edits the query; an empty query clears the
+  match/highlight but stays in search mode.
+Help overlay + Source-focus help line gain `Alt-F search  (↵ next  ⇧↵/↑↓ prev)`.
+
+### 16.5 Freed keys
+`<`/`>` retain their §11.4 per-window horizontal-scroll meaning in every window EXCEPT the
+variable-history window (§16.1), which now uses the arrows.
+
+### 16.6 (reserved)
+
+### 16.7 Engine API additions
+```java
+List<FieldWriteHit> fieldWrites(String fileName, String fieldName, long ownerId, int cap);
+long countFieldWrites(String fileName, String fieldName, long ownerId);
+    // ownerId == 0 → all instances (the existing 2-arg/§13.5 behaviour, which now delegates
+    // to these with ownerId 0); ownerId != 0 → only writes whose record target()==ownerId.
+long frameThisId(int frameIndex);
+    // the `this` object id of that stack frame (slot 0), or 0 for a static/unrecorded frame
+    // or when no `this` is resolvable — reuses the §2.4 this-derivation locals() already does.
+record SeqLocation(boolean found, int tid, long index) {}
+SeqLocation findSeq(long seq);
+    // locate the record with global seq `seq`: per-thread binary search (each thread file is
+    // seq-ascending), returning the first thread carrying it; found=false when no record has
+    // that seq. Does NOT move the cursor.
+```
+The two existing `fieldWrites`/`countFieldWrites` overloads keep their signatures and
+delegate with `ownerId = 0`.

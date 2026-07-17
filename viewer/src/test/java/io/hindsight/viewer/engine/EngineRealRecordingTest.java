@@ -30,6 +30,10 @@ final class EngineRealRecordingTest {
             "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/"
                     + "hedera-node/test-clients/build/hindsight/recordings/transfer-11");
 
+    private static final Path REAL2 = Path.of(
+            "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/"
+                    + "hedera-node/test-clients/build/hindsight/recordings/transfer-12");
+
     @Test
     void stepsThroughRealRecordingWithoutThrowing() throws IOException {
         assumeTrue(Files.isDirectory(REAL), "real recording not present: " + REAL);
@@ -221,6 +225,50 @@ final class EngineRealRecordingTest {
                 }
             }
             assertTrue(containsSeed, "fieldWrites must contain the seed write's exact (tid, index)");
+        }
+    }
+
+    /**
+     * Exercises the v1.6 {@code findSeq} (§16.7) against a real schema-4 recording (transfer-12):
+     * a seq read from a real record via the probe must round-trip to that exact record's
+     * coordinates, and the out-of-range sentinels {@code 0} and {@code Long.MAX_VALUE} must not
+     * match. {@code findSeq} must never move the cursor.
+     */
+    @Test
+    void findSeqOnRealRecording() throws IOException {
+        assumeTrue(Files.isDirectory(REAL2), "real recording not present: " + REAL2);
+
+        try (Engine e = Engine.open(REAL2);
+                Recording probe = Recording.open(REAL2)) {
+            assertEquals(4, e.schemaVersion(), "transfer-12 is a schema-4 recording");
+
+            // Pick a known record from a middle thread/index via the probe, then locate its seq.
+            List<Integer> tids = probe.threadIds();
+            int someTid = tids.get(tids.size() / 2);
+            long count = probe.recordCount(someTid);
+            assumeTrue(count > 0, "chosen thread has records");
+            long index = count / 2;
+            long knownSeq = probe.recordAt(someTid, index).seq();
+
+            SeqLocation loc = e.findSeq(knownSeq);
+            assertTrue(loc.found(), "a real record's seq must be locatable");
+            assertEquals(knownSeq, probe.recordAt(loc.tid(), loc.index()).seq(),
+                    "findSeq must return coordinates whose record carries that seq");
+            // seq is globally unique, so it round-trips to the very record we picked.
+            assertEquals(someTid, loc.tid());
+            assertEquals(index, loc.index());
+
+            // Out-of-range sentinels never match (§16.7 test contract).
+            assertFalse(e.findSeq(0L).found(), "seq 0 is below the first record");
+            assertFalse(e.findSeq(Long.MAX_VALUE).found(), "Long.MAX_VALUE is above the last record");
+
+            // findSeq must not move the cursor.
+            int tid = e.currentTid();
+            long ci = e.currentIndex();
+            e.findSeq(knownSeq);
+            e.findSeq(Long.MAX_VALUE);
+            assertEquals(tid, e.currentTid());
+            assertEquals(ci, e.currentIndex());
         }
     }
 

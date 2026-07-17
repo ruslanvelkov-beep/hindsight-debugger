@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: Apache-2.0
+package io.hindsight.viewer.tui;
+
+/**
+ * Pure text/geometry helpers for the v1.6 variable-history window (VIEWER.md §16.1):
+ * the window width (75% of the terminal, clamped), the scope description shown in the
+ * title, and the assembled title itself. Kept terminal-free so the exact strings and
+ * the clamp arithmetic are unit-testable without a live screen.
+ *
+ * <p>Row numbering reuses {@link DialogFormat#number} (right-aligned to the row count's
+ * width) exactly as the {@code /} dialog does, so it is not duplicated here.
+ */
+public final class VarHistory {
+
+    private VarHistory() {}
+
+    /**
+     * The §16.1 window width: 75% of the terminal columns, clamped to
+     * {@code [40, cols-2]} — {@code w = clamp(cols*3/4, 40, cols-2)}.
+     *
+     * @param cols the terminal width in columns
+     * @return the window width in columns
+     */
+    public static int width(final int cols) {
+        return Math.min(Math.max(cols * 3 / 4, 40), Math.max(40, cols - 2));
+    }
+
+    /**
+     * The §16.1 title scope suffix: {@code this <SimpleClass>#<id>} when the this-instance
+     * filter is active and an enclosing instance exists; {@code all instances (no enclosing
+     * this)} when there is no enclosing instance ({@code thisId == 0}); {@code all instances}
+     * otherwise.
+     *
+     * @param thisOnly whether the this-instance filter is active
+     * @param thisId the enclosing instance id captured at open time, or {@code 0} for none
+     * @param simpleClass the simple class name of the enclosing instance ({@code ?} when unknown)
+     * @return the scope text
+     */
+    public static String scope(final boolean thisOnly, final long thisId, final String simpleClass) {
+        if (thisOnly && thisId != 0) {
+            return "this " + (simpleClass == null ? "?" : simpleClass) + "#" + thisId;
+        }
+        if (thisId == 0) {
+            return "all instances (no enclosing this)";
+        }
+        return "all instances";
+    }
+
+    /**
+     * The §16.1 window title: {@code Variable history [v] — <count> entries · <scope>}.
+     *
+     * @param count the number of rows currently shown (post-filter, pre-cap-note)
+     * @param scope the {@link #scope} text
+     * @return the assembled title
+     */
+    public static String title(final int count, final String scope) {
+        return "Variable history [v] — " + count + " entries · " + scope;
+    }
+}

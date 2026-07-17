@@ -20,6 +20,7 @@ import io.hindsight.viewer.engine.Instance;
 import io.hindsight.viewer.engine.Local;
 import io.hindsight.viewer.engine.ObjectNode;
 import io.hindsight.viewer.engine.RecordInfo;
+import io.hindsight.viewer.engine.SeqLocation;
 import io.hindsight.viewer.engine.StepResult;
 import io.hindsight.viewer.engine.Value;
 import io.hindsight.viewer.highlight.JavaHighlighter;
@@ -35,6 +36,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.regex.PatternSyntaxException;
 
 /**
@@ -148,23 +150,47 @@ public final class ViewerApp {
     }
 
     /**
-     * Live state of the §13.5 variable-history overlay: the matching field writes (rows rendered
-     * once at open — values are as-of the write, not the cursor), a §13.1 persistent scroll, and a
-     * cap note.
+     * Live state of the §13.5/§16.1 variable-history overlay: the shown field's identity
+     * ({@code fileName}/{@code fieldName}) and the enclosing instance id ({@code thisId})
+     * captured when {@code v} was pressed, the current this-instance filter flag
+     * ({@code thisOnly}, toggled by Tab), and the currently-built rows/hits/cap-note (rebuilt on
+     * every toggle via {@link #rebuildVarHistory}; values are as-of the write, not the cursor).
+     * {@code listViewH} is the list's visible row count captured at render so Ctrl-F/Ctrl-B and
+     * PgDn/PgUp know the page size; {@code scroll} is the §13.1 persistent offset.
      */
     private static final class VarHistoryWindow {
-        final List<String> rows;
-        final List<FieldWriteHit> hits;
-        final String note;
+        final String fileName;
+        final String fieldName;
+        final long thisId;
+        boolean thisOnly;
+        List<String> rows = List.of();
+        List<FieldWriteHit> hits = List.of();
+        String note = "";
         int sel;
         int scroll;
         int hcol;
+        int listViewH = 1;
 
-        VarHistoryWindow(final List<String> rows, final List<FieldWriteHit> hits, final String note) {
-            this.rows = rows;
-            this.hits = hits;
-            this.note = note;
+        VarHistoryWindow(final String fileName, final String fieldName, final long thisId) {
+            this.fileName = fileName;
+            this.fieldName = fieldName;
+            this.thisId = thisId;
         }
+    }
+
+    /**
+     * Live state of the §16.4 Source Code in-file search: the {@code active} flag (search mode
+     * on/off), the incrementally-edited {@code query}, the {@link InFileSearch#occurrences} table
+     * ({@code {line, col}} 1-based per matching line), the {@code current} index into it (or
+     * {@code -1}), and whether the current query has a match ({@code found}, drives the yellow vs.
+     * red field colour). One instance lives for the app; {@code active} toggles it.
+     */
+    private static final class SourceSearch {
+        boolean active;
+        final StringBuilder query = new StringBuilder();
+        List<int[]> occurrences = List.of();
+        int current = -1;
+        boolean found = true;
     }
 
     private final Screen screen;
@@ -187,6 +213,12 @@ public final class ViewerApp {
     // §15.5: the one persistent `/` dialog — kept across Esc/close so reopening restores it.
     private SearchDialog searchDialog;
     private VarHistoryWindow varHist;
+    // §16.3: the Records "jump to record number" modal (null when closed).
+    private RecordJump recordJump;
+    // §16.4: the Source Code in-file search state (one instance; `active` toggles it).
+    private final SourceSearch sourceSearch = new SourceSearch();
+    // §16.2: the tid last shown, so afterMove collapses Locals only on a real cross-thread jump.
+    private int lastShownTid;
     private TerminalPosition cursorPos;
 
     // §14.4: the Locals selection's value/descriptor, captured by renderLocals for the info line.
@@ -260,6 +292,7 @@ public final class ViewerApp {
         }
         threadSel = Math.max(0, tids.indexOf(engine.currentTid()));
         stackSel = 0;
+        lastShownTid = engine.currentTid(); // §16.2: seed so the first in-thread step never collapses
         appendHistory(); // seed the trail with the initial landing so Records is never empty (§11.5)
     }
 
@@ -320,6 +353,9 @@ public final class ViewerApp {
         if (varHist != null) {
             drawVarHistory(g, cols, rows);
         }
+        if (recordJump != null) {
+            drawRecordJump(g, cols, rows);
+        }
         if (quitConfirm) {
             drawQuitConfirm(g, cols, rows);
         }
@@ -335,6 +371,10 @@ public final class ViewerApp {
     private void renderSource(final TextGraphics g, final Layout.Rect rect) {
         boolean focused = focus == Win.SOURCE;
         drawBox(g, rect, sourceTitle(), Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
+        if (sourceSearch.active) {
+            // §16.4: the search field is drawn ON the title row, overwriting the title.
+            renderSourceSearchField(g, rect);
+        }
         int ix = rect.col() + 1;
         int iy = rect.row() + 1;
         int iw = rect.width() - 2;
@@ -452,6 +492,33 @@ public final class ViewerApp {
     /** The §13.4 cursor line to render, or -1 — the cursor shows only while Source is focused. */
     private int sourceCursorLine() {
         return focus == Win.SOURCE ? srcCursor : -1;
+    }
+
+    /**
+     * The §16.4 search field drawn over the Source title row: from {@code rect.col()+2} (where the
+     * title text begins) to {@code rect.col()+width-3} (two columns before the corner, which the box
+     * border keeps). Black background, YELLOW letters — RED when the non-empty query has no match.
+     */
+    private void renderSourceSearchField(final TextGraphics g, final Layout.Rect rect) {
+        int startX = rect.col() + 2;
+        int endX = rect.col() + rect.width() - 3;
+        int fieldW = endX - startX + 1;
+        if (fieldW <= 0) {
+            return;
+        }
+        String text = InFileSearch.field(sourceSearch.query.toString(), fieldW);
+        // §16.4: RED when the (non-empty) query has no match — `found` is false only in that case.
+        put(g, startX, rect.row(), text, sourceSearch.found ? TextColor.ANSI.YELLOW : Palette.ERROR,
+                TextColor.ANSI.BLACK, false);
+    }
+
+    /** The lines currently shown in the Source window: browse lines, else the selected frame's source. */
+    private List<String> shownSourceLines() {
+        if (browseMode) {
+            return browseLines;
+        }
+        Frame f = selectedFrameOrNull();
+        return f == null ? List.of() : sourcePath.lines(f.classBinary(), f.fileName()).orElse(List.of());
     }
 
     private void renderCodeLines(
@@ -682,12 +749,12 @@ public final class ViewerApp {
                 + "/ calls  . obj  F file  c/s/t/l/r focus  q quit";
         String ctx = switch (focus) {
             case SOURCE -> browseMode
-                    ? "↑↓ cursor  v var-history  <> hscroll  o return  g/G/Home/End"
-                    : "↑↓ cursor  v var-history  ←→/<> hscroll  g/G/Home/End";
+                    ? "↑↓ cursor  v var-history  Alt-F search  <> hscroll  o return  g/G/Home/End"
+                    : "↑↓ cursor  v var-history  Alt-F search  ←→/<> hscroll  g/G/Home/End";
             case THREADS -> "↑↓ select  ↵ switch  ←→/<> hscroll";
             case STACK -> "↑↓ select frame  ←→/<> hscroll";
             case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  <> hscroll";
-            case RECORDS -> "↑↓ select  ↵ jump  ←→/<> hscroll";
+            case RECORDS -> "↑↓ select  ↵ jump  j record#  ←→/<> hscroll";
         };
         put(g, 0, row, clipPad(ctx + "  |  " + base, cols), Palette.DIM, Palette.BG, false);
     }
@@ -942,9 +1009,15 @@ public final class ViewerApp {
         }
     }
 
-    /** The §13.5 variable-history overlay, drawn as a centered modal like {@link #drawDialog}. */
+    /**
+     * The §16.1 variable-history overlay, drawn as a centered modal like {@link #drawDialog} but
+     * 75% of the terminal width ({@link VarHistory#width}). The title carries the entry count and
+     * the active scope ({@link VarHistory#title}/{@link VarHistory#scope}); rows are numbered
+     * {@code 1.}–{@code N.} ({@link DialogFormat#number}) prefixed to the seq/old→new text, and the
+     * whole numbered row is clipped through the Left/Right {@code hcol}.
+     */
     private void drawVarHistory(final TextGraphics g, final int cols, final int rows) {
-        int w = clamp(cols - 6, 24, 74);
+        int w = VarHistory.width(cols);
         int h = clamp(rows - 6, 8, 20);
         int x = Math.max(0, (cols - w) / 2);
         int y = Math.max(0, (rows - h) / 2);
@@ -952,12 +1025,15 @@ public final class ViewerApp {
         g.setBackgroundColor(Palette.DIALOG_BG);
         g.disableModifiers(SGR.BOLD);
         g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
-        drawBox(g, new Layout.Rect(x, y, w, h), "Variable history [v]", Palette.DIALOG_BG, Palette.FOCUS, true);
+        int count = varHist.rows.size();
+        String scope = VarHistory.scope(varHist.thisOnly, varHist.thisId, varHistoryThisSimpleClass());
+        drawBox(g, new Layout.Rect(x, y, w, h), VarHistory.title(count, scope),
+                Palette.DIALOG_BG, Palette.FOCUS, true);
         int ix = x + 1;
         int iy = y + 1;
         int iw = w - 2;
         int hintRow = y + h - 2;
-        put(g, ix, hintRow, clip("↑↓ select  ↵ jump  <> hscroll  Esc close", iw),
+        put(g, ix, hintRow, clip("↑↓ select  ←→ hscroll  ^F/^B pg  g/G ends  ⇥ this/all  ↵ jump  Esc", iw),
                 Palette.DIM, Palette.DIALOG_BG, false);
         int listBottom = hintRow;
         if (!varHist.note.isEmpty()) {
@@ -965,17 +1041,28 @@ public final class ViewerApp {
             put(g, ix, listBottom, clip(varHist.note, iw), Palette.DIM, Palette.DIALOG_BG, false);
         }
         int listH = listBottom - iy;
-        varHist.sel = clamp(varHist.sel, 0, Math.max(0, varHist.rows.size() - 1));
-        varHist.scroll = ScrollMath.adjustScroll(varHist.scroll, varHist.sel, listH, varHist.rows.size());
+        varHist.listViewH = Math.max(1, listH); // §16.1: page size for ^F/^B, PgDn/PgUp
+        varHist.sel = clamp(varHist.sel, 0, Math.max(0, count - 1));
+        varHist.scroll = ScrollMath.adjustScroll(varHist.scroll, varHist.sel, listH, count);
         for (int r = 0; r < listH; r++) {
             int idx = varHist.scroll + r;
-            if (idx >= varHist.rows.size()) {
+            if (idx >= count) {
                 break;
             }
             boolean s = idx == varHist.sel;
-            put(g, ix, iy + r, HScroll.clip(varHist.rows.get(idx), varHist.hcol, iw),
+            String text = DialogFormat.number(idx, count) + varHist.rows.get(idx);
+            put(g, ix, iy + r, HScroll.clip(text, varHist.hcol, iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
+    }
+
+    /** The simple class name of the var-history enclosing instance (for the §16.1 scope), or {@code ?}. */
+    private String varHistoryThisSimpleClass() {
+        if (varHist.thisId == 0) {
+            return "?";
+        }
+        String cls = recording.objectClassName(varHist.thisId);
+        return cls == null ? "?" : Format.simpleName(cls);
     }
 
     private void drawHelpOverlay(final TextGraphics g, final int cols, final int rows) {
@@ -993,6 +1080,8 @@ public final class ViewerApp {
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
             "v                     variable history for the Source cursor line",
+            "Alt-F                 Source in-file search (↵ next  ⇧↵/↑↓ prev)",
+            "j                     Records: jump to a record by seq",
             "/  .  F               browse calls/instances / find object / open file",
             "Tab in /              toggle calls ↔ instances;  ↑↓ enters the result",
             "                      list, / returns to the query, f = first mention",
@@ -1036,6 +1125,30 @@ public final class ViewerApp {
         put(g, x + 3, y + 3, clip(hint, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
     }
 
+    /** The §16.3 "jump to record number" modal: a digit input line and (when present) an error line. */
+    private void drawRecordJump(final TextGraphics g, final int cols, final int rows) {
+        String prompt = "seq: " + recordJump.text();
+        String err = recordJump.error();
+        String hint = "digits then ↵ jump    Esc close";
+        int content = Math.max(prompt.length(), Math.max(err.length(), hint.length()));
+        int w = Math.min(cols - 2, Math.max(24, content + 6));
+        int h = Math.min(rows - 2, err.isEmpty() ? 5 : 6);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), "Jump to record", Palette.DIALOG_BG, Palette.FOCUS, true);
+        put(g, x + 3, y + 1, clip(prompt, w - 6), Palette.FG, Palette.DIALOG_BG, false);
+        int hintRow = y + h - 2;
+        if (!err.isEmpty()) {
+            put(g, x + 3, y + 2, clip(err, w - 6), Palette.ERROR, Palette.DIALOG_BG, false);
+        }
+        put(g, x + 3, hintRow, clip(hint, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+        cursorPos = new TerminalPosition(Math.min(x + w - 2, x + 3 + prompt.length()), y + 1);
+    }
+
     // ---- key dispatch ----
 
     private void handleKey(final KeyStroke k) {
@@ -1070,6 +1183,16 @@ public final class ViewerApp {
             }
             if (varHist != null) {
                 handleVarHistory(k);
+                return;
+            }
+            if (recordJump != null) {
+                // §16.3: the modal consumes all keys (Ctrl-C still the emergency quit).
+                handleRecordJump(k);
+                return;
+            }
+            if (sourceSearch.active) {
+                // §16.4: intercept BEFORE global/nav so typing does not trigger focus/step keys.
+                handleSourceSearch(k);
                 return;
             }
             if (isCtrlC(k)) {
@@ -1257,6 +1380,8 @@ public final class ViewerApp {
             setSrcCursor(lastLine);
         } else if (isChar(k, 'v') && !k.isCtrlDown() && !k.isAltDown()) {
             varHistory();
+        } else if (isChar(k, 'f') && k.isAltDown()) {
+            enterSourceSearch(); // §16.4: mirror the Alt-R dispatch
         }
     }
 
@@ -1331,12 +1456,18 @@ public final class ViewerApp {
     private void selectStackRow(final int row) {
         List<Frame> frames = engine.stack();
         int frameIndex = frames.size() - 1 - row;
+        int prevFrame = engine.selectedFrame();
         if (engine.selectFrame(frameIndex)) {
             stackSel = row;
-            followPending = true;
-            srcHcol = 0;
-            localsHcol = 0;
-            srcCursorPending = true; // §13.4: cursor to the selected frame's line
+            if (frameIndex != prevFrame) {
+                // §16.2: only an ACTUAL frame switch re-follows, resets scroll and collapses
+                // Locals — a no-op re-selection must leave the reader's view untouched.
+                followPending = true;
+                srcHcol = 0;
+                localsHcol = 0;
+                srcCursorPending = true; // §13.4: cursor to the selected frame's line
+                localsTree.clearExpansion();
+            }
         }
     }
 
@@ -1369,6 +1500,10 @@ public final class ViewerApp {
         Character ch = k.getCharacter();
         int page = Math.max(1, recordsViewH - 1);
         int last = Math.max(0, entries.size() - 1);
+        if (isChar(k, 'j') && !k.isCtrlDown() && !k.isAltDown()) {
+            recordJump = new RecordJump(); // §16.3
+            return;
+        }
         if (t == KeyType.ArrowLeft) {
             recordsHcol = Math.max(0, recordsHcol - HSTEP);
         } else if (t == KeyType.ArrowRight) {
@@ -1842,9 +1977,11 @@ public final class ViewerApp {
     private void varHistory() {
         List<String> lines;
         String fileName;
+        long thisId;
         if (browseMode) {
             lines = browseLines;
             fileName = browseName;
+            thisId = 0; // §16.1: no enclosing instance in browse mode
         } else {
             List<Frame> frames = engine.stack();
             int sf = engine.selectedFrame();
@@ -1853,6 +1990,7 @@ public final class ViewerApp {
             lines = frame != null
                     ? sourcePath.lines(frame.classBinary(), fileName).orElse(null)
                     : null;
+            thisId = frame != null ? engine.frameThisId(sf) : 0; // §16.1: the selected frame's `this`
         }
         if (lines == null || lines.isEmpty()) {
             status = "no class variable definition on this line";
@@ -1863,27 +2001,42 @@ public final class ViewerApp {
             status = "no class variable definition on this line";
             return;
         }
+        // §13.5: first candidate with hits (all-instances scope) wins; §16.1 remembers thisId for Tab.
         for (String name : names) {
-            // Ask for one extra hit so an exactly-full window is distinguishable from a capped one.
-            List<FieldWriteHit> hits = engine.fieldWrites(fileName, name, VAR_HISTORY_CAP + 1);
-            if (!hits.isEmpty()) {
-                boolean capped = hits.size() > VAR_HISTORY_CAP;
-                List<FieldWriteHit> shown = capped ? hits.subList(0, VAR_HISTORY_CAP) : hits;
-                List<String> rows = new ArrayList<>(shown.size());
-                for (FieldWriteHit hit : shown) {
-                    rows.add(varHistoryRow(hit));
-                }
-                varHist = new VarHistoryWindow(
-                        rows,
-                        List.copyOf(shown),
-                        capped
-                                ? "showing first " + VAR_HISTORY_CAP + " of "
-                                        + engine.countFieldWrites(fileName, name)
-                                : "");
+            if (!engine.fieldWrites(fileName, name, 0L, 1).isEmpty()) {
+                VarHistoryWindow w = new VarHistoryWindow(fileName, name, thisId);
+                rebuildVarHistory(w);
+                varHist = w;
                 return;
             }
         }
         status = "no recorded writes for '" + names.get(0) + "'";
+    }
+
+    /**
+     * §16.1 shared row builder used at open and by the Tab toggle: {@code ownerId = thisOnly &&
+     * thisId != 0 ? thisId : 0}; asks {@link Engine#fieldWrites} for {@code CAP+1} hits so a full
+     * window is distinguishable from a capped one, uses {@link Engine#countFieldWrites} for the
+     * cap note, and resets selection/scroll/hcol.
+     */
+    private void rebuildVarHistory(final VarHistoryWindow w) {
+        long ownerId = w.thisOnly && w.thisId != 0 ? w.thisId : 0L;
+        List<FieldWriteHit> hits = engine.fieldWrites(w.fileName, w.fieldName, ownerId, VAR_HISTORY_CAP + 1);
+        boolean capped = hits.size() > VAR_HISTORY_CAP;
+        List<FieldWriteHit> shown = capped ? hits.subList(0, VAR_HISTORY_CAP) : hits;
+        List<String> rows = new ArrayList<>(shown.size());
+        for (FieldWriteHit hit : shown) {
+            rows.add(varHistoryRow(hit));
+        }
+        w.hits = List.copyOf(shown);
+        w.rows = rows;
+        w.note = capped
+                ? "showing first " + VAR_HISTORY_CAP + " of "
+                        + engine.countFieldWrites(w.fileName, w.fieldName, ownerId)
+                : "";
+        w.sel = 0;
+        w.scroll = 0;
+        w.hcol = 0;
     }
 
     /** {@code seq N · t<tid> · Owner#oid.field: old → new  (File:line)}; statics omit {@code #oid}. */
@@ -1895,7 +2048,12 @@ public final class ViewerApp {
                 + ": " + h.before() + " → " + h.after() + "  (" + file + ":" + h.line() + ")";
     }
 
-    /** One key while the variable-history overlay is open — it consumes all keys, like a dialog. */
+    /**
+     * One key while the §16.1 variable-history overlay is open — it consumes all keys, like a dialog:
+     * ↑/↓ select, ←/→ hscroll (step {@code HSTEP}; {@code <}/{@code >} no longer scroll here — §16.5),
+     * Ctrl-F/Ctrl-B and PgDn/PgUp page, {@code g}/Home first row, {@code G}/End last, Tab toggles the
+     * this-instance filter, Enter jumps, Esc closes.
+     */
     private void handleVarHistory(final KeyStroke k) {
         KeyType t = k.getKeyType();
         if (t == KeyType.Escape) {
@@ -1907,34 +2065,222 @@ public final class ViewerApp {
             return;
         }
         int last = Math.max(0, varHist.rows.size() - 1);
-        if (t == KeyType.ArrowUp) {
+        int page = Math.max(1, varHist.listViewH - 1);
+        if (t == KeyType.Tab) {
+            toggleVarHistoryScope();
+        } else if (t == KeyType.ArrowUp) {
             varHist.sel = Math.max(0, varHist.sel - 1);
         } else if (t == KeyType.ArrowDown) {
             varHist.sel = Math.min(last, varHist.sel + 1);
-        } else if (isChar(k, '<')) {
+        } else if (t == KeyType.ArrowLeft) {
             varHist.hcol = Math.max(0, varHist.hcol - HSTEP);
-        } else if (isChar(k, '>')) {
+        } else if (t == KeyType.ArrowRight) {
             varHist.hcol += HSTEP;
+        } else if (t == KeyType.PageUp || (k.isCtrlDown() && isChar(k, 'b'))) {
+            varHist.sel = Math.max(0, varHist.sel - page);
+        } else if (t == KeyType.PageDown || (k.isCtrlDown() && isChar(k, 'f'))) {
+            varHist.sel = Math.min(last, varHist.sel + page);
+        } else if (t == KeyType.Home || isChar(k, 'g')) {
+            varHist.sel = 0;
+        } else if (t == KeyType.End || isChar(k, 'G')) {
+            varHist.sel = last;
         } else if (t == KeyType.Enter) {
             jumpToWrite();
         }
     }
 
     /**
-     * Jump to a field write (§13.5): seek to the {@code FIELD_WRITE} record, then position on the
-     * nearest LINE at/before it (the write belongs to that line); fall forward only if no LINE
-     * precedes. One history entry.
+     * §16.1 Tab: toggle between all-instances and this-instance-only, re-query via the owner-filtered
+     * engine calls ({@link #rebuildVarHistory}) and reset selection/scroll/hcol. A no-op (with a
+     * scope note) when there is no enclosing instance ({@code thisId == 0}: static context or browse).
+     */
+    private void toggleVarHistoryScope() {
+        if (varHist.thisId == 0) {
+            status = "no enclosing this — showing all instances";
+            return;
+        }
+        varHist.thisOnly = !varHist.thisOnly;
+        rebuildVarHistory(varHist);
+    }
+
+    /**
+     * Jump to a field write (§13.5): position on the nearest LINE at/before the {@code FIELD_WRITE}
+     * record (the write belongs to that line). One history entry. A no-op when the current scope
+     * lists no writes (e.g. an empty §16.1 this-filter).
      */
     private void jumpToWrite() {
+        if (varHist.hits.isEmpty()) {
+            return;
+        }
         FieldWriteHit hit = varHist.hits.get(clamp(varHist.sel, 0, varHist.hits.size() - 1));
         varHist = null;
-        engine.seek(hit.tid(), hit.index());
-        if (!engine.reverseStep().moved()) {
-            engine.stepInto();
-        }
+        landOnNearestLineAtOrBefore(hit.tid(), hit.index());
         afterMove();
         appendHistory();
         status = "jumped to seq " + engine.currentSeq() + " (t" + engine.currentTid() + ")";
+    }
+
+    /**
+     * The §13.5/§16.3 landing rule: seek to {@code (tid, index)}, then position on the nearest LINE
+     * AT/BEFORE it (the record belongs to that line); fall FORWARD only if no LINE precedes it.
+     */
+    private void landOnNearestLineAtOrBefore(final int tid, final long index) {
+        engine.seek(tid, index);
+        // When the target record is itself a LINE, seek already put the cursor exactly on it —
+        // stepping would move OFF it (reverseStep from a LINE goes to the previous line, the
+        // §16.3 off-by-one). Only a non-LINE target needs walking back to the LINE it belongs
+        // to (falling forward only when none precedes).
+        if (rec(tid, index).type() == Format.LINE) {
+            return;
+        }
+        if (!engine.reverseStep().moved()) {
+            engine.stepInto();
+        }
+    }
+
+    // ---- record jump (§16.3) ----
+
+    /** One key while the §16.3 record-jump modal is open — it consumes all keys (Ctrl-C still quits). */
+    private void handleRecordJump(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (isCtrlC(k)) {
+            running = false;
+            return;
+        }
+        if (t == KeyType.Escape) {
+            recordJump = null;
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            recordJump.backspace();
+            return;
+        }
+        if (t == KeyType.Enter) {
+            submitRecordJump();
+            return;
+        }
+        if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null) {
+                recordJump.appendDigit(ch); // non-digits are dropped by RecordJump
+            }
+        }
+    }
+
+    /**
+     * §16.3 Enter: resolve the typed seq via {@link Engine#findSeq}. If found, close the modal and
+     * land on the nearest LINE at/before it (one history entry); if not found, keep the modal open
+     * with a {@code no record with seq N} error. An empty/overflowing buffer is a no-op.
+     */
+    private void submitRecordJump() {
+        OptionalLong parsed = recordJump.parse();
+        if (parsed.isEmpty()) {
+            return;
+        }
+        long seq = parsed.getAsLong();
+        SeqLocation loc = engine.findSeq(seq);
+        if (!loc.found()) {
+            recordJump.setError("no record with seq " + seq);
+            return;
+        }
+        recordJump = null;
+        landOnNearestLineAtOrBefore(loc.tid(), loc.index());
+        afterMove();
+        appendHistory();
+        status = "jumped to seq " + seq + " (t" + loc.tid() + ")";
+    }
+
+    // ---- source in-file search (§16.4) ----
+
+    /** §16.4: enter in-file search (empty query; the cursor stays where it is until a match). */
+    private void enterSourceSearch() {
+        sourceSearch.active = true;
+        sourceSearch.query.setLength(0);
+        recomputeSourceSearch();
+    }
+
+    /**
+     * §16.4: recompute occurrences (case-insensitive substring, one per matching line) over the
+     * shown file, pick the current occurrence (first at/after the cursor line, wrapping) and center
+     * it. An empty query clears the match set without leaving search mode.
+     */
+    private void recomputeSourceSearch() {
+        sourceSearch.occurrences = InFileSearch.occurrences(shownSourceLines(), sourceSearch.query.toString());
+        if (sourceSearch.occurrences.isEmpty()) {
+            sourceSearch.current = -1;
+            sourceSearch.found = sourceSearch.query.length() == 0;
+            return;
+        }
+        sourceSearch.found = true;
+        sourceSearch.current = InFileSearch.currentIndex(sourceSearch.occurrences, srcCursor);
+        focusOccurrence();
+    }
+
+    /** §16.4: move the source cursor to the current occurrence and center the view on it. */
+    private void focusOccurrence() {
+        if (sourceSearch.current < 0 || sourceSearch.current >= sourceSearch.occurrences.size()) {
+            return;
+        }
+        int line = sourceSearch.occurrences.get(sourceSearch.current)[0];
+        int fileLines = Math.max(1, srcFileLines);
+        srcCursor = clamp(line, 1, fileLines);
+        srcTop = ScrollMath.center(srcCursor, Math.max(1, srcViewH), fileLines);
+    }
+
+    /** §16.4: cyclic next ({@code dir>0}) / previous ({@code dir<0}) occurrence, re-centering. */
+    private void moveOccurrence(final int dir) {
+        int size = sourceSearch.occurrences.size();
+        if (size == 0) {
+            return;
+        }
+        sourceSearch.current = dir > 0
+                ? InFileSearch.next(sourceSearch.current, size)
+                : InFileSearch.prev(sourceSearch.current, size);
+        focusOccurrence();
+    }
+
+    /**
+     * One key while §16.4 in-file search is active — consumes all keys (Ctrl-C still quits): Esc
+     * exits (cursor stays on the last occurrence), Backspace edits, Enter = next occurrence,
+     * Shift-Enter/Ctrl-Enter = previous, ↓ = next / ↑ = previous (universal fallback), printables
+     * extend the query.
+     */
+    private void handleSourceSearch(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (isCtrlC(k)) {
+            running = false;
+            return;
+        }
+        if (t == KeyType.Escape) {
+            sourceSearch.active = false;
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (sourceSearch.query.length() > 0) {
+                sourceSearch.query.deleteCharAt(sourceSearch.query.length() - 1);
+                recomputeSourceSearch();
+            }
+            return;
+        }
+        if (t == KeyType.Enter) {
+            moveOccurrence(k.isShiftDown() || k.isCtrlDown() ? -1 : 1);
+            return;
+        }
+        if (t == KeyType.ArrowDown) {
+            moveOccurrence(1);
+            return;
+        }
+        if (t == KeyType.ArrowUp) {
+            moveOccurrence(-1);
+            return;
+        }
+        if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= ' ') {
+                sourceSearch.query.append(ch.charValue());
+                recomputeSourceSearch();
+            }
+        }
     }
 
     private void openFile() {
@@ -2023,6 +2369,13 @@ public final class ViewerApp {
     }
 
     private void afterMove() {
+        // §16.2: a navigation landing in a DIFFERENT thread collapses the Locals tree, so it opens
+        // fresh rather than replaying a stale expansion path against unrelated locals. A plain
+        // in-thread step keeps the same tid and does NOT collapse (the reader is following state).
+        if (engine.currentTid() != lastShownTid) {
+            localsTree.clearExpansion();
+        }
+        lastShownTid = engine.currentTid();
         stackSel = 0;
         threadSel = Math.max(0, tids.indexOf(engine.currentTid()));
         followPending = true;

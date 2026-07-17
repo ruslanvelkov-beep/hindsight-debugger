@@ -706,6 +706,187 @@ final class EngineTest {
         return r.write();
     }
 
+    // ---- §16.7: owner-filtered field writes ----
+
+    @Test
+    void fieldWritesOwnerFilterAndDelegation(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(buildOwnerWrites(dir))) {
+            // ownerId 0 — the existing (unfiltered) behaviour: every balance write ascending by
+            // seq (two on #100, one on #200, one static), and the 3-arg overload delegates to it.
+            List<FieldWriteHit> all = e.fieldWrites("Acct.java", "balance", 0L, 10);
+            assertEquals(List.of(5L, 6L, 7L, 8L), all.stream().map(FieldWriteHit::seq).toList());
+            assertEquals(all, e.fieldWrites("Acct.java", "balance", 10),
+                    "the 3-arg overload must delegate to ownerId 0 exactly");
+
+            // ownerId #100 — only that object's two writes, ascending seq; the static (target 0)
+            // is excluded when ownerId != 0.
+            List<FieldWriteHit> a = e.fieldWrites("Acct.java", "balance", 100L, 10);
+            assertEquals(List.of(5L, 8L), a.stream().map(FieldWriteHit::seq).toList());
+            for (FieldWriteHit h : a) {
+                assertEquals(100L, h.ownerId());
+                assertFalse(h.isStatic(), "the static write must be excluded from a #100 query");
+            }
+            assertEquals("0", a.get(0).before());
+            assertEquals("10", a.get(0).after());
+            assertEquals("10", a.get(1).before());
+            assertEquals("20", a.get(1).after());
+
+            // ownerId #200 — its single write.
+            List<FieldWriteHit> b = e.fieldWrites("Acct.java", "balance", 200L, 10);
+            assertEquals(1, b.size());
+            assertEquals(6L, b.get(0).seq());
+            assertEquals(200L, b.get(0).ownerId());
+
+            // A never-written owner id yields nothing.
+            assertTrue(e.fieldWrites("Acct.java", "balance", 999L, 10).isEmpty());
+
+            // The cap still bounds the owner-filtered walk.
+            assertEquals(a.subList(0, 1), e.fieldWrites("Acct.java", "balance", 100L, 1));
+
+            // countFieldWrites mirrors the same filtering (cap-free), and its 2-arg overload
+            // delegates to ownerId 0.
+            assertEquals(4L, e.countFieldWrites("Acct.java", "balance", 0L));
+            assertEquals(4L, e.countFieldWrites("Acct.java", "balance"));
+            assertEquals(2L, e.countFieldWrites("Acct.java", "balance", 100L));
+            assertEquals(1L, e.countFieldWrites("Acct.java", "balance", 200L));
+            assertEquals(0L, e.countFieldWrites("Acct.java", "balance", 999L));
+        }
+    }
+
+    // ---- §16.7: frameThisId ----
+
+    @Test
+    void frameThisIdMatchesLocalsThisAndZeroForStaticOrOutOfRange(@TempDir final Path dir)
+            throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            stepTo(e, IDX_LINE21); // stack: [0] main (static), [1] helper (instance, this=#200)
+
+            // Instance frame → its this id, identical to the slot-0 `this` Ref locals() surfaces.
+            long innerThis = e.frameThisId(1);
+            assertEquals(200L, innerThis);
+            Local self = e.locals(1).get(0);
+            assertEquals("this", self.name());
+            assertEquals(innerThis, ((Value.Ref) self.value()).objectId(),
+                    "frameThisId must match the slot-0 this id from locals()");
+
+            // Static frame → 0.
+            assertTrue(e.stack().get(0).isStatic());
+            assertEquals(0L, e.frameThisId(0));
+
+            // Out-of-range frame indices → 0.
+            assertEquals(0L, e.frameThisId(e.stack().size()));
+            assertEquals(0L, e.frameThisId(-1));
+        }
+    }
+
+    @Test
+    void frameThisIdRecoversConstructorThis(@TempDir final Path dir) throws IOException {
+        // A constructor's ENTER carries target 0; the live id is on the matching EXIT.
+        // frameThisId must recover it via the SAME derivation locals() uses (§2.4/§16.7).
+        SyntheticRecording r = new SyntheticRecording(dir);
+        int cls = r.sym("CLASS", "com.ex.Widget");
+        int file = r.sym("FILE", "Widget.java");
+        int ctor = r.sym("METHOD", "<init>");
+        int siteCtor = r.methodSite(cls, file, 8, ctor, "(I)V", false);
+        int lineSite = r.lineSite(cls, file, 9);
+
+        r.threadStart(1, "main", 1, 1_000L);
+        r.firstSeen(1, 777L, "com.ex.Widget");
+        r.rec(1, Format.METHOD_ENTER, 0, 0, 0, siteCtor, 0, 0, 0);          // ENTER, target 0
+        r.rec(1, Format.LINE, 0, Format.TAG_VOID, 0, lineSite, 0, 0, 0);     // cursor lands here
+        r.rec(1, Format.METHOD_EXIT, 0, Format.TAG_VOID, 0, siteCtor, 777L, 0, 0); // EXIT carries this
+
+        try (Engine e = Engine.open(r.write())) {
+            int inner = e.stack().size() - 1;
+            assertEquals(777L, e.frameThisId(inner), "constructor this must be recovered from the EXIT");
+            // And it agrees with locals()'s recovered `this`.
+            assertEquals(777L, ((Value.Ref) e.locals(inner).get(0).value()).objectId());
+        }
+    }
+
+    // ---- §16.7: findSeq ----
+
+    @Test
+    void findSeqLocatesRecordsAcrossThreadsAndReportsMisses(@TempDir final Path dir)
+            throws IOException {
+        Path built = buildCalls(dir); // t1 seqs {1,2,5,6,9,10,11,12}, t2 seqs {3,4,7,8}
+        try (Engine e = Engine.open(built);
+                Recording probe = Recording.open(built)) {
+            // Exact hits inside a thread.
+            assertFound(e, probe, 5L, 1, 2);
+            assertFound(e, probe, 11L, 1, 6);
+
+            // First and last record of thread t1.
+            assertFound(e, probe, 1L, 1, 0);
+            assertFound(e, probe, 12L, 1, 7);
+
+            // Cross-thread: seq 7 lives in t2 (and is a gap WITHIN t1), so the t1 binary search
+            // must miss and the scan continue into t2 and find it there.
+            assertFound(e, probe, 7L, 2, 2);
+            // First and last record of thread t2.
+            assertFound(e, probe, 3L, 2, 0);
+            assertFound(e, probe, 8L, 2, 3);
+
+            // Below the minimum and above the maximum seq → not found (the recording's global
+            // seq is a contiguous AtomicLong, so there is no interior gap to miss).
+            assertNotFound(e, 0L);
+            assertNotFound(e, 13L);
+            assertNotFound(e, Long.MAX_VALUE);
+
+            // findSeq never moves the cursor, on a hit or a miss.
+            int tid = e.currentTid();
+            long idx = e.currentIndex();
+            e.findSeq(7L);
+            e.findSeq(999L);
+            assertEquals(tid, e.currentTid());
+            assertEquals(idx, e.currentIndex());
+        }
+    }
+
+    /**
+     * A recording where the field {@code balance} is written on two distinct owner ids
+     * ({@code #100} twice, {@code #200} once, interleaved across threads so global seq order
+     * differs from per-thread order) plus one static write (target 0) — exercising the §16.7
+     * owner filter and its exclusion of statics.
+     */
+    private static Path buildOwnerWrites(final Path dir) throws IOException {
+        SyntheticRecording r = new SyntheticRecording(dir);
+        int file = r.sym("FILE", "Acct.java");
+        int clsAcct = r.sym("CLASS", "com.ex.Acct");
+        int fieldBalance = r.sym("FIELD", "balance");
+        int siteInstance = r.fieldSite(clsAcct, file, 21, fieldBalance, "I", false);
+        int siteStatic = r.fieldSite(clsAcct, file, 5, fieldBalance, "I", true);
+
+        int inline = SyntheticRecording.flags(Format.KIND_INLINE, Format.KIND_INLINE, 0);
+        int staticInline =
+                SyntheticRecording.flags(Format.KIND_INLINE, Format.KIND_INLINE, Format.FLAG_STATIC);
+
+        r.threadStart(1, "t1", 1L, 0L); // seq 1,2  t1 idx 0,1
+        r.threadStart(2, "t2", 2L, 0L); // seq 3,4  t2 idx 0,1
+        r.rec(1, Format.FIELD_WRITE, inline, Format.TAG_INT, 0, siteInstance, 100L, 0, 10);   // seq 5  #100
+        r.rec(2, Format.FIELD_WRITE, inline, Format.TAG_INT, 0, siteInstance, 200L, 0, 99);   // seq 6  #200
+        r.rec(1, Format.FIELD_WRITE, staticInline, Format.TAG_INT, 0, siteStatic, 0L, 0, 7);  // seq 7  static
+        r.rec(2, Format.FIELD_WRITE, inline, Format.TAG_INT, 0, siteInstance, 100L, 10, 20);  // seq 8  #100
+        return r.write();
+    }
+
+    private static void assertFound(final Engine e, final Recording probe, final long seq,
+            final int expectTid, final long expectIndex) throws IOException {
+        SeqLocation loc = e.findSeq(seq);
+        assertTrue(loc.found(), "seq " + seq + " should be found");
+        assertEquals(expectTid, loc.tid(), "tid for seq " + seq);
+        assertEquals(expectIndex, loc.index(), "index for seq " + seq);
+        assertEquals(seq, probe.recordAt(loc.tid(), loc.index()).seq(),
+                "the record at the returned location must carry that seq");
+    }
+
+    private static void assertNotFound(final Engine e, final long seq) {
+        SeqLocation loc = e.findSeq(seq);
+        assertFalse(loc.found(), "seq " + seq + " should not be found");
+        assertEquals(0, loc.tid());
+        assertEquals(0L, loc.index());
+    }
+
     // ---- helpers ----
 
     private static void stepTo(final Engine e, final int targetIndex) {

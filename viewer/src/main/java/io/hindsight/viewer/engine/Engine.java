@@ -490,6 +490,38 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
+     * Locate the record with global sequence number {@code seq} (§16.7). Each thread's record
+     * file is seq-ascending — {@code seq} is a global {@code AtomicLong} incremented once per
+     * record, so within a thread the record indices are strictly increasing in seq — so each
+     * thread is binary-searched over {@code [0, count)}. {@code seq} is globally unique, so at
+     * most one record matches across ALL threads; the first thread found to carry it is returned
+     * (any is fine, since there is only one). Returns {@link SeqLocation#found()} {@code false}
+     * (with {@code tid == 0}, {@code index == 0}) when no record has that seq. Does <em>not</em>
+     * move the cursor and does not require the record to be a {@code LINE}.
+     *
+     * @param seq the global sequence number to locate
+     */
+    public SeqLocation findSeq(final long seq) {
+        for (int tid : recording.threadIds()) {
+            ThreadIndex ti = index(tid);
+            long lo = 0;
+            long hi = ti.count - 1L;
+            while (lo <= hi) {
+                long mid = (lo + hi) >>> 1;
+                long midSeq = rec(tid, mid).seq();
+                if (midSeq == seq) {
+                    return new SeqLocation(true, tid, mid);
+                } else if (midSeq < seq) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+        }
+        return new SeqLocation(false, 0, 0L);
+    }
+
+    /**
      * Move to the innermost (execution) frame's <em>return</em>: the greatest {@code LINE} index
      * {@code j} in this thread with {@code frameEnter[j] == frameEnter[cursor]} and
      * {@code j ≤ matchingExit[enter]} (§11.6, key {@code e}). No-op with {@link
@@ -769,18 +801,10 @@ public final class Engine implements AutoCloseable {
 
         TreeMap<Integer, Local> bySlot = new TreeMap<>();
 
-        // 1. Synthetic `this` for instance frames.
+        // 1. Synthetic `this` for instance frames — the derivation is shared with
+        // frameThisId() (§16.7) so the two never diverge.
         if (!frame.isStatic()) {
-            long thisId = rec(cursorTid, enter).target();
-            // §2.1: a constructor's ENTER carries target 0 (this is uninitialized at entry);
-            // the live object's id is on the matching METHOD_EXIT (exitCtor). Recover it so a
-            // ctor body shows `this` as the real, expandable object rather than null.
-            if (thisId == 0 && "<init>".equals(frame.methodName()) && exit >= 0 && exit < ti.count) {
-                Rec exitRec = rec(cursorTid, exit);
-                if (exitRec.type() == Format.METHOD_EXIT) {
-                    thisId = exitRec.target();
-                }
-            }
+            long thisId = thisIdOf(frame, ti);
             Value v = thisId != 0 ? new Value.Ref(thisId, renderObjectId(thisId)) : new Value.Null();
             String desc = frame.classBinary() != null
                     ? "L" + frame.classBinary().replace('.', '/') + ";"
@@ -824,6 +848,45 @@ public final class Engine implements AutoCloseable {
         }
 
         return List.copyOf(bySlot.values());
+    }
+
+    /**
+     * The {@code this} object id (slot 0) of stack frame {@code frameIndex}, or {@code 0} for a
+     * static frame, an unrecorded (capture-only) frame, an out-of-range index, or when no
+     * {@code this} is resolvable (§16.7). Reuses the exact §2.4 {@code this}-derivation that
+     * {@link #locals} performs (both delegate to {@link #thisIdOf}), so the two never diverge.
+     *
+     * @param frameIndex a stack index, {@code 0} = outermost .. {@code depth-1} = innermost
+     */
+    public long frameThisId(final int frameIndex) {
+        if (frameIndex < 0 || frameIndex >= publicFrames.size()) {
+            return 0;
+        }
+        return thisIdOf(publicFrames.get(frameIndex), index(cursorTid));
+    }
+
+    /**
+     * The §2.4 {@code this}-derivation shared by {@link #locals} and {@link #frameThisId}: for a
+     * recorded instance frame, the slot-0 {@code this} object id read from the frame's ENTER
+     * record {@code target}, with the {@code <init>} fallback — a constructor's ENTER carries
+     * {@code target 0} (this is uninitialised at entry) so the live object's id is recovered from
+     * the matching {@code METHOD_EXIT}. Returns {@code 0} for a static frame, an unrecorded frame
+     * (no ENTER), or when the id is genuinely absent.
+     */
+    private long thisIdOf(final Frame frame, final ThreadIndex ti) {
+        if (frame.isStatic() || !frame.recorded() || frame.enterIndex() < 0) {
+            return 0;
+        }
+        int enter = frame.enterIndex();
+        int exit = ti.matchingExit[enter];
+        long thisId = rec(cursorTid, enter).target();
+        if (thisId == 0 && "<init>".equals(frame.methodName()) && exit >= 0 && exit < ti.count) {
+            Rec exitRec = rec(cursorTid, exit);
+            if (exitRec.type() == Format.METHOD_EXIT) {
+                thisId = exitRec.target();
+            }
+        }
+        return thisId;
     }
 
     // ---- object trees (§2.5) ----
@@ -1225,6 +1288,24 @@ public final class Engine implements AutoCloseable {
      * @param cap the maximum number of hits to return
      */
     public List<FieldWriteHit> fieldWrites(final String fileName, final String fieldName, final int cap) {
+        return fieldWrites(fileName, fieldName, 0L, cap);
+    }
+
+    /**
+     * The owner-filtered variant of {@link #fieldWrites(String, String, int)} (§16.7): identical
+     * to the 3-arg version but, when {@code ownerId != 0}, additionally requires the
+     * {@code FIELD_WRITE} record's {@code target()} to equal {@code ownerId} — so a
+     * {@code this}-instance query lists only that object's writes, and statics (target 0) are
+     * excluded. {@code ownerId == 0} reproduces the 3-arg behaviour exactly, which is why the
+     * 3-arg overload delegates here rather than duplicating the walk.
+     *
+     * @param fileName the source file to match owners against, e.g. {@code Foo.java}
+     * @param fieldName the bare field name to look up
+     * @param ownerId the owner object id to restrict to, or {@code 0} for all instances (+ statics)
+     * @param cap the maximum number of hits to return
+     */
+    public List<FieldWriteHit> fieldWrites(
+            final String fileName, final String fieldName, final long ownerId, final int cap) {
         ensureInstanceIndex();
         List<WriteRef> refs = fieldWriteRefsByName.get(fieldName);
         if (refs == null || fileName == null || cap <= 0) {
@@ -1236,6 +1317,9 @@ public final class Engine implements AutoCloseable {
                 break;
             }
             Rec r = rec(w.tid(), w.index());
+            if (ownerId != 0 && r.target() != ownerId) {
+                continue;
+            }
             Site s = recording.site(r.location());
             if (s == null) {
                 continue;
@@ -1270,6 +1354,21 @@ public final class Engine implements AutoCloseable {
      * @param fieldName the bare field name to look up
      */
     public long countFieldWrites(final String fileName, final String fieldName) {
+        return countFieldWrites(fileName, fieldName, 0L);
+    }
+
+    /**
+     * The owner-filtered variant of {@link #countFieldWrites(String, String)} (§16.7): identical
+     * to the 2-arg version but, when {@code ownerId != 0}, only counts writes whose
+     * {@code FIELD_WRITE} record {@code target()} equals {@code ownerId} (statics, target 0, are
+     * excluded). {@code ownerId == 0} reproduces the 2-arg behaviour exactly, which is why the
+     * 2-arg overload delegates here. Renders nothing, so it stays cheap against millions of writes.
+     *
+     * @param fileName the source file to match owners against, e.g. {@code Foo.java}
+     * @param fieldName the bare field name to look up
+     * @param ownerId the owner object id to restrict to, or {@code 0} for all instances (+ statics)
+     */
+    public long countFieldWrites(final String fileName, final String fieldName, final long ownerId) {
         ensureInstanceIndex();
         List<WriteRef> refs = fieldWriteRefsByName.get(fieldName);
         if (refs == null || fileName == null) {
@@ -1278,6 +1377,9 @@ public final class Engine implements AutoCloseable {
         long n = 0;
         for (WriteRef w : refs) {
             Rec r = rec(w.tid(), w.index());
+            if (ownerId != 0 && r.target() != ownerId) {
+                continue;
+            }
             Site s = recording.site(r.location());
             if (s == null) {
                 continue;
