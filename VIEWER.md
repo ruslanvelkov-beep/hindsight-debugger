@@ -913,3 +913,96 @@ SeqLocation findSeq(long seq);
 ```
 The two existing `fieldWrites`/`countFieldWrites` overloads keep their signatures and
 delegate with `ownerId = 0`.
+
+## 17. v1.7 additions & changes
+
+Authoritative over conflicting earlier text (§2, §11, §13.5, §14.2/§14.5, §16). Items
+17.4 needs a recorder ≥ v1.7 recording (older recordings keep the argN fallback);
+everything else works on existing schema-4 recordings.
+
+### 17.1 Execution-record stepping (engine)
+Stepping stops ONLY at records that change the execution position — the **exec set**:
+`LINE`, `METHOD_ENTER`, `METHOD_EXIT`. Metadata records (first-seen, snapshots,
+thread-start, time-sync, stack captures) and value records (ARG, LOCAL_WRITE,
+FIELD_WRITE, BRANCH) are never step landings.
+- `ThreadIndex` gains `execIndices` (ascending record indices of the exec set) beside
+  `lineIndices`; all stepping walks it.
+- `stepInto` / `reverseStep`: the next/previous exec record in the thread.
+- `stepOver` / `reverseStepOver`: the next/previous exec record at the CURRENT FRAME'S
+  DEPTH or shallower, excluding the frame's own ENTER — LINEs of the current/outer
+  frames, the current/ancestor frame's EXIT, and past the frame's end a SIBLING frame's
+  ENTER/records (the walk flows into the thread's next same-depth invocation instead of
+  dead-ending at frame boundaries — threads re-entered from uninstrumented code produce
+  thousands of sibling top-level frames). Everything inside callees (strictly deeper) is
+  skipped; a callee's ENTER can only be a stepInto landing.
+- The cursor may now rest ON a `METHOD_ENTER` (the frame just entered — its locals are
+  the seeded args; its current line falls back to the method site's line when no LINE has
+  executed yet) or a `METHOD_EXIT` (frame about to pop; current line = last LINE of the
+  frame, or the site line). stack()/locals()/recordInfo()/watches must all be correct at
+  such positions. In callsOnly-scope threads (no LINE records at all) stepping therefore
+  works for the first time — ENTER/EXIT are the stops.
+- `runToCurrentLine` and `exitFrameForward/Backward` keep LINE-based semantics (they are
+  line-oriented commands) but must be no-op-safe when the frame has no LINEs.
+- The §11.5 history-append and §13.1 scrolling rules are untouched.
+
+### 17.2 Jump landings on exec records
+Every jump that previously advanced to "the nearest following LINE" now advances to the
+nearest following EXEC record (§17.1 set): the `/` calls jump, the instances `f`
+first-mention jump, and the `.` object jump. The `j` record jump and the variable-history
+jump land on the nearest exec record AT/BEFORE the target (falling forward only when none
+precedes). A jump that lands on a metadata record is a bug.
+
+### 17.3 Explorable map keys and values (engine)
+A MAP-form object's children change: each entry node (labelled `<key> → <value>` as
+today) is now EXPANDABLE and yields exactly two children, `key = <key>` and
+`value = <value>`, each carrying its own Value — so a Ref key/value is independently
+explorable from there (per its own snapshot availability). SET/LIST/ARRAY children are
+unchanged.
+
+### 17.4 Real parameter names (recorder + reader + engine)
+The agent records parameter names into METHOD sites at transform time (FORMAT.md §5
+`#p<slot>=<name>|...` suffix, from the LVT with MethodParameters fallback). The reader
+strips the suffix from `desc` and exposes a per-site slot→name map. Engine `locals()`
+names ARG-seeded slots from it — `argN` only when the recording carries no names.
+
+### 17.5 Frame-selected position and stepping (engine + TUI)
+- Engine: `SeqLocation frameAsOf(int frameIndex)` — the record the frame's shown state is
+  reconstructed as-of (its last exec record at/before the cursor; the ENTER itself when
+  none): `found=false` for unrecorded/out-of-range frames.
+- TUI: with Source focused, the info line's record info reflects the SELECTED frame's
+  as-of record (its seq/site), not the innermost, whenever a non-innermost frame is
+  selected. On any step/run/exit-frame command while a non-innermost RECORDED frame is
+  selected, the TUI first `engine.seek`s to that frame's as-of record and then applies
+  the step — the cursor genuinely moves (one history entry via the normal doStep path;
+  the previous position remains reachable from the Records window).
+
+### 17.6 Recording name in the Threads title row (TUI)
+The top-right window's border row shows the recording directory's NAME right-aligned,
+ending exactly 2 columns left of the window's top-right corner, to the right of
+`Threads [t]`. Names longer than 21 characters render as first-10 + `…` + last-10.
+`Ctrl-D` (any focus) opens a small centered popup titled `Recording` showing the full
+ABSOLUTE path (wrapped as needed); Esc closes it. Help overlay gains the binding.
+
+### 17.7 Open-file browser (TUI)
+The `F` dialog is redesigned; title `Open file [F]`.
+- Content: a directory TREE rooted at the project root(s) (the `--repo`/source roots),
+  listing subdirectories and `.java` files. ↑/↓ move, →/↵ expand a directory (↵ on a FILE
+  opens it in browse mode and closes the dialog), ← collapses, Ctrl-F/Ctrl-B page, g/G
+  ends. The full file index under the roots is walked once and cached.
+- The `file:` query line is a case-insensitive REGEX filter over file names: only matching
+  files are listed, a directory whose subtree has no matching file disappears, and the
+  tree updates on every keystroke. Clearing the filter restores everything.
+- Per-directory expand/collapse state is remembered ACROSS filter changes (a directory
+  that disappears and reappears keeps its prior state) and across dialog close/reopen —
+  the dialog's whole state (filter, selection, scroll, expansion) is persistent like
+  §15.5, so `F` reopens exactly where it was closed. The §15.2 QUERY/LIST focus model
+  applies (arrows enter the list, `/`-style return-to-query via typing? no — `F` has no
+  competing key: any printable edits the filter from LIST focus too is NOT wanted; use
+  the §15.2 model exactly: printables edit only in QUERY focus).
+- Esc closes. The old dotted-class/`path:line` input form is retired (§11.8 superseded).
+
+### 17.8 Native Shift-F7 / Shift-F8 (TUI)
+Reverse step / reverse step-over bind to: `F7`+shift and `F8`+shift (xterm `;2~`
+modifier form), PLUS `F15`/`F16` as aliases — Apple Terminal encodes Shift-F7/F8 with
+the legacy "+8" scheme (`ESC[28~`/`ESC[29~`), which lanterna decodes as plain F15/F16
+(user-verified). The F9/F10 fallbacks are REMOVED. Help texts say `⇧F7/⇧F8 reverse`.

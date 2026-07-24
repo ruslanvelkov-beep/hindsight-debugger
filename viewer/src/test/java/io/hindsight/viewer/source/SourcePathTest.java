@@ -110,4 +110,16 @@ final class SourcePathTest {
         assertFalse(sp.resolveClass("x.y.Z", "Z.java").isPresent());
         assertFalse(sp.linesOfFile(dir.resolve("nope/Nope.java")).isPresent());
     }
+
+    @Test
+    void rootsExposesExplicitThenDiscoveredRoots(@TempDir final Path dir) throws IOException {
+        // §17.7: the open-file browser builds its tree from these roots.
+        Path explicit = dir.resolve("explicit");
+        Files.createDirectories(explicit);
+        Path discovered = dir.resolve("repo/proj/src/main/java");
+        Files.createDirectories(discovered);
+
+        SourcePath sp = SourcePath.of(List.of(explicit), List.of(dir.resolve("repo")));
+        assertEquals(List.of(explicit, discovered), sp.roots());
+    }
 }

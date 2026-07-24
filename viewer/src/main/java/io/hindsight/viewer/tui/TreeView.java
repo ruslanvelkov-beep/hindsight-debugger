@@ -16,10 +16,13 @@ import java.util.Set;
  * <p>Children are never stored — they are re-fetched from a {@link ChildSource}
  * (the engine, in production) every time the visible list is (re)computed, so the
  * tree always reflects the current cursor's {@code seq} and a cyclic object graph
- * cannot be walked eagerly. The cycle guard is delegated to the engine: this class
- * threads the set of ancestor object ids down each path and hands it to
- * {@link ChildSource#children(ObjectNode, Set)}, which renders a back-reference as
- * a non-expandable leaf.
+ * cannot be walked eagerly. The traversal descends into every open
+ * {@link ObjectNode#expandable()} node — reference nodes and the §17.3 map-entry
+ * nodes alike. The cycle guard is delegated to the engine: this class threads the
+ * set of ancestor object ids down each path — a node's own id joins the path only
+ * when its value is a reference and it is not a map entry (an entry carries no id
+ * of its own) — and hands it to {@link ChildSource#children(ObjectNode, Set)},
+ * which renders a back-reference as a non-expandable leaf.
  *
  * <p>Expansion is keyed by a structural path string ({@code "2/0/1"} = root 2, its
  * child 0, that child's child 1) so it survives the roots being rebuilt on every
@@ -211,12 +214,20 @@ public final class TreeView {
         boolean expandable = node.expandable();
         boolean isOpen = expandable && expanded.contains(key);
         out.add(new Row(node, depth, expandable, isOpen, key));
-        if (!isOpen || !(node.value() instanceof Value.Ref ref)) {
+        if (!isOpen) {
             return;
         }
+        // §17.3: descend into ANY open expandable node. A map-entry node contributes no
+        // ancestor id of its own — its fixed key/value children resolve against the SAME
+        // path (its value would falsely flag the value child as a cycle) — while any other
+        // expandable node is a reference whose object id joins the path.
         List<ObjectNode> kids = childSource.children(node, ancestors);
-        Set<Long> childAncestors = new HashSet<>(ancestors);
-        childAncestors.add(ref.objectId());
+        Set<Long> childAncestors = ancestors;
+        if (!node.isMapEntry() && node.value() instanceof Value.Ref ref) {
+            Set<Long> withSelf = new HashSet<>(ancestors);
+            withSelf.add(ref.objectId());
+            childAncestors = withSelf;
+        }
         for (int j = 0; j < kids.size(); j++) {
             walk(kids.get(j), depth + 1, key + "/" + j, childAncestors, expanded, childSource, out);
         }

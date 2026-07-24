@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.hindsight.viewer.engine.ObjectNode;
+import io.hindsight.viewer.engine.TestObjectNodes;
 import io.hindsight.viewer.engine.Value;
 import java.util.HashMap;
 import java.util.List;
@@ -16,7 +17,9 @@ import org.junit.jupiter.api.Test;
 /**
  * Tests the tree flattening/navigation of VIEWER.md §6.4/§6.5 against a fake
  * {@link TreeView.ChildSource}, so the traversal, path keying and ancestor-id
- * threading are verified without a terminal or an engine.
+ * threading — including the §17.3 map-entry rules (descend into ANY expandable
+ * node; an entry contributes no ancestor id) — are verified without a terminal
+ * or an engine.
  */
 final class TreeViewTest {
 
@@ -115,5 +118,61 @@ final class TreeViewTest {
         tv.clearExpansion();
         assertEquals(1, tv.rows().size());
         assertEquals(0, tv.selection());
+    }
+
+    /** A child source keyed by node LABEL (map-entry nodes share values, not ids). */
+    private static final class LabelSource implements TreeView.ChildSource {
+        final Map<String, List<ObjectNode>> byLabel = new HashMap<>();
+        final Map<String, Set<Long>> ancestorsSeen = new HashMap<>();
+
+        @Override
+        public List<ObjectNode> children(final ObjectNode node, final Set<Long> ancestorIds) {
+            ancestorsSeen.put(node.label(), Set.copyOf(ancestorIds));
+            return byLabel.getOrDefault(node.label(), List.of());
+        }
+    }
+
+    @Test
+    void descendsIntoExpandableNonRefNodes() {
+        // §17.3: a map entry with PRIMITIVE key/value is expandable although its value is
+        // no Ref — the walk must still fetch and show its children (the old walk did not).
+        LabelSource cs = new LabelSource();
+        ObjectNode entry = TestObjectNodes.mapEntry(
+                "1 -> 2", new Value.Primitive("1"), new Value.Primitive("2"));
+        cs.byLabel.put("1 -> 2", List.of(leaf("key = 1", "1"), leaf("value = 2", "2")));
+
+        List<TreeView.Row> rows = TreeView.flatten(List.of(entry), Set.of("0"), cs);
+        assertEquals(List.of("0", "0/0", "0/1"), rows.stream().map(TreeView.Row::key).toList());
+        assertTrue(rows.get(0).expandable());
+        assertTrue(rows.get(0).expanded());
+        assertEquals(Set.of(), cs.ancestorsSeen.get("1 -> 2"));
+    }
+
+    @Test
+    void mapEntryAddsNoAncestorIdButRefChildrenStillDo() {
+        // Root #100 holds an entry whose value is #200; the entry expands to its key/value
+        // pair. The ENTRY must add no ancestor id (its children resolve against {100} only,
+        // NOT {100, 200} — else the "value = #200" child would look like a cycle), while the
+        // Ref child "value = #200" adds its own id for ITS children as before.
+        LabelSource cs = new LabelSource();
+        ObjectNode entry = TestObjectNodes.mapEntry(
+                "k -> #200", new Value.Primitive("k"), new Value.Ref(200, "#200"));
+        cs.byLabel.put("a = #100", List.of(entry));
+        cs.byLabel.put("k -> #200", List.of(
+                leaf("key = k", "k"), ObjectNode.of("value = #200", new Value.Ref(200, "#200"))));
+        cs.byLabel.put("value = #200", List.of(ref("w = #300", 300)));
+        cs.byLabel.put("w = #300", List.of(leaf("z = 9", "9")));
+
+        List<TreeView.Row> rows = TreeView.flatten(
+                List.of(ref("a = #100", 100)), Set.of("0", "0/0", "0/0/1", "0/0/1/0"), cs);
+
+        assertEquals(
+                List.of("0", "0/0", "0/0/0", "0/0/1", "0/0/1/0", "0/0/1/0/0"),
+                rows.stream().map(TreeView.Row::key).toList());
+        assertEquals(Set.of(100L), cs.ancestorsSeen.get("k -> #200"), "entry sees the root's id");
+        assertEquals(Set.of(100L), cs.ancestorsSeen.get("value = #200"),
+                "the entry added NO ancestor id of its own");
+        assertEquals(Set.of(100L, 200L), cs.ancestorsSeen.get("w = #300"),
+                "a Ref node still adds its id for its children");
     }
 }

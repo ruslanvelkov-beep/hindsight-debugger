@@ -37,6 +37,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
+import java.util.function.Supplier;
 import java.util.regex.PatternSyntaxException;
 
 /**
@@ -87,6 +88,14 @@ import java.util.regex.PatternSyntaxException;
  *       window keeps a cursor line (rendered in the gutter while focused) that
  *       ↑/↓ move; {@code v} parses it via {@link FieldDecl} and lists the matching
  *       {@link Engine#fieldWrites} in a jumpable modal.
+ *   <li><b>Exec-record landings</b> (§17.1/§17.2): every step and jump lands on the
+ *       exec set (LINE/METHOD_ENTER/METHOD_EXIT, {@link ExecRecords}) — never on a
+ *       metadata record — and stepping honours a selected outer frame by seeking to
+ *       its as-of record first (§17.5, {@link Engine#frameAsOf}).
+ *   <li><b>Open-file browser</b> (§17.7): {@code F} is a persistent directory-tree
+ *       browser over the source roots ({@link FileTree}) with a per-keystroke regex
+ *       filter over file names; {@code Ctrl-D} pops up the recording's full path and
+ *       the Threads border carries its name (§17.6).
  * </ul>
  */
 public final class ViewerApp {
@@ -105,9 +114,9 @@ public final class ViewerApp {
         SOURCE, THREADS, STACK, LOCALS, RECORDS
     }
 
-    /** Which modal dialog is open (§9, §11.7 regex method browse, §11.8 open file). */
+    /** Which query modal is open (§9, §11.7 regex method browse); the §17.7 file browser is separate. */
     private enum DialogKind {
-        METHOD, OBJECT, FILE
+        METHOD, OBJECT
     }
 
     /** Which part of the {@code /} dialog receives keys (§15.2): the query line or the result list. */
@@ -146,6 +155,28 @@ public final class ViewerApp {
 
         SearchDialog(final DialogKind kind) {
             this.kind = kind;
+        }
+    }
+
+    /**
+     * Live state of the §17.7 open-file browser: the once-built {@link FileTree} (index +
+     * expansion memory + filter), the incrementally-edited query, the §15.2 QUERY/LIST focus,
+     * and the list selection/scroll. The one instance is persistent like the {@code /} dialog
+     * (§15.5): {@code ViewerApp.fileDialog} survives Esc, so reopening with {@code F} restores
+     * filter, selection, scroll and expansion exactly; {@code fileDialogOpen} is the only
+     * open/closed switch. {@code listViewH} is the visible row count captured at render so
+     * paging knows the page size.
+     */
+    private static final class FileDialog {
+        final FileTree tree;
+        final StringBuilder query = new StringBuilder();
+        DialogFocus focus = DialogFocus.QUERY;
+        int sel;
+        int scroll;
+        int listViewH = 1;
+
+        FileDialog(final FileTree tree) {
+            this.tree = tree;
         }
     }
 
@@ -199,6 +230,9 @@ public final class ViewerApp {
     private final SourcePath sourcePath;
     private final JavaHighlighter highlighter = new JavaHighlighter();
     private final List<Integer> tids;
+    // §17.6: the recording directory's full absolute path (Ctrl-D popup) and bare name (border).
+    private final String recordingPath;
+    private final String recordingName;
 
     private final TreeView localsTree;
     private final Map<String, List<List<JavaHighlighter.Span>>> highlightCache = new HashMap<>();
@@ -212,6 +246,11 @@ public final class ViewerApp {
     private SearchDialog dialog;
     // §15.5: the one persistent `/` dialog — kept across Esc/close so reopening restores it.
     private SearchDialog searchDialog;
+    // §17.7: the persistent open-file browser state (lazily built on first `F`) + its open flag.
+    private FileDialog fileDialog;
+    private boolean fileDialogOpen;
+    // §17.6: whether the Ctrl-D "Recording" path popup is open.
+    private boolean recordingPopup;
     private VarHistoryWindow varHist;
     // §16.3: the Records "jump to record number" modal (null when closed).
     private RecordJump recordJump;
@@ -269,7 +308,10 @@ public final class ViewerApp {
      * @param screen a started (or startable) lanterna screen the loop renders to
      * @param engine the reconstruction engine (already open)
      * @param recording the same recording, used directly for the §9 object scan and record counts
-     * @param sourcePath resolves class/file to source lines and modules
+     * @param sourcePath resolves class/file to source lines and modules; its roots seed the
+     *     §17.7 open-file browser
+     * @param recordingDir the recording directory, shown on the Threads border and in the
+     *     {@code Ctrl-D} popup (§17.6)
      * @param initialTid the {@code --tid} thread to focus, or empty for the engine's default
      */
     public ViewerApp(
@@ -277,11 +319,16 @@ public final class ViewerApp {
             final Engine engine,
             final Recording recording,
             final SourcePath sourcePath,
+            final Path recordingDir,
             final OptionalInt initialTid) {
         this.screen = screen;
         this.engine = engine;
         this.recording = recording;
         this.sourcePath = sourcePath;
+        Path absDir = recordingDir != null ? recordingDir.toAbsolutePath().normalize() : null;
+        this.recordingPath = absDir != null ? absDir.toString() : "";
+        Path dirName = absDir != null ? absDir.getFileName() : null;
+        this.recordingName = dirName != null ? dirName.toString() : this.recordingPath;
         this.tids = engine.threads();
         this.localsTree = new TreeView(engine::children);
         if (initialTid.isPresent()) {
@@ -350,11 +397,17 @@ public final class ViewerApp {
         if (dialog != null) {
             drawDialog(g, cols, rows);
         }
+        if (fileDialogOpen) {
+            drawFileDialog(g, cols, rows);
+        }
         if (varHist != null) {
             drawVarHistory(g, cols, rows);
         }
         if (recordJump != null) {
             drawRecordJump(g, cols, rows);
+        }
+        if (recordingPopup) {
+            drawRecordingPopup(g, cols, rows);
         }
         if (quitConfirm) {
             drawQuitConfirm(g, cols, rows);
@@ -579,6 +632,7 @@ public final class ViewerApp {
     private void renderThreads(final TextGraphics g, final Layout.Rect rect) {
         boolean focused = focus == Win.THREADS;
         drawBox(g, rect, "Threads [t]", Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
+        drawRecordingName(g, rect, focused);
         int ix = rect.col() + 1;
         int iy = rect.row() + 1;
         int iw = rect.width() - 2;
@@ -596,6 +650,35 @@ public final class ViewerApp {
         threadSel = clamp(threadSel, 0, Math.max(0, rows.size() - 1));
         threadScroll = ScrollMath.adjustScroll(threadScroll, threadSel, ih, rows.size());
         drawRows(g, ix, iy, iw, ih, rows, threadSel, threadScroll, threadsHcol, true);
+    }
+
+    /**
+     * The recording directory's NAME on the Threads window's top border (§17.6): right-aligned,
+     * its last character exactly 2 columns left of the top-right corner, drawn AFTER
+     * {@link #drawBox} so it overwrites border dashes, and kept to the right of the
+     * {@code Threads [t]} title. The §17.6 budget is {@link RecordingName#MAX_BORDER_NAME} (21,
+     * first-10 {@code …} last-10 beyond it); a narrower window shrinks the budget further so
+     * the name never collides with the title.
+     */
+    private void drawRecordingName(final TextGraphics g, final Layout.Rect rect, final boolean focused) {
+        if (recordingName.isEmpty()) {
+            return;
+        }
+        int x = rect.col();
+        int w = rect.width();
+        int endCol = x + w - 3; // the name's last column: 2 left of the corner at x+w-1
+        int titleEnd = x + 2 + "Threads [t]".length() + 2; // first border column after " Threads [t] "
+        int maxLen = endCol - titleEnd; // keep >= 1 dash between title and name
+        if (maxLen < 1) {
+            return;
+        }
+        String name = RecordingName.abbreviate(recordingName, Math.min(RecordingName.MAX_BORDER_NAME, maxLen));
+        if (name.isEmpty()) {
+            return;
+        }
+        int start = endCol - name.length() + 1;
+        // A leading space visually separates the name from the border dashes, like a title.
+        put(g, start - 1, rect.row(), " " + name, focused ? Palette.FOCUS : Palette.UNFOCUS, Palette.BG, focused);
     }
 
     private void renderStack(final TextGraphics g, final Layout.Rect rect) {
@@ -709,11 +792,13 @@ public final class ViewerApp {
     }
 
     /**
-     * The focus-sensitive position part of the status row (§14.4/§15.6): the selected instance's
-     * full class + id while the {@code /} dialog is in instances mode, the selected Locals row's
-     * full type while Locals is focused, the selected stack frame's fully-qualified
-     * {@code Class.method} while Stack is focused (grey §14.5 frames included), and the compact
-     * record info everywhere else (or as fallback when the focused window has no selection).
+     * The focus-sensitive position part of the status row (§14.4/§15.6/§17.5): the selected
+     * instance's full class + id while the {@code /} dialog is in instances mode, the selected
+     * Locals row's full type while Locals is focused, the selected stack frame's fully-qualified
+     * {@code Class.method} while Stack is focused (grey §14.5 frames included), the SELECTED
+     * frame's as-of record while Source is focused on a non-innermost recorded frame (§17.5),
+     * and the compact record info everywhere else (or as fallback when the focused window has
+     * no selection).
      */
     private String positionText(final RecordInfo ri) {
         if (dialog != null && dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
@@ -731,8 +816,58 @@ public final class ViewerApp {
             if (f != null) {
                 return FrameText.qualified(f); // §15.6
             }
+        } else if (dialog == null && focus == Win.SOURCE) {
+            String framePos = selectedFramePositionText();
+            if (framePos != null) {
+                return framePos; // §17.5: the SELECTED (non-innermost) frame's as-of record
+            }
         }
         return "seq " + ri.seq() + DOT + "t" + ri.tid() + DOT + ri.siteText();
+    }
+
+    /**
+     * The §17.5 Source-focused position text: with a non-innermost RECORDED frame selected, the
+     * compact record info ({@code seq · t · site}) of THAT frame's as-of record
+     * ({@link Engine#frameAsOf}) — the record its shown state is reconstructed as-of — instead
+     * of the cursor's. {@code null} (caller falls back to the cursor's info) for the innermost
+     * frame, an unrecorded frame ({@code found=false}) or an out-of-range selection.
+     */
+    private String selectedFramePositionText() {
+        List<Frame> frames = engine.stack();
+        int sf = engine.selectedFrame();
+        if (sf < 0 || sf >= frames.size() - 1) {
+            return null; // innermost (or nothing) selected: today's behaviour
+        }
+        SeqLocation loc = engine.frameAsOf(sf);
+        if (!loc.found()) {
+            return null; // unrecorded frame: no as-of record to show
+        }
+        Rec r = rec(loc.tid(), loc.index());
+        return "seq " + r.seq() + DOT + "t" + loc.tid() + DOT + asOfSiteText(r, frames.get(sf));
+    }
+
+    /**
+     * {@code Class.method (File:line)} for a frame's as-of record, mirroring the engine's
+     * {@code RecordInfo.siteText} shape; the frame itself backfills any part the record's
+     * site does not carry (e.g. a LINE site without a member symbol).
+     */
+    private String asOfSiteText(final Rec r, final Frame f) {
+        Site s = recording.site(r.location());
+        String cls = s != null ? recording.symbolText(s.classSym()) : null;
+        if (cls == null) {
+            cls = f.classBinary();
+        }
+        String method = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
+        if (method == null) {
+            method = f.methodName();
+        }
+        String file = s != null ? recording.symbolText(s.fileSym()) : null;
+        if (file == null) {
+            file = f.fileName();
+        }
+        int line = s != null ? s.line() : f.currentLine();
+        String methodPart = method != null && !method.isEmpty() ? "." + method : "";
+        return simpleClass(cls) + methodPart + " (" + (file != null ? file : "?") + ":" + line + ")";
     }
 
     /** The instance owning the selected row of the instances-mode result tree (§14.2), or null. */
@@ -745,8 +880,8 @@ public final class ViewerApp {
     }
 
     private void renderHelp(final TextGraphics g, final int cols, final int row) {
-        String base = "F7 step  F8 over  ⇧/F9 F10 rev  e/E exit-frame  ^R run  o origin  "
-                + "/ calls  . obj  F file  c/s/t/l/r focus  q quit";
+        String base = "F7 step  F8 over  ⇧F7/⇧F8 reverse  e/E exit-frame  ^R run  o origin  "
+                + "/ calls  . obj  F file  ^D recording  c/s/t/l/r focus  q quit";
         String ctx = switch (focus) {
             case SOURCE -> browseMode
                     ? "↑↓ cursor  v var-history  Alt-F search  <> hscroll  o return  g/G/Home/End"
@@ -880,7 +1015,6 @@ public final class ViewerApp {
                     ? "Browse instances [/]  ⇥ calls"
                     : "Browse method calls [/]  ⇥ instances";
             case OBJECT -> "Find object usage [.]";
-            case FILE -> "Open source file [F]";
         };
         drawBox(g, new Layout.Rect(x, y, w, h), title, Palette.DIALOG_BG, Palette.FOCUS, true);
 
@@ -889,7 +1023,6 @@ public final class ViewerApp {
         int iw = w - 2;
         String prompt = switch (dialog.kind) {
             case METHOD -> "regex: ";
-            case FILE -> "file:  ";
             case OBJECT -> "query: ";
         };
         put(g, ix, iy, clipPad(prompt + dialog.query, iw), Palette.FG, Palette.DIALOG_BG, false);
@@ -901,7 +1034,6 @@ public final class ViewerApp {
 
         int hintRow = y + h - 2;
         String hint = switch (dialog.kind) {
-            case FILE -> "class[:line] | path.java[:line]   ↵ open  Esc close";
             case METHOD -> searchHint();
             case OBJECT -> "↑↓ select  ↵ jump  Esc close";
         };
@@ -924,11 +1056,6 @@ public final class ViewerApp {
             dialog.listViewH = Math.max(1, listH); // §15.2: page size for Ctrl-F/Ctrl-B, PgDn/PgUp
         }
 
-        if (dialog.kind == DialogKind.FILE) {
-            put(g, ix, listTop, clip("Opens a file in browse mode; press o to return to execution.", iw),
-                    Palette.DIM, Palette.DIALOG_BG, false);
-            return;
-        }
         if (dialog.rows.isEmpty()) {
             put(g, ix, listTop, clip(dialog.query.length() == 0 ? "(type to search)" : "(no matches)", iw),
                     Palette.DIM, Palette.DIALOG_BG, false);
@@ -1069,11 +1196,13 @@ public final class ViewerApp {
         String[] lines = {
             "Hindsight Viewer — keys",
             "",
-            "F7 / Shift+F7 (F9)    step into / reverse step",
-            "F8 / Shift+F8 (F10)   step over / reverse step over",
+            "F7 / Shift+F7         step into / reverse step",
+            "F8 / Shift+F8         step over / reverse step over",
+            "                      (Apple Terminal sends ⇧F7/⇧F8 as F15/F16 — accepted)",
             "e / E                 exit current frame: forward / backward",
             "Ctrl+R / Alt+R        run to current line: forward / backward",
             "o                     origin — return Source to the execution line",
+            "Ctrl+D                show the recording directory's full path",
             "c t s l r             focus Source Code/Threads/Stack/Locals/Records",
             "Tab / Shift+Tab       cycle focus forward / backward",
             "Arrows PgUp PgDn      navigate the focused window",
@@ -1085,6 +1214,7 @@ public final class ViewerApp {
             "/  .  F               browse calls/instances / find object / open file",
             "Tab in /              toggle calls ↔ instances;  ↑↓ enters the result",
             "                      list, / returns to the query, f = first mention",
+            "F                     source-root file tree (file: = name regex, ↵ opens)",
             "?  F1                 toggle this help",
             "q  Ctrl+C             quit (q asks to confirm)",
             "",
@@ -1123,6 +1253,41 @@ public final class ViewerApp {
         drawBox(g, new Layout.Rect(x, y, w, h), "Quit", Palette.DIALOG_BG, Palette.FOCUS, true);
         put(g, x + 3, y + 1, clip(msg, w - 6), Palette.FG, Palette.DIALOG_BG, false);
         put(g, x + 3, y + 3, clip(hint, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+    }
+
+    /**
+     * The §17.6 {@code Recording} popup: a small centered box with the recording directory's
+     * FULL absolute path, hard-wrapped across lines as needed ({@link RecordingName#wrap}).
+     */
+    private void drawRecordingPopup(final TextGraphics g, final int cols, final int rows) {
+        int w = clamp(recordingPath.length() + 6, 24, Math.min(74, Math.max(24, cols - 4)));
+        List<String> lines = RecordingName.wrap(recordingPath, w - 6);
+        int h = Math.min(rows - 2, lines.size() + 4);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), "Recording", Palette.DIALOG_BG, Palette.FOCUS, true);
+        for (int i = 0; i < lines.size() && y + 1 + i < y + h - 2; i++) {
+            put(g, x + 3, y + 1 + i, clip(lines.get(i), w - 6), Palette.FG, Palette.DIALOG_BG, false);
+        }
+        put(g, x + 3, y + h - 2, clip("Esc close", w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+    }
+
+    /**
+     * One key while the §17.6 {@code Recording} popup is open — it consumes every key: only Esc
+     * closes it (Ctrl-C stays the emergency quit).
+     */
+    private void handleRecordingPopup(final KeyStroke k) {
+        if (isCtrlC(k)) {
+            running = false;
+            return;
+        }
+        if (k.getKeyType() == KeyType.Escape) {
+            recordingPopup = false;
+        }
     }
 
     /** The §16.3 "jump to record number" modal: a digit input line and (when present) an error line. */
@@ -1177,8 +1342,17 @@ public final class ViewerApp {
                 }
                 return;
             }
+            if (recordingPopup) {
+                // §17.6: the popup consumes all keys; Esc closes (Ctrl-C still quits).
+                handleRecordingPopup(k);
+                return;
+            }
             if (dialog != null) {
                 handleDialog(k);
+                return;
+            }
+            if (fileDialogOpen) {
+                handleFileDialog(k);
                 return;
             }
             if (varHist != null) {
@@ -1230,22 +1404,23 @@ public final class ViewerApp {
             helpOverlay = true;
             return true;
         }
-        // Stepping via function keys.
+        // Stepping via function keys (§17.8: ⇧F7/⇧F8 reverse, with F15/F16 as the aliases
+        // Apple Terminal's legacy "+8" encodings decode to; the F9/F10 fallbacks are gone).
         switch (t) {
             case F7 -> {
-                doStep(k.isShiftDown() ? engine.reverseStep() : engine.stepInto());
+                doStepFromSelected(() -> k.isShiftDown() ? engine.reverseStep() : engine.stepInto());
                 return true;
             }
             case F8 -> {
-                doStep(k.isShiftDown() ? engine.reverseStepOver() : engine.stepOver());
+                doStepFromSelected(() -> k.isShiftDown() ? engine.reverseStepOver() : engine.stepOver());
                 return true;
             }
-            case F9 -> {
-                doStep(engine.reverseStep());
+            case F15 -> {
+                doStepFromSelected(engine::reverseStep);
                 return true;
             }
-            case F10 -> {
-                doStep(engine.reverseStepOver());
+            case F16 -> {
+                doStepFromSelected(engine::reverseStepOver);
                 return true;
             }
             case Tab -> {
@@ -1262,20 +1437,25 @@ public final class ViewerApp {
         }
         // Run-to-line (Ctrl+R forward, Ctrl+Shift+R or Alt+R backward).
         if (isChar(k, 'r') && k.isCtrlDown()) {
-            doStep(engine.runToCurrentLine(!k.isShiftDown()));
+            doStepFromSelected(() -> engine.runToCurrentLine(!k.isShiftDown()));
             return true;
         }
         if (isChar(k, 'r') && k.isAltDown()) {
-            doStep(engine.runToCurrentLine(false));
+            doStepFromSelected(() -> engine.runToCurrentLine(false));
             return true;
         }
         // Exit current frame (§11.6). Check E first so a shifted 'e' is not eaten by 'e'.
         if (isChar(k, 'E') || (isChar(k, 'e') && k.isShiftDown())) {
-            doStep(engine.exitFrameBackward());
+            doStepFromSelected(engine::exitFrameBackward);
             return true;
         }
         if (isChar(k, 'e')) {
-            doStep(engine.exitFrameForward());
+            doStepFromSelected(engine::exitFrameForward);
+            return true;
+        }
+        // Recording-path popup (§17.6).
+        if (k.isCtrlDown() && isChar(k, 'd')) {
+            recordingPopup = true;
             return true;
         }
         // Return-to-execution / leave browse mode (§11.2).
@@ -1302,7 +1482,7 @@ public final class ViewerApp {
             return true;
         }
         if (isChar(k, 'F') || (isChar(k, 'f') && k.isShiftDown())) {
-            openDialog(DialogKind.FILE);
+            openFileDialog(); // §17.7: the persistent tree browser
             return true;
         }
         // Focus letters (unmodified only, so Ctrl/Alt+letter reach navigation). §11.3 swaps c/s.
@@ -1566,7 +1746,7 @@ public final class ViewerApp {
         }
     }
 
-    /** Keys of the transient {@code .}/{@code F} dialogs (§9/§11.8) — unchanged by §15.2. */
+    /** Keys of the transient {@code .} dialog (§9) — unchanged by §15.2. */
     private void handleTransientDialog(final KeyStroke k) {
         KeyType t = k.getKeyType();
         if (t == KeyType.Enter) {
@@ -1744,9 +1924,9 @@ public final class ViewerApp {
      * The {@code f} key of the instances-mode {@code /} dialog (§14.2 semantics, rebound from
      * {@code g} by §15.2): move the cursor to the OWNING instance of the selected row (the root
      * of its subtree) — seek to its {@code OBJECT_FIRST_SEEN}, advance to the nearest following
-     * LINE (the §11.7 jump pattern), one history entry — and keep the dialog open; the expanded
-     * trees re-resolve against the new seq on the next draw. If the engine has no first-mention
-     * record (defensive), report and stay put.
+     * execution record (the §11.7/§17.2 jump pattern), one history entry — and keep the dialog
+     * open; the expanded trees re-resolve against the new seq on the next draw. If the engine
+     * has no first-mention record (defensive), report and stay put.
      */
     private void jumpToFirstMention() {
         InstanceBrowse.Row row = selectedInstanceRow();
@@ -1758,8 +1938,7 @@ public final class ViewerApp {
             status = "no first mention recorded for " + row.display();
             return;
         }
-        engine.seek(c.tid(), c.index());
-        engine.stepInto();
+        landOnNearestExecAfter(c.tid(), c.index());
         afterMove();
         appendHistory();
         status = "jumped to first mention of " + row.display() + " (seq " + c.seq() + ")";
@@ -1779,11 +1958,6 @@ public final class ViewerApp {
                 }
             }
             case OBJECT -> recomputeObjectResults();
-            case FILE -> {
-                dialog.rows = List.of();
-                dialog.targets = List.of();
-                dialog.note = "";
-            }
         }
     }
 
@@ -1931,10 +2105,6 @@ public final class ViewerApp {
         if (dialog == null) {
             return;
         }
-        if (dialog.kind == DialogKind.FILE) {
-            openFile();
-            return;
-        }
         if (dialog.rows.isEmpty()) {
             status = "no matches for \"" + dialog.query + "\"";
             dialog = null;
@@ -1958,14 +2128,28 @@ public final class ViewerApp {
     }
 
     /**
-     * Jumps to a method call (§11.7): seek to its {@code METHOD_ENTER} record, then advance to the
-     * nearest following LINE so the cursor sits on a line; appends exactly one history entry.
+     * Jumps to a method call (§11.7/§17.2): seek to its {@code METHOD_ENTER} record, then advance
+     * to the nearest following execution record; appends exactly one history entry.
      */
     private void jumpToCall(final int tid, final long index) {
-        engine.seek(tid, index);
-        engine.stepInto();
+        landOnNearestExecAfter(tid, index);
         afterMove();
         appendHistory();
+    }
+
+    /**
+     * The §11.7/§17.2 forward-jump landing: seek to {@code (tid, index)}, then advance to the
+     * nearest FOLLOWING execution record (the §17.1 set — LINE/METHOD_ENTER/METHOD_EXIT). With
+     * exec-based stepping the {@code stepInto} lands on the exec set by construction; when
+     * nothing follows the target in its thread, fall back to the nearest exec record before it
+     * so the cursor never rests on a metadata record (§17.2: such a landing is a bug).
+     */
+    private void landOnNearestExecAfter(final int tid, final long index) {
+        engine.seek(tid, index);
+        if (!engine.stepInto().moved()
+                && !ExecRecords.isExec(rec(engine.currentTid(), engine.currentIndex()).type())) {
+            engine.reverseStep();
+        }
     }
 
     // ---- variable history (§13.5) ----
@@ -2104,9 +2288,9 @@ public final class ViewerApp {
     }
 
     /**
-     * Jump to a field write (§13.5): position on the nearest LINE at/before the {@code FIELD_WRITE}
-     * record (the write belongs to that line). One history entry. A no-op when the current scope
-     * lists no writes (e.g. an empty §16.1 this-filter).
+     * Jump to a field write (§13.5/§17.2): position on the nearest execution record at/before
+     * the {@code FIELD_WRITE} record (the write belongs to that position). One history entry.
+     * A no-op when the current scope lists no writes (e.g. an empty §16.1 this-filter).
      */
     private void jumpToWrite() {
         if (varHist.hits.isEmpty()) {
@@ -2114,23 +2298,24 @@ public final class ViewerApp {
         }
         FieldWriteHit hit = varHist.hits.get(clamp(varHist.sel, 0, varHist.hits.size() - 1));
         varHist = null;
-        landOnNearestLineAtOrBefore(hit.tid(), hit.index());
+        landOnNearestExecAtOrBefore(hit.tid(), hit.index());
         afterMove();
         appendHistory();
         status = "jumped to seq " + engine.currentSeq() + " (t" + engine.currentTid() + ")";
     }
 
     /**
-     * The §13.5/§16.3 landing rule: seek to {@code (tid, index)}, then position on the nearest LINE
-     * AT/BEFORE it (the record belongs to that line); fall FORWARD only if no LINE precedes it.
+     * The §13.5/§16.3/§17.2 landing rule: seek to {@code (tid, index)}, then position on the
+     * nearest EXECUTION record (the §17.1 set — LINE/METHOD_ENTER/METHOD_EXIT) AT/BEFORE it (the
+     * record belongs to that execution position); fall FORWARD only if no exec record precedes.
      */
-    private void landOnNearestLineAtOrBefore(final int tid, final long index) {
+    private void landOnNearestExecAtOrBefore(final int tid, final long index) {
         engine.seek(tid, index);
-        // When the target record is itself a LINE, seek already put the cursor exactly on it —
-        // stepping would move OFF it (reverseStep from a LINE goes to the previous line, the
-        // §16.3 off-by-one). Only a non-LINE target needs walking back to the LINE it belongs
-        // to (falling forward only when none precedes).
-        if (rec(tid, index).type() == Format.LINE) {
+        // When the target record is itself an exec record, seek already put the cursor exactly
+        // on it — stepping would move OFF it (reverseStep from it goes to the previous exec
+        // record, the §16.3 off-by-one). Only a non-exec target needs walking back to the exec
+        // record it belongs to (falling forward only when none precedes).
+        if (ExecRecords.isExec(rec(tid, index).type())) {
             return;
         }
         if (!engine.reverseStep().moved()) {
@@ -2168,9 +2353,10 @@ public final class ViewerApp {
     }
 
     /**
-     * §16.3 Enter: resolve the typed seq via {@link Engine#findSeq}. If found, close the modal and
-     * land on the nearest LINE at/before it (one history entry); if not found, keep the modal open
-     * with a {@code no record with seq N} error. An empty/overflowing buffer is a no-op.
+     * §16.3 Enter: resolve the typed seq via {@link Engine#findSeq}. If found, close the modal
+     * and land on the nearest execution record at/before it (§17.2, one history entry); if not
+     * found, keep the modal open with a {@code no record with seq N} error. An
+     * empty/overflowing buffer is a no-op.
      */
     private void submitRecordJump() {
         OptionalLong parsed = recordJump.parse();
@@ -2184,7 +2370,7 @@ public final class ViewerApp {
             return;
         }
         recordJump = null;
-        landOnNearestLineAtOrBefore(loc.tid(), loc.index());
+        landOnNearestExecAtOrBefore(loc.tid(), loc.index());
         afterMove();
         appendHistory();
         status = "jumped to seq " + seq + " (t" + loc.tid() + ")";
@@ -2283,37 +2469,247 @@ public final class ViewerApp {
         }
     }
 
-    private void openFile() {
-        String input = dialog.query.toString();
-        dialog = null;
-        OpenFileTarget.Target target = OpenFileTarget.parse(input);
-        if (target == null) {
-            status = "open file: nothing to open";
-            return;
+    // ---- open-file browser (§17.7) ----
+
+    /**
+     * Opens the {@code F} open-file browser. The file index (a {@link FileTree} over the
+     * source roots) is walked once, lazily, on the first open; the dialog state — filter,
+     * selection, scroll, per-directory expansion — is persistent like the {@code /} dialog
+     * (§15.5), so reopening restores it exactly.
+     */
+    private void openFileDialog() {
+        if (fileDialog == null) {
+            FileTree tree = FileTree.build(sourcePath.roots());
+            fileDialog = new FileDialog(tree);
+            tree.setFilter(fileDialog.query.toString());
         }
-        Optional<Path> resolved = target.path()
-                ? resolvePathTarget(target.rawPath())
-                : sourcePath.resolveClass(target.classBinary(), target.fileName());
-        if (resolved.isEmpty()) {
-            status = "file not found: " + input;
-            return;
-        }
-        Path file = resolved.get();
-        Optional<List<String>> lines = sourcePath.linesOfFile(file);
-        if (lines.isEmpty()) {
-            status = "cannot read: " + file;
-            return;
-        }
-        enterBrowse(file, lines.get(), target.line());
+        fileDialogOpen = true;
     }
 
-    /** Resolves a {@code .java} path target (§11.8): absolute first, then relative to each root. */
-    private Optional<Path> resolvePathTarget(final String raw) {
-        Path p = Path.of(raw);
-        if (p.isAbsolute() && sourcePath.linesOfFile(p).isPresent()) {
-            return Optional.of(p);
+    /**
+     * One key while the {@code F} browser is open — it consumes all keys (Ctrl-C still the
+     * emergency quit); Esc closes from either §15.2 focus, keeping the state for reopen.
+     */
+    private void handleFileDialog(final KeyStroke k) {
+        if (isCtrlC(k)) {
+            running = false;
+            return;
         }
-        return sourcePath.resolveClass(null, raw);
+        if (k.getKeyType() == KeyType.Escape) {
+            fileDialogOpen = false; // §17.7: state persists across close/reopen
+            return;
+        }
+        if (fileDialog.focus == DialogFocus.QUERY) {
+            handleFileQueryKey(k);
+        } else {
+            handleFileListKey(k);
+        }
+    }
+
+    /**
+     * QUERY-focus keys of the {@code F} browser — the §15.2 model exactly: printables edit the
+     * regex filter (recomputed per keystroke), Backspace deletes, Ctrl-Backspace/Ctrl-U/Ctrl-W
+     * clear, and ↑/↓ hand the focus to the tree list (when it has rows).
+     */
+    private void handleFileQueryKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
+            if (fileDialog.query.length() > 0) {
+                fileDialog.query.setLength(0);
+                applyFileFilter();
+            }
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (fileDialog.query.length() > 0) {
+                fileDialog.query.deleteCharAt(fileDialog.query.length() - 1);
+                applyFileFilter();
+            }
+            return;
+        }
+        if (t == KeyType.ArrowUp || t == KeyType.ArrowDown) {
+            if (!fileDialog.tree.rows().isEmpty()) {
+                // §15.2: the first arrow only ENTERS the list; the selection stays put.
+                fileDialog.focus = DialogFocus.LIST;
+            }
+            return;
+        }
+        if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= ' ') {
+                fileDialog.query.append(ch.charValue());
+                applyFileFilter();
+            }
+        }
+    }
+
+    /**
+     * Applies the edited {@code file:} regex to the tree (per keystroke, §17.7) and resets
+     * selection/scroll (§13.1). Expansion state is deliberately untouched — it is remembered
+     * across filter changes.
+     */
+    private void applyFileFilter() {
+        fileDialog.tree.setFilter(fileDialog.query.toString());
+        fileDialog.sel = 0;
+        fileDialog.scroll = 0;
+    }
+
+    /**
+     * LIST-focus keys of the {@code F} browser (§15.2/§17.7): ↑/↓ move, Ctrl-F/Ctrl-B and
+     * PgDn/PgUp page, {@code g}/{@code G} jump to the ends, →/↵ expand a directory (↵ on a
+     * FILE opens it in browse mode and closes the dialog), ← collapses (or moves to the
+     * parent row), {@code /} returns to the query line; other printables are ignored.
+     */
+    private void handleFileListKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        List<FileTree.Row> rows = fileDialog.tree.rows();
+        int last = Math.max(0, rows.size() - 1);
+        int page = Math.max(1, fileDialog.listViewH - 1);
+        if (!ctrl && isChar(k, '/')) {
+            fileDialog.focus = DialogFocus.QUERY;
+            return;
+        }
+        if (t == KeyType.ArrowUp) {
+            fileDialog.sel = Math.max(0, fileDialog.sel - 1);
+            return;
+        }
+        if (t == KeyType.ArrowDown) {
+            fileDialog.sel = Math.min(last, fileDialog.sel + 1);
+            return;
+        }
+        if (t == KeyType.PageUp || (ctrl && isChar(k, 'b'))) {
+            fileDialog.sel = Math.max(0, fileDialog.sel - page);
+            return;
+        }
+        if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
+            fileDialog.sel = Math.min(last, fileDialog.sel + page);
+            return;
+        }
+        if (!ctrl && isChar(k, 'g')) {
+            fileDialog.sel = 0;
+            return;
+        }
+        if (!ctrl && isChar(k, 'G')) {
+            fileDialog.sel = last;
+            return;
+        }
+        if (rows.isEmpty()) {
+            return;
+        }
+        FileTree.Row row = rows.get(clamp(fileDialog.sel, 0, last));
+        if (t == KeyType.ArrowRight) {
+            expandOrDescendFileRow(row, rows);
+        } else if (t == KeyType.Enter) {
+            if (row.directory()) {
+                expandOrDescendFileRow(row, rows);
+            } else {
+                openFileRow(row);
+            }
+        } else if (t == KeyType.ArrowLeft) {
+            collapseOrParentFileRow(row, rows);
+        }
+    }
+
+    /** →/↵ on a directory row: expand it, or step onto its first child when already open. */
+    private void expandOrDescendFileRow(final FileTree.Row row, final List<FileTree.Row> rows) {
+        if (!row.directory()) {
+            return;
+        }
+        if (!row.expanded()) {
+            fileDialog.tree.expand(row.path());
+        } else if (fileDialog.sel + 1 < rows.size()) {
+            fileDialog.sel++; // a visible expanded dir always has a visible first child
+        }
+    }
+
+    /** ← on a row: collapse an expanded directory, else move the selection to its parent row. */
+    private void collapseOrParentFileRow(final FileTree.Row row, final List<FileTree.Row> rows) {
+        if (row.directory() && row.expanded()) {
+            fileDialog.tree.collapse(row.path());
+            return;
+        }
+        for (int i = fileDialog.sel - 1; i >= 0; i--) {
+            if (rows.get(i).depth() < row.depth()) {
+                fileDialog.sel = i;
+                return;
+            }
+        }
+    }
+
+    /** ↵ on a file row: open it in browse mode (§11.8 path) and close the dialog (§17.7). */
+    private void openFileRow(final FileTree.Row row) {
+        Optional<List<String>> lines = sourcePath.linesOfFile(row.path());
+        if (lines.isEmpty()) {
+            status = "cannot read: " + row.path();
+            return;
+        }
+        fileDialogOpen = false;
+        enterBrowse(row.path(), lines.get(), -1);
+    }
+
+    /**
+     * Draws the §17.7 {@code Open file [F]} browser: the {@code file:} regex line (terminal
+     * cursor on it in QUERY focus), an {@code invalid regex} note when the filter does not
+     * compile, the flattened directory tree (▸/▾ directories, {@code .java} leaves, §13.1
+     * edge-only scrolling) and a focus-sensitive hint row.
+     */
+    private void drawFileDialog(final TextGraphics g, final int cols, final int rows) {
+        int w = clamp(cols - 6, 24, 74);
+        int h = clamp(rows - 6, 8, 20);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), "Open file [F]", Palette.DIALOG_BG, Palette.FOCUS, true);
+
+        int ix = x + 1;
+        int iy = y + 1;
+        int iw = w - 2;
+        String prompt = "file: ";
+        put(g, ix, iy, clipPad(prompt + fileDialog.query, iw), Palette.FG, Palette.DIALOG_BG, false);
+        if (fileDialog.focus == DialogFocus.QUERY) {
+            cursorPos = new TerminalPosition(
+                    Math.min(x + w - 2, ix + prompt.length() + fileDialog.query.length()), iy);
+        }
+        if (!fileDialog.tree.filterValid()) {
+            put(g, ix, iy + 1, clip("invalid regex", iw), Palette.DIM, Palette.DIALOG_BG, false);
+        }
+
+        int hintRow = y + h - 2;
+        String hint = fileDialog.focus == DialogFocus.QUERY
+                ? "type to filter file names (regex)  ↑↓ tree  ^U clear  Esc close"
+                : "↑↓ move  →/↵ expand  ↵ open file  ← collapse  ^F/^B pg  g/G  / query  Esc";
+        put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
+
+        int listTop = iy + 2;
+        int listH = hintRow - listTop;
+        fileDialog.listViewH = Math.max(1, listH);
+        List<FileTree.Row> rows2 = fileDialog.tree.rows();
+        if (rows2.isEmpty()) {
+            String empty = !fileDialog.tree.filterValid() || fileDialog.query.length() > 0
+                    ? "(no matches)"
+                    : "(no .java files under the source roots)";
+            put(g, ix, listTop, clip(empty, iw), Palette.DIM, Palette.DIALOG_BG, false);
+            return;
+        }
+        fileDialog.sel = clamp(fileDialog.sel, 0, rows2.size() - 1);
+        fileDialog.scroll = ScrollMath.adjustScroll(fileDialog.scroll, fileDialog.sel, listH, rows2.size());
+        for (int r = 0; r < listH; r++) {
+            int idx = fileDialog.scroll + r;
+            if (idx >= rows2.size()) {
+                break;
+            }
+            FileTree.Row row = rows2.get(idx);
+            String glyph = row.directory() ? (row.expanded() ? "▾ " : "▸ ") : "  ";
+            String text = "  ".repeat(row.depth()) + glyph + row.name();
+            boolean s = idx == fileDialog.sel;
+            put(g, ix, listTop + r, clipPad(text, iw),
+                    s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+        }
     }
 
     private void enterBrowse(final Path file, final List<String> lines, final int line) {
@@ -2331,8 +2727,10 @@ public final class ViewerApp {
     }
 
     /**
-     * Positions the cursor on the nearest LINE at/after {@code targetSeq} in thread {@code tid} by
-     * stepping (used by the object-usage jump). Capped so a huge gap cannot hang the UI.
+     * Positions the cursor on the nearest execution record (§17.1 set) at/after
+     * {@code targetSeq} in thread {@code tid} by stepping (used by the {@code .} object-usage
+     * jump — §17.2): {@code selectThread} and every step land on exec records, so the final
+     * landing is one by construction. Capped so a huge gap cannot hang the UI.
      */
     private void seekToSeq(final int tid, final long targetSeq) {
         if (engine.currentTid() != tid) {
@@ -2366,6 +2764,41 @@ public final class ViewerApp {
             afterMove();
             appendHistory();
         }
+    }
+
+    /**
+     * Runs a step/run/exit-frame command honouring the frame selection (§17.5): while a
+     * non-innermost RECORDED frame is selected, the cursor is first seeked to that frame's
+     * as-of record ({@link Engine#frameAsOf}) and the command applies from there — the cursor
+     * genuinely moves. The combined action flows through the normal {@link #doStep} append,
+     * so history gets exactly ONE entry, recording the FINAL landing; a seek that moved makes
+     * the whole action count as moved even when the follow-up step could not go further (the
+     * previous position stays reachable from the Records window).
+     */
+    private void doStepFromSelected(final Supplier<StepResult> step) {
+        boolean seeked = seekToSelectedFrameAsOf();
+        StepResult r = step.get();
+        if (seeked && !r.moved()) {
+            r = new StepResult(true, r.message());
+        }
+        doStep(r);
+    }
+
+    /**
+     * §17.5: when the SELECTED frame is a recorded, non-innermost frame, move the cursor to its
+     * as-of record and report {@code true}; otherwise (innermost selected, unrecorded/grey
+     * frame, or nothing to select) leave the cursor alone and report {@code false}.
+     */
+    private boolean seekToSelectedFrameAsOf() {
+        int sf = engine.selectedFrame();
+        if (sf < 0 || sf >= engine.stack().size() - 1) {
+            return false; // innermost (or no frames): today's behaviour
+        }
+        SeqLocation loc = engine.frameAsOf(sf);
+        if (!loc.found()) {
+            return false; // unrecorded frame: stepping stays on the execution cursor
+        }
+        return engine.seek(loc.tid(), loc.index()).moved();
     }
 
     private void afterMove() {

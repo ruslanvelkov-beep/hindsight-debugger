@@ -19,3 +19,9 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
+
+tasks.test {
+    // The self-skipping real-recording integration tests open multi-hundred-MB recordings;
+    // the engine's per-record index arrays need more than Gradle's 512m default.
+    maxHeapSize = "3g"
+}

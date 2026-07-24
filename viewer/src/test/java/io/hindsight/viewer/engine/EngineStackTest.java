@@ -27,6 +27,7 @@ final class EngineStackTest {
     // Record indices in buildCaptureAtStart(), referenced by assertions.
     private static final int IDX_ENTER_MAIN = 3;
     private static final int IDX_LINE10 = 4;
+    private static final int IDX_ENTER_HELPER = 5;
     private static final int IDX_LINE20 = 6;
 
     /**
@@ -128,7 +129,24 @@ final class EngineStackTest {
             assertFalse(e.selectFrame(4));
             assertFalse(e.selectFrame(-1));
 
-            // A cursor move resets the selection to the innermost frame of the merged stack.
+            // §17.5: unrecorded frames have no as-of record; recorded ones do — the outer
+            // recorded frame's is its call-site LINE, the innermost's the cursor itself.
+            assertFalse(e.frameAsOf(0).found());
+            assertFalse(e.frameAsOf(1).found());
+            assertEquals(new SeqLocation(true, 1, IDX_LINE10), e.frameAsOf(2));
+            assertEquals(new SeqLocation(true, 1, IDX_LINE20), e.frameAsOf(3));
+            assertFalse(e.frameAsOf(4).found());
+
+            // A reverse step lands on helper's ENTER first (§17.1): the entered frame is
+            // still on the stack, its line falling back to the method site's line.
+            assertTrue(e.reverseStep().moved());
+            assertEquals(IDX_ENTER_HELPER, e.currentIndex());
+            List<Frame> onEnter = e.stack();
+            assertEquals(4, onEnter.size(), "[Boot, App, main, helper] on helper's ENTER");
+            assertEquals(3, e.selectedFrame());
+            assertEquals(20, onEnter.get(3).currentLine(), "site line: no LINE executed yet");
+
+            // Another reverse step pops back into main; the selection resets to innermost.
             assertTrue(e.reverseStep().moved());
             assertEquals(IDX_LINE10, e.currentIndex());
             List<Frame> shallower = e.stack();
@@ -176,7 +194,10 @@ final class EngineStackTest {
         r.rec(1, Format.METHOD_EXIT, 0, Format.TAG_VOID, 0, siteMain, 0, 0, 0); // idx 7
 
         try (Engine e = Engine.open(r.write())) {
-            // Initial cursor = first LINE (idx 4), after capture 1 but before capture 2.
+            // Initial cursor = the first exec record (main's ENTER at idx 3, §17.1), already
+            // after capture 1; one step reaches the first LINE, still before capture 2.
+            assertEquals(3, e.currentIndex());
+            assertTrue(e.stepInto().moved());
             assertEquals(4, e.currentIndex());
             List<Frame> before = e.stack();
             assertEquals(2, before.size());
@@ -231,6 +252,9 @@ final class EngineStackTest {
         r.rec(1, Format.METHOD_EXIT, 0, Format.TAG_VOID, 0, siteMain, 0, 0, 0); // idx 5
 
         try (Engine e = Engine.open(r.write())) {
+            // Initial cursor = main's ENTER (§17.1); step once onto the LINE.
+            assertEquals(3, e.currentIndex());
+            assertTrue(e.stepInto().moved());
             assertEquals(4, e.currentIndex());
             List<Frame> stack = e.stack();
             assertEquals(3, stack.size(), "whole 2-frame capture + 1 recorded frame");
@@ -307,12 +331,20 @@ final class EngineStackTest {
         r.rec(1, Format.METHOD_EXIT, 0, Format.TAG_VOID, 0, siteMain, 0, 0, 0); // idx 6
 
         try (Engine e = Engine.open(r.write())) {
+            // Initial cursor = main's ENTER (idx 2, §17.1), still before the capture.
+            assertEquals(2, e.currentIndex());
+            List<Frame> atEnter = e.stack();
+            assertEquals(1, atEnter.size(), "no capture at/before the cursor → recorded only");
+            assertTrue(atEnter.get(0).recorded());
+
+            assertTrue(e.stepInto().moved()); // idx 3: the first LINE, still before the capture
             assertEquals(3, e.currentIndex());
             List<Frame> before = e.stack();
             assertEquals(1, before.size(), "no capture at/before the cursor → recorded only");
             assertTrue(before.get(0).recorded());
 
             assertTrue(e.stepInto().moved()); // idx 5, now past the capture
+            assertEquals(5, e.currentIndex());
             List<Frame> after = e.stack();
             assertEquals(2, after.size());
             assertFalse(after.get(0).recorded());

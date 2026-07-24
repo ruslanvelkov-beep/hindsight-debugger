@@ -17,9 +17,12 @@ package io.hindsight.viewer.engine;
  *   <li>{@code parentEnter[e]} — for a {@code METHOD_ENTER} at {@code e}, the enclosing frame's
  *       ENTER index when {@code e} was pushed, or {@code -1} at depth 0.</li>
  * </ul>
- * {@code lineIndices} is the sorted list of {@code LINE} record indices, the search
- * structure that stepping binary-searches over; it is empty when the recording had
- * {@code lines=false}. {@code timeSyncIndices}/{@code timeSyncMillis} let
+ * {@code execIndices} is the sorted list of <em>execution</em>-record indices — the
+ * {@code LINE}/{@code METHOD_ENTER}/{@code METHOD_EXIT} exec set of VIEWER.md §17.1
+ * that all stepping walks; metadata and value records never appear in it.
+ * {@code lineIndices} is the sorted list of {@code LINE} record indices, kept beside
+ * it for the line-oriented commands (run-to-line, exit-frame); it is empty when the
+ * recording had {@code lines=false}. {@code timeSyncIndices}/{@code timeSyncMillis} let
  * {@link #timeAt} answer "wall-clock at record i" from the nearest preceding
  * {@code TIME_SYNC} without a linear scan. {@code stackSnapshotIndices} is the
  * ascending list of {@code STACK_SNAPSHOT} record indices (schema 4, VIEWER.md
@@ -37,6 +40,7 @@ final class ThreadIndex {
     final int[] frameEnter;
     final int[] matchingExit;
     final int[] parentEnter;
+    final long[] execIndices;
     final long[] lineIndices;
     final long[] timeSyncIndices;
     final long[] timeSyncMillis;
@@ -50,6 +54,7 @@ final class ThreadIndex {
             final int[] frameEnter,
             final int[] matchingExit,
             final int[] parentEnter,
+            final long[] execIndices,
             final long[] lineIndices,
             final long[] timeSyncIndices,
             final long[] timeSyncMillis,
@@ -61,6 +66,7 @@ final class ThreadIndex {
         this.frameEnter = frameEnter;
         this.matchingExit = matchingExit;
         this.parentEnter = parentEnter;
+        this.execIndices = execIndices;
         this.lineIndices = lineIndices;
         this.timeSyncIndices = timeSyncIndices;
         this.timeSyncMillis = timeSyncMillis;
@@ -68,7 +74,7 @@ final class ThreadIndex {
         this.threadName = threadName;
     }
 
-    /** Whether this thread carries any {@code LINE} records (else stepping degrades, §2.2). */
+    /** Whether this thread carries any {@code LINE} records (the line-oriented commands need one). */
     boolean hasLines() {
         return lineIndices.length > 0;
     }

@@ -30,21 +30,29 @@ import java.util.TreeMap;
  * as-of that point on the timeline.
  *
  * <p>All heavy analysis happens once at {@link #open}: a bracket-matching pass per
- * thread builds a {@link ThreadIndex} (depths, frame links, line/time search
- * structures, §2.1) and a global object-event index (per-object ordered
+ * thread builds a {@link ThreadIndex} (depths, frame links, exec/line/time search
+ * structures, §2.1/§17.1) and a global object-event index (per-object ordered
  * SNAPSHOT/FIELD_WRITE records plus a static-write index for watches). Navigation
  * and reconstruction are then cheap lookups against those indices. Because the
  * public navigation/reconstruction API is not declared to throw, unexpected
  * {@link IOException} from the lazily-mapped reader is wrapped in
  * {@link UncheckedIOException}; a well-formed recording never triggers it.
  *
+ * <p>The cursor rests only on <em>execution</em> records — the §17.1 exec set of
+ * {@code LINE}, {@code METHOD_ENTER} and {@code METHOD_EXIT} — and every stepping
+ * command lands on one; metadata records (first-seen, snapshots, thread-start,
+ * time-sync, stack captures) and value records (ARG, LOCAL_WRITE, FIELD_WRITE,
+ * BRANCH) are never step landings. On a {@code METHOD_ENTER} the entered frame is
+ * on the stack with its seeded arguments as locals; on a {@code METHOD_EXIT} the
+ * exiting frame is still on the stack, reconstructed as of the exit.
+ *
  * <p>The engine has no dependency on the source, highlight or TUI packages and no
  * terminal imports, so it is fully unit-testable against synthetic recordings.
  */
 public final class Engine implements AutoCloseable {
 
-    static final String NO_NEXT_LINE = "no next line in this thread";
-    static final String NO_EARLIER_LINE = "no earlier line in this thread";
+    static final String NO_NEXT_STEP = "no next step in this thread";
+    static final String NO_EARLIER_STEP = "no earlier step in this thread";
     static final String NO_NEXT_APPEARANCE = "no next appearance of this line.";
     static final String NO_PREV_APPEARANCE = "no previous appearance of this line.";
     static final String ALREADY_HERE = "already here";
@@ -61,6 +69,28 @@ public final class Engine implements AutoCloseable {
 
     /** A stack frame plus the record index whose state its locals reflect (§2.4). */
     private record FrameCtx(Frame frame, long asOfIndex) {}
+
+    /**
+     * Minimal growable {@code long[]} builder for index construction. A thread can hold
+     * tens of millions of records (ThreadIndex's compactness contract), so the exec/line/
+     * time-sync positions must accumulate unboxed — an {@code ArrayList<Long>} at that
+     * scale costs ~4× the memory and overflows a default test heap.
+     */
+    private static final class LongList {
+        private long[] a = new long[16];
+        private int n;
+
+        void add(final long v) {
+            if (n == a.length) {
+                a = Arrays.copyOf(a, a.length * 2);
+            }
+            a[n++] = v;
+        }
+
+        long[] toArray() {
+            return Arrays.copyOf(a, n);
+        }
+    }
 
     /** Reconstructed object state as-of a seq: either named fields or an unfolded container. */
     private static final class Reconstructed {
@@ -171,10 +201,11 @@ public final class Engine implements AutoCloseable {
         int[] parentEnter = new int[count];
         int[] estack = new int[16];
         int top = -1;
-        List<Long> lineList = new ArrayList<>();
-        List<Long> tsIdx = new ArrayList<>();
-        List<Long> tsMs = new ArrayList<>();
-        List<Long> capIdx = new ArrayList<>();
+        LongList execList = new LongList();
+        LongList lineList = new LongList();
+        LongList tsIdx = new LongList();
+        LongList tsMs = new LongList();
+        LongList capIdx = new LongList();
         String threadName = null;
 
         for (int i = 0; i < count; i++) {
@@ -191,6 +222,7 @@ public final class Engine implements AutoCloseable {
                     frameEnter[i] = i;
                     matchingExit[i] = count - 1;
                     parentEnter[i] = parent;
+                    execList.add((long) i);
                 }
                 case Format.METHOD_EXIT -> {
                     if (top >= 0) {
@@ -203,11 +235,13 @@ public final class Engine implements AutoCloseable {
                         depth[i] = 0;
                         frameEnter[i] = -1;
                     }
+                    execList.add((long) i);
                 }
                 default -> {
                     depth[i] = top + 1;
                     frameEnter[i] = top >= 0 ? estack[top] : -1;
                     if (type == Format.LINE) {
+                        execList.add((long) i);
                         lineList.add((long) i);
                     } else if (type == Format.THREAD_START && threadName == null) {
                         threadName = recording.symbolText(r.location());
@@ -223,7 +257,8 @@ public final class Engine implements AutoCloseable {
         }
 
         return new ThreadIndex(tid, count, depth, frameEnter, matchingExit, parentEnter,
-                toLongArray(lineList), toLongArray(tsIdx), toLongArray(tsMs), toLongArray(capIdx), threadName);
+                execList.toArray(), lineList.toArray(), tsIdx.toArray(), tsMs.toArray(),
+                capIdx.toArray(), threadName);
     }
 
     private void indexObjectEvent(final Rec r, final int tid, final int index) {
@@ -283,18 +318,18 @@ public final class Engine implements AutoCloseable {
         long bestIndex = 0;
         for (Map.Entry<Integer, ThreadIndex> e : indices.entrySet()) {
             ThreadIndex ti = e.getValue();
-            if (ti.hasLines()) {
-                long firstLine = ti.lineIndices[0];
-                long seq = recording.recordAt(ti.tid, firstLine).seq();
+            if (ti.execIndices.length > 0) {
+                long firstExec = ti.execIndices[0];
+                long seq = recording.recordAt(ti.tid, firstExec).seq();
                 if (seq < bestSeq) {
                     bestSeq = seq;
                     bestTid = ti.tid;
-                    bestIndex = firstLine;
+                    bestIndex = firstExec;
                 }
             }
         }
         if (bestTid < 0) {
-            // No LINE records anywhere: fall back to the lowest tid with any records (§2.2).
+            // No exec records anywhere: fall back to the lowest tid with any records (§2.2).
             for (int tid : recording.threadIds()) {
                 if (recording.recordCount(tid) > 0) {
                     bestTid = tid;
@@ -309,14 +344,6 @@ public final class Engine implements AutoCloseable {
         cursorTid = bestTid;
         cursorIndex = bestIndex;
         recompute();
-    }
-
-    private static long[] toLongArray(final List<Long> list) {
-        long[] out = new long[list.size()];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = list.get(i);
-        }
-        return out;
     }
 
     // ---- cursor accessors ----
@@ -347,64 +374,77 @@ public final class Engine implements AutoCloseable {
         return ci >= 0 && ci < ti.depth.length ? ti.depth[ci] : 0;
     }
 
-    // ---- navigation (§2.6) ----
+    // ---- navigation (§2.6, exec-record stepping §17.1) ----
 
-    /** Step to the next LINE record in this thread, descending into callees (F7). */
+    /**
+     * Step to the next execution record — {@code LINE}, {@code METHOD_ENTER} or
+     * {@code METHOD_EXIT} — in this thread, any frame (F7, §17.1). Descends into callees:
+     * from a call-site line the next exec record is the callee's ENTER.
+     */
     public StepResult stepInto() {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
-            return degradedForward();
+        int start = execForwardStart(ti);
+        if (start < ti.execIndices.length) {
+            return moveTo(cursorTid, ti.execIndices[start]);
         }
-        int start = forwardStart(ti);
-        if (start < ti.lineIndices.length) {
-            return moveTo(cursorTid, ti.lineIndices[start]);
-        }
-        return new StepResult(false, NO_NEXT_LINE);
+        return new StepResult(false, NO_NEXT_STEP);
     }
 
-    /** Step to the next same-or-shallower LINE record, skipping callee lines (F8). */
+    /**
+     * Step to the next execution record belonging to the current frame or an ancestor of it
+     * (F8, §17.1): the next exec record at the current frame's depth or shallower — the
+     * current/outer frames' LINEs, the current/ancestor frame's EXIT, and (past the current
+     * frame's end) a SIBLING frame's ENTER, so the walk flows into the thread's next
+     * top-level invocation instead of dead-ending at every frame boundary. Everything inside
+     * callees (strictly deeper) is skipped; the current frame's own ENTER is never a landing.
+     */
     public StepResult stepOver() {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
-            return degradedForward();
-        }
-        int d = depthAtCursor();
-        for (int t = forwardStart(ti); t < ti.lineIndices.length; t++) {
-            long li = ti.lineIndices[t];
-            if (ti.depth[(int) li] <= d) {
-                return moveTo(cursorTid, li);
+        int own = ownFrameEnter(ti);
+        int d = own >= 0 ? ti.depth[own] : 0;
+        for (int t = execForwardStart(ti); t < ti.execIndices.length; t++) {
+            long j = ti.execIndices[t];
+            if (ti.depth[(int) j] <= d && j != own) {
+                return moveTo(cursorTid, j);
             }
         }
-        return new StepResult(false, NO_NEXT_LINE);
+        return new StepResult(false, NO_NEXT_STEP);
     }
 
-    /** Step to the previous LINE record in this thread, any depth (Shift-F7). */
+    /** Step to the previous execution record in this thread, any frame (Shift-F7, §17.1). */
     public StepResult reverseStep() {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
-            return degradedBackward();
-        }
-        int start = backwardStart(ti);
+        int start = execBackwardStart(ti);
         if (start >= 0) {
-            return moveTo(cursorTid, ti.lineIndices[start]);
+            return moveTo(cursorTid, ti.execIndices[start]);
         }
-        return new StepResult(false, NO_EARLIER_LINE);
+        return new StepResult(false, NO_EARLIER_STEP);
     }
 
-    /** Step to the previous same-or-shallower LINE record (Shift-F8). */
+    /**
+     * Step to the previous exec record at the current frame's depth or shallower (Shift-F8,
+     * §17.1) — the mirror of {@link #stepOver}: earlier completed callees are skipped whole,
+     * the current frame's own ENTER is skipped (from a frame's first line the landing is the
+     * caller's call-site line), and before the frame began the landing is an earlier sibling
+     * frame's EXIT.
+     */
     public StepResult reverseStepOver() {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
-            return degradedBackward();
-        }
-        int d = depthAtCursor();
-        for (int t = backwardStart(ti); t >= 0; t--) {
-            long li = ti.lineIndices[t];
-            if (ti.depth[(int) li] <= d) {
-                return moveTo(cursorTid, li);
+        int own = ownFrameEnter(ti);
+        int d = own >= 0 ? ti.depth[own] : 0;
+        for (int t = execBackwardStart(ti); t >= 0; t--) {
+            long j = ti.execIndices[t];
+            if (ti.depth[(int) j] <= d && j != own) {
+                return moveTo(cursorTid, j);
             }
         }
-        return new StepResult(false, NO_EARLIER_LINE);
+        return new StepResult(false, NO_EARLIER_STEP);
+    }
+
+    /** The cursor's frame ENTER index, or {@code -1} outside any frame. */
+    private int ownFrameEnter(final ThreadIndex ti) {
+        int ci = (int) cursorIndex;
+        return ci >= 0 && ci < ti.frameEnter.length ? ti.frameEnter[ci] : -1;
     }
 
     /**
@@ -438,9 +478,10 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
-     * Move the cursor into another thread — onto the LINE record with the greatest
-     * {@code seq ≤} the current seq, else that thread's first LINE record, keeping the
-     * timelines roughly aligned when switching (§2.6).
+     * Move the cursor into another thread — onto the execution record (§17.1 set) with the
+     * greatest {@code seq ≤} the current seq, else that thread's first exec record, keeping
+     * the timelines roughly aligned when switching (§2.6). A thread with no exec records at
+     * all (metadata only) positions on its first record.
      */
     public StepResult selectThread(final int tid) {
         ThreadIndex ti = indices.get(tid);
@@ -450,16 +491,16 @@ public final class Engine implements AutoCloseable {
         if (ti.count == 0) {
             return new StepResult(false, "thread t" + tid + " has no records");
         }
-        if (!ti.hasLines()) {
+        if (ti.execIndices.length == 0) {
             return moveTo(tid, 0);
         }
         long targetSeq = currentSeq();
         int lo = 0;
-        int hi = ti.lineIndices.length - 1;
+        int hi = ti.execIndices.length - 1;
         int ans = -1;
         while (lo <= hi) {
             int mid = (lo + hi) >>> 1;
-            long seqMid = rec(tid, ti.lineIndices[mid]).seq();
+            long seqMid = rec(tid, ti.execIndices[mid]).seq();
             if (seqMid <= targetSeq) {
                 ans = mid;
                 lo = mid + 1;
@@ -467,18 +508,18 @@ public final class Engine implements AutoCloseable {
                 hi = mid - 1;
             }
         }
-        long chosen = ans >= 0 ? ti.lineIndices[ans] : ti.lineIndices[0];
+        long chosen = ans >= 0 ? ti.execIndices[ans] : ti.execIndices[0];
         return moveTo(tid, chosen);
     }
 
     /**
-     * Jump the cursor straight to the {@code LINE} record at {@code (tid, index)} — the absolute
-     * move behind history-trail entries and search-result selections (§11.5/§11.7). Callers pass
-     * indices that are already {@code LINE} records; on a move the selected frame resets to
-     * innermost, exactly like the stepping methods.
+     * Jump the cursor straight to the record at {@code (tid, index)} — the absolute move behind
+     * history-trail entries and search-result selections (§11.5/§11.7). Callers pass indices
+     * that are already execution records (the §17.1 set — the TUI lands on one by seek+step);
+     * on a move the selected frame resets to innermost, exactly like the stepping methods.
      *
      * @param tid the thread to move into
-     * @param index the record index (a {@code LINE} record) to land on
+     * @param index the record index (an execution record) to land on
      * @return {@link StepResult#moved()} {@code false} with {@link #ALREADY_HERE} when the cursor
      *     is already at {@code (tid, index)}; otherwise a plain moved result
      */
@@ -598,28 +639,16 @@ public final class Engine implements AutoCloseable {
         return true;
     }
 
-    private int forwardStart(final ThreadIndex ti) {
-        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+    /** Index into {@code execIndices} of the first exec record strictly after the cursor. */
+    private int execForwardStart(final ThreadIndex ti) {
+        int idx = Arrays.binarySearch(ti.execIndices, cursorIndex);
         return idx >= 0 ? idx + 1 : -idx - 1;
     }
 
-    private int backwardStart(final ThreadIndex ti) {
-        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+    /** Index into {@code execIndices} of the last exec record strictly before the cursor, or -1. */
+    private int execBackwardStart(final ThreadIndex ti) {
+        int idx = Arrays.binarySearch(ti.execIndices, cursorIndex);
         return idx >= 0 ? idx - 1 : -idx - 2;
-    }
-
-    private StepResult degradedForward() {
-        if (cursorIndex + 1 < index(cursorTid).count) {
-            return moveTo(cursorTid, cursorIndex + 1);
-        }
-        return new StepResult(false, "no next record in this thread");
-    }
-
-    private StepResult degradedBackward() {
-        if (cursorIndex > 0) {
-            return moveTo(cursorTid, cursorIndex - 1);
-        }
-        return new StepResult(false, "no earlier record in this thread");
     }
 
     private StepResult moveTo(final int tid, final long idx) {
@@ -644,6 +673,23 @@ public final class Engine implements AutoCloseable {
     /** Currently selected frame index; reset to innermost on every cursor move. */
     public int selectedFrame() {
         return selectedFrame;
+    }
+
+    /**
+     * The record the frame's shown state is reconstructed as-of (§17.5): the frame's last
+     * execution record at/before the cursor — the cursor itself for the innermost frame, the
+     * call-site LINE for an outer frame, or the frame's own ENTER when it has executed no
+     * line yet. {@code found=false} for an out-of-range index or an unrecorded (capture-only)
+     * frame, whose shown state is not reconstructed from records at all.
+     *
+     * @param frameIndex a stack index, {@code 0} = outermost .. {@code stack().size()-1} = innermost
+     */
+    public SeqLocation frameAsOf(final int frameIndex) {
+        int unrecorded = publicFrames.size() - ctx.size();
+        if (frameIndex < unrecorded || frameIndex >= publicFrames.size()) {
+            return new SeqLocation(false, 0, 0L);
+        }
+        return new SeqLocation(true, cursorTid, ctx.get(frameIndex - unrecorded).asOfIndex());
     }
 
     private void recompute() {
@@ -677,21 +723,23 @@ public final class Engine implements AutoCloseable {
             int currentLine;
             long asOf;
             if (k == m - 1) {
-                currentLine = cursorLine >= 0 ? cursorLine : (s != null ? s.line() : 0);
+                // Innermost frame: the cursor line itself; on an ENTER/EXIT cursor (§17.1)
+                // the last LINE the frame executed at/before the cursor, else the site line
+                // (an ENTER before any line, or a line-less frame).
+                if (cursorLine >= 0) {
+                    currentLine = cursorLine;
+                } else {
+                    long lastLine = lastFrameLineAtOrBefore(ti, enterK, ci);
+                    currentLine = lastLine >= 0 ? lineNumberAt(cursorTid, lastLine)
+                            : (s != null ? s.line() : 0);
+                }
                 asOf = ci;
             } else {
                 int childEnter = enters.get(k + 1);
-                int found = -1;
-                for (int j = childEnter - 1; j >= enterK; j--) {
-                    Rec rj = rec(cursorTid, j);
-                    if (rj.type() == Format.LINE && ti.frameEnter[j] == enterK) {
-                        found = j;
-                        break;
-                    }
-                }
-                if (found >= 0) {
-                    currentLine = lineNumberAt(cursorTid, found);
-                    asOf = found;
+                long lastLine = lastFrameLineAtOrBefore(ti, enterK, childEnter - 1L);
+                if (lastLine >= 0) {
+                    currentLine = lineNumberAt(cursorTid, lastLine);
+                    asOf = lastLine;
                 } else {
                     currentLine = s != null ? s.line() : 0;
                     asOf = enterK;
@@ -708,6 +756,31 @@ public final class Engine implements AutoCloseable {
         }
         this.publicFrames = List.copyOf(merged);
         this.selectedFrame = Math.max(0, merged.size() - 1);
+    }
+
+    /**
+     * The greatest {@code LINE} record index {@code ≤ bound} belonging to the frame entered at
+     * {@code enterK} ({@code frameEnter == enterK}), or {@code -1} when that frame has executed
+     * no line by {@code bound}. Walks the sorted {@code lineIndices} backward from the bound,
+     * stopping once indices fall before the frame's ENTER — every record of a frame follows its
+     * ENTER, so nothing earlier can belong to it (lines of nested callees in between belong to
+     * their own enters and are skipped by the {@code frameEnter} test).
+     */
+    private long lastFrameLineAtOrBefore(final ThreadIndex ti, final int enterK, final long bound) {
+        int t = Arrays.binarySearch(ti.lineIndices, bound);
+        if (t < 0) {
+            t = -t - 2;
+        }
+        for (; t >= 0; t--) {
+            long j = ti.lineIndices[t];
+            if (j < enterK) {
+                return -1;
+            }
+            if (ti.frameEnter[(int) j] == enterK) {
+                return j;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -812,8 +885,12 @@ public final class Engine implements AutoCloseable {
             bySlot.put(0, new Local(0, "this", desc, v));
         }
 
-        // 1b. Parameter slots from ARG records that immediately follow the ENTER.
+        // 1b. Parameter slots from ARG records that immediately follow the ENTER. Names come
+        // from the site's §5 `#p` slot→name map when the recording carries one (§17.4,
+        // recorder ≥ v1.7); the argN fallback keeps older recordings readable.
         List<String> params = paramDescriptors(frame.descriptor());
+        Site methodSite = recording.site(frame.methodSiteId());
+        Map<Integer, String> paramNames = methodSite != null ? methodSite.paramNames() : Map.of();
         int base = frame.isStatic() ? 0 : 1;
         int[] argSlot = new int[params.size()];
         int acc = base;
@@ -830,7 +907,8 @@ public final class Engine implements AutoCloseable {
             int slot = argIdx < argSlot.length ? argSlot[argIdx] : base + argIdx;
             String d = argIdx < params.size() ? params.get(argIdx) : "";
             Value v = toValue(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated());
-            bySlot.put(slot, new Local(slot, "arg" + argIdx, d, v));
+            String name = paramNames.getOrDefault(slot, "arg" + argIdx);
+            bySlot.put(slot, new Local(slot, name, d, v));
         }
 
         // 2. LOCAL_WRITE records in (enter, p] belonging to this frame, latest wins.
@@ -906,10 +984,22 @@ public final class Engine implements AutoCloseable {
      * Materialise a node's children as-of the current seq (§2.5): base is the object's latest
      * snapshot with {@code seq ≤ currentSeq}, over which field writes in {@code (snapshot.seq,
      * currentSeq]} are applied; containers unfold to elements/pairs with a {@code …+N more}
-     * sentinel when truncated at capture. {@code ancestorIds} carries the object ids already on
-     * the path so a back-reference renders as a {@code ↺ (cycle)} leaf instead of recursing.
+     * sentinel when truncated at capture. A MAP unfolds to entry nodes labelled
+     * {@code <key> -> <value>}, each expandable into exactly the two children
+     * {@code key = <key>} and {@code value = <value>} carrying their own values (§17.3), so a
+     * Ref key or value is independently explorable from there. {@code ancestorIds} carries the
+     * object ids already on the path so a back-reference renders as a {@code ↺ (cycle)} leaf
+     * instead of recursing.
      */
     public List<ObjectNode> children(final ObjectNode node, final Set<Long> ancestorIds) {
+        if (node.isMapEntry()) {
+            // §17.3: an entry expands to its key/value pair; the entry itself carries no
+            // object id, so the ancestor path passes through unchanged (the cycle guard
+            // applies to the Ref key/value children exactly as to any other child).
+            return List.of(
+                    childNode("key = ", node.entryKey(), ancestorIds),
+                    childNode("value = ", node.entryValue(), ancestorIds));
+        }
         if (!(node.value() instanceof Value.Ref ref) || ref.objectId() == 0) {
             return List.of();
         }
@@ -928,7 +1018,9 @@ public final class Engine implements AutoCloseable {
         } else if (rc.form == Format.FORM_MAP) {
             int pairs = rc.keys.size();
             for (int i = 0; i < pairs; i++) {
-                out.add(childNode(rc.keys.get(i).display() + " -> ", rc.values.get(i), path));
+                Value k = rc.keys.get(i);
+                Value v = rc.values.get(i);
+                out.add(ObjectNode.mapEntry(k.display() + " -> " + v.display(), k, v));
             }
             if (rc.totalSize > pairs) {
                 out.add(moreLeaf(rc.totalSize - pairs));

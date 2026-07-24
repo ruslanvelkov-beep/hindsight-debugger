@@ -56,7 +56,7 @@ public final class Main {
                     .setUnixTerminalCtrlCBehaviour(UnixLikeTerminal.CtrlCBehaviour.TRAP)
                     .createScreen();
             screen.startScreen();
-            new ViewerApp(screen, engine, recording, sourcePath, parsed.tid()).run();
+            new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid()).run();
         } catch (IOException e) {
             code = 1;
             System.err.println("viewer: " + e.getMessage());

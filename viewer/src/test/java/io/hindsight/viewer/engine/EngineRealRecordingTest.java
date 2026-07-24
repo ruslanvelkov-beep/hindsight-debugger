@@ -22,7 +22,7 @@ import org.junit.jupiter.api.Test;
  * present on this machine (otherwise skipped). It catches real-data edge cases the
  * synthetic tests cannot: it opens the engine, steps 100 times, and asserts that
  * {@code stack()}/{@code locals()}/{@code recordInfo()} never throw and the cursor
- * stays on LINE records the whole time.
+ * stays on execution records (LINE/METHOD_ENTER/METHOD_EXIT, §17.1) the whole time.
  */
 final class EngineRealRecordingTest {
 
@@ -42,7 +42,7 @@ final class EngineRealRecordingTest {
                 Recording probe = Recording.open(REAL)) {
             assertNotNull(e.threads());
             assertEquals(3, e.schemaVersion(), "transfer-11 is a schema-3 recording");
-            assertTrue(cursorIsOnLine(e, probe), "initial cursor should sit on a LINE record");
+            assertTrue(cursorIsOnExec(e, probe), "initial cursor should sit on an exec record");
 
             for (int i = 0; i < 100; i++) {
                 // These must never throw on real data.
@@ -61,9 +61,89 @@ final class EngineRealRecordingTest {
                 if (!res.moved()) {
                     break; // reached the end of the thread within 100 steps
                 }
-                assertTrue(cursorIsOnLine(e, probe),
-                        "stepInto must land on a LINE record (index " + e.currentIndex() + ")");
+                assertTrue(cursorIsOnExec(e, probe),
+                        "stepInto must land on an exec record — LINE/ENTER/EXIT (index "
+                                + e.currentIndex() + ")");
             }
+        }
+    }
+
+    /**
+     * §17.1 on a real schema-4 recording (transfer-12): 100 stepInto landings must all be
+     * members of the exec set — LINE, METHOD_ENTER or METHOD_EXIT, never a metadata or
+     * value record — with stack/locals/recordInfo reconstructable at every landing
+     * (including cursors resting on ENTER/EXIT).
+     */
+    @Test
+    void execSteppingLandsOnlyOnExecRecords() throws IOException {
+        assumeTrue(Files.isDirectory(REAL2), "real recording not present: " + REAL2);
+
+        try (Engine e = Engine.open(REAL2);
+                Recording probe = Recording.open(REAL2)) {
+            assertTrue(cursorIsOnExec(e, probe), "initial cursor should sit on an exec record");
+            int moved = 0;
+            for (int i = 0; i < 100; i++) {
+                if (!e.stepInto().moved()) {
+                    break;
+                }
+                moved++;
+                int type = probe.recordAt(e.currentTid(), e.currentIndex()).type();
+                assertTrue(isExecType(type),
+                        "landing " + i + " must be LINE/ENTER/EXIT, was type " + type
+                                + " at index " + e.currentIndex());
+                assertNotNull(e.stack());
+                assertFalse(e.stack().isEmpty(), "an exec cursor always has a frame");
+                assertNotNull(e.locals(e.selectedFrame()));
+                assertNotNull(e.recordInfo());
+            }
+            assertTrue(moved > 0, "the recording must allow at least one step");
+        }
+    }
+
+    /**
+     * §17.1 in a LINE-less (callsOnly-scope) thread of the real recording: stepping works
+     * for the first time — ENTER/EXIT are the stops. Skipped when every thread of the
+     * recording carries LINE records.
+     */
+    @Test
+    void steppingMovesInLineLessThread() throws IOException {
+        assumeTrue(Files.isDirectory(REAL2), "real recording not present: " + REAL2);
+
+        try (Engine e = Engine.open(REAL2);
+                Recording probe = Recording.open(REAL2)) {
+            int lineLessTid = -1;
+            long firstExec = -1;
+            long execCount = 0;
+            for (int tid : e.threads()) {
+                ThreadIndex ti = e.threadIndex(tid);
+                if (ti.lineIndices.length == 0 && ti.execIndices.length >= 2) {
+                    lineLessTid = tid;
+                    firstExec = ti.execIndices[0];
+                    execCount = ti.execIndices.length;
+                    break;
+                }
+            }
+            assumeTrue(lineLessTid >= 0, "recording has no LINE-less thread with 2+ exec records");
+
+            // Position on the thread's first exec record, then step: the cursor must move
+            // and land on ENTER/EXIT records inside the same thread.
+            e.seek(lineLessTid, firstExec);
+            assertEquals(lineLessTid, e.currentTid());
+            assertEquals(firstExec, e.currentIndex());
+            for (int i = 0; i < Math.min(10, execCount - 1); i++) {
+                StepResult res = e.stepInto();
+                assertTrue(res.moved(), "stepInto must move in a LINE-less thread (step " + i + ")");
+                assertEquals(lineLessTid, e.currentTid());
+                int type = probe.recordAt(e.currentTid(), e.currentIndex()).type();
+                assertTrue(type == Format.METHOD_ENTER || type == Format.METHOD_EXIT,
+                        "landings in a LINE-less thread are ENTER/EXIT, was type " + type);
+            }
+            // Reverse mirrors; the LINE-oriented commands no-op gracefully.
+            assertTrue(e.reverseStep().moved(), "reverseStep must move back");
+            assertEquals(lineLessTid, e.currentTid());
+            assertFalse(e.runToCurrentLine(true).moved(), "runTo is a safe no-op without LINEs");
+            assertFalse(e.exitFrameForward().moved(), "exitFrameForward no-ops without LINEs");
+            assertFalse(e.exitFrameBackward().moved(), "exitFrameBackward no-ops without LINEs");
         }
     }
 
@@ -122,7 +202,7 @@ final class EngineRealRecordingTest {
                 assertTrue(e.seek(startTid, startIndex).moved(), "seek back to the origin moves");
                 assertEquals(startIndex, e.currentIndex());
                 assertEquals(startTid, e.currentTid());
-                assertTrue(cursorIsOnLine(e, probe), "seek lands on a LINE record");
+                assertTrue(cursorIsOnExec(e, probe), "seek lands back on the origin exec record");
             }
 
             // --- exitFrameForward/Backward(): stay on LINE, idempotent at the ends ---
@@ -286,5 +366,14 @@ final class EngineRealRecordingTest {
 
     private static boolean cursorIsOnLine(final Engine e, final Recording probe) throws IOException {
         return probe.recordAt(e.currentTid(), e.currentIndex()).type() == Format.LINE;
+    }
+
+    /** Whether the cursor rests on a §17.1 exec record — LINE, METHOD_ENTER or METHOD_EXIT. */
+    private static boolean cursorIsOnExec(final Engine e, final Recording probe) throws IOException {
+        return isExecType(probe.recordAt(e.currentTid(), e.currentIndex()).type());
+    }
+
+    private static boolean isExecType(final int type) {
+        return type == Format.LINE || type == Format.METHOD_ENTER || type == Format.METHOD_EXIT;
     }
 }
