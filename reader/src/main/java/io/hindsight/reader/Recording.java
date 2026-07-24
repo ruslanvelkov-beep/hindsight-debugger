@@ -233,10 +233,31 @@ public final class Recording implements AutoCloseable {
                 continue;
             }
             try {
+                // §5 desc suffixes: '#' never occurs in a JVM descriptor, so everything from
+                // the first '#' on is suffix tokens — '#s' (static) and '#p<slot>=<name>|...'
+                // (parameter names, recorder ≥ v1.7). Written in that order, parsed in any.
                 String desc = f[6];
-                boolean isStatic = desc.endsWith("#s");
-                if (isStatic) {
-                    desc = desc.substring(0, desc.length() - 2);
+                boolean isStatic = false;
+                Map<Integer, String> paramNames = Map.of();
+                int hash = desc.indexOf('#');
+                if (hash >= 0) {
+                    String tail = desc.substring(hash);
+                    desc = desc.substring(0, hash);
+                    int i = 0;
+                    while (i < tail.length()) { // tail.charAt(i) == '#'
+                        int next = tail.indexOf('#', i + 1);
+                        if (next < 0) {
+                            next = tail.length();
+                        }
+                        String token = tail.substring(i + 1, next);
+                        if ("s".equals(token)) {
+                            isStatic = true;
+                        } else if (token.startsWith("p")) {
+                            paramNames = parseParamNames(token.substring(1));
+                        }
+                        // unknown suffix tokens: skipped (forward compatibility)
+                        i = next;
+                    }
                 }
                 sites.put(
                         Integer.parseInt(f[0]),
@@ -249,11 +270,36 @@ public final class Recording implements AutoCloseable {
                                 Integer.parseInt(f[5]),
                                 desc,
                                 Integer.parseInt(f[7]),
-                                isStatic));
+                                isStatic,
+                                paramNames));
             } catch (NumberFormatException e) {
                 // torn line — skip
             }
         }
+    }
+
+    /**
+     * Parses the body of a §5 {@code #p} suffix ({@code <slot>=<name>[|<slot>=<name>...]})
+     * into slot → name. Malformed entries are skipped, matching the torn-line tolerance of
+     * the surrounding TSV parsing — names are Java identifiers, so no unescaping applies.
+     */
+    private static Map<Integer, String> parseParamNames(final String body) {
+        if (body.isEmpty()) {
+            return Map.of();
+        }
+        Map<Integer, String> out = new HashMap<>();
+        for (String entry : body.split("\\|")) {
+            int eq = entry.indexOf('=');
+            if (eq <= 0 || eq == entry.length() - 1) {
+                continue; // torn entry — tolerated
+            }
+            try {
+                out.put(Integer.parseInt(entry.substring(0, eq)), entry.substring(eq + 1));
+            } catch (NumberFormatException e) {
+                // torn entry — skip
+            }
+        }
+        return out;
     }
 
     private void discoverThreads() throws IOException {

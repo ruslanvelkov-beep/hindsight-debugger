@@ -348,7 +348,8 @@ public final class ThreadWorker {
             emitObjectFirstSeenAt(seq, id, obj);
             if (rt.snapshotFirstSeen && (level <= rt.snapshotDepth || alwaysDump(obj))) {
                 // §7: baseline snapshot at first sight; later field writes evolve it.
-                // Always-dump wrappers and snapshotAlways-matched classes are depth-exempt.
+                // Always-dump wrappers, unfolded containers (recorder ≥ v1.7) and
+                // snapshotAlways-matched classes are depth-exempt.
                 enqueuePendingDump(id, obj, level);
             }
         }
@@ -640,12 +641,17 @@ public final class ThreadWorker {
 
     /**
      * Whether {@code o} is baseline-dumped regardless of its §7 discovery level: the
-     * {@code java.base} wrappers unconditionally, plus any class matching a configured
+     * {@code java.base} wrappers and the {@link #isUnfoldedContainer unfolded containers}
+     * ({@code java.base} maps/collections and all arrays — recorder ≥ v1.7 always-dump
+     * containers, §7) unconditionally, plus any class matching a configured
      * {@code snapshotAlways} prefix (small value carriers like PBJ's {@code OneOf} that appear
-     * arbitrarily deep). Called only on the cold first-sight path.
+     * arbitrarily deep). Container contents drift inside uninstrumented {@code java.base}
+     * code, so a container first sighted beyond {@code snapshotDepth} would otherwise never
+     * be inspectable at all; its dump is the usual bounded unfolding (64-entry cap). Called
+     * only on the cold first-sight path.
      */
     private boolean alwaysDump(Object o) {
-        if (isJavaBaseWrapper(o)) {
+        if (isJavaBaseWrapper(o) || isUnfoldedContainer(o)) {
             return true;
         }
         final String[] prefixes = rt.snapshotAlways;

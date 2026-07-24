@@ -67,6 +67,15 @@ final class SyntheticRecording {
         return site("METHOD", classSym, fileSym, line, methodSym, desc + (isStatic ? "#s" : ""), -1);
     }
 
+    /**
+     * METHOD site whose desc column is written verbatim — for the §5 suffix matrix
+     * ({@code #s}, the recorder ≥ v1.7 {@code #p<slot>=<name>|...}, both, neither).
+     */
+    int methodSiteRawDesc(final int classSym, final int fileSym, final int line, final int methodSym,
+            final String rawDesc) {
+        return site("METHOD", classSym, fileSym, line, methodSym, rawDesc, -1);
+    }
+
     int fieldSite(final int ownerClassSym, final int fileSym, final int line, final int fieldSym,
             final String desc, final boolean isStatic) {
         return site("FIELD", ownerClassSym, fileSym, line, fieldSym, desc + (isStatic ? "#s" : ""), -1);

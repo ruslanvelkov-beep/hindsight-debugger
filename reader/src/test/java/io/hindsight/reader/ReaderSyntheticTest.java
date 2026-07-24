@@ -217,7 +217,75 @@ final class ReaderSyntheticTest {
             assertNotNull(s);
             assertTrue(s.isStatic());
             assertEquals("(JII)J", s.desc());
+            assertTrue(s.paramNames().isEmpty(), "pre-v1.7 rows keep the argN fallback");
         }
+    }
+
+    @Test
+    void paramNameSuffixIsSplitIntoSlotMapAndStrippedFromDesc() throws IOException {
+        // The §5 suffix matrix (recorder ≥ v1.7): #s+#p (the spec's literal example),
+        // #p alone, #s alone, and a plain descriptor.
+        SyntheticRecording sr = new SyntheticRecording(tmp.resolve("rec"));
+        int cls = sr.sym("CLASS", "com.example.Bank");
+        int m = sr.sym("METHOD", "pay");
+        int staticNamed = sr.methodSiteRawDesc(cls, 0, 0, m, "(IJ)V#s#p0=amount|1=memo");
+        int instanceNamed = sr.methodSiteRawDesc(cls, 0, 0, m, "(JLjava/lang/String;)I#p1=amount|3=memo");
+        int staticPlain = sr.methodSiteRawDesc(cls, 0, 0, m, "(JII)J#s");
+        int plain = sr.methodSiteRawDesc(cls, 0, 0, m, "(I)V");
+        sr.threadStart(1, "main", 1, 500L);
+        Path dir = sr.write();
+
+        try (Recording rec = Recording.open(dir)) {
+            Site s = rec.site(staticNamed);
+            assertEquals("(IJ)V", s.desc(), "desc is stripped of BOTH suffixes");
+            assertTrue(s.isStatic());
+            assertEquals(java.util.Map.of(0, "amount", 1, "memo"), s.paramNames());
+
+            s = rec.site(instanceNamed);
+            assertEquals("(JLjava/lang/String;)I", s.desc());
+            assertFalse(s.isStatic());
+            assertEquals(java.util.Map.of(1, "amount", 3, "memo"), s.paramNames(),
+                    "slots are the first-instruction LVT slots, exactly as written");
+
+            s = rec.site(staticPlain);
+            assertEquals("(JII)J", s.desc());
+            assertTrue(s.isStatic());
+            assertEquals(java.util.Map.of(), s.paramNames());
+
+            s = rec.site(plain);
+            assertEquals("(I)V", s.desc());
+            assertFalse(s.isStatic());
+            assertTrue(s.paramNames().isEmpty(), "empty — never null — when the row carries no #p");
+        }
+    }
+
+    @Test
+    void verifyAndDumpPassOnParamSuffixedSites() throws IOException {
+        // A recording whose METHOD site carries the full #s#p suffix must verify clean and
+        // dump exactly as an unsuffixed one would — consumers see only the stripped desc.
+        SyntheticRecording sr = new SyntheticRecording(tmp.resolve("rec"));
+        int cls = sr.sym("CLASS", "com.example.Bank");
+        int file = sr.sym("FILE", "Bank.java");
+        int m = sr.sym("METHOD", "compound");
+        int site = sr.methodSiteRawDesc(cls, file, 106, m, "(JII)J#s#p0=balance|2=ratePercent|3=years");
+        sr.threadStart(1, "main", 1, 500L);
+        sr.rec(1, Format.METHOD_ENTER, 0, 0, 3, site, 0, 0, 0);
+        sr.rec(1, Format.ARG, SyntheticRecording.flags(0, Format.KIND_INLINE, 0),
+                Format.TAG_LONG, 0, site, 0, 0, 1000);
+        sr.rec(1, Format.ARG, SyntheticRecording.flags(0, Format.KIND_INLINE, 0),
+                Format.TAG_INT, 1, site, 0, 0, 5);
+        sr.rec(1, Format.ARG, SyntheticRecording.flags(0, Format.KIND_INLINE, 0),
+                Format.TAG_INT, 2, site, 0, 0, 3);
+        sr.rec(1, Format.METHOD_EXIT, SyntheticRecording.flags(0, Format.KIND_INLINE, 0),
+                Format.TAG_LONG, 0, site, 0, 0, 1157);
+        Path dir = sr.write();
+
+        TestCli.Result verify = TestCli.run("verify", "--dir", dir.toString());
+        assertEquals(0, verify.code(), "unexpected violations:\n" + verify.out());
+        TestCli.Result dump = TestCli.run("dump", "--dir", dir.toString());
+        assertEquals(0, dump.code(), dump.err());
+        assertTrue(dump.outContains("Bank.compound(3 args) (Bank.java:106)"), dump.out());
+        assertTrue(dump.outContains("return 1157 [Bank.compound]"), dump.out());
     }
 
     @Test

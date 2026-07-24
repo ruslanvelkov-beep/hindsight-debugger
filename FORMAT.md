@@ -214,7 +214,13 @@ One line per instrumented location, assigned at transform time, ids dense from 1
 - kind `METHOD`: `memberSym` = method name symbol, `desc` = JVM method descriptor
   (literal text, not a symbol), `line` = first line number in body (0 if unknown),
   `slot` = `-1`. Access bit for static is appended to desc as a suffix `#s` when the
-  method is static (readers need it to map ENTER args to parameter names).
+  method is static (readers need it to map ENTER args to parameter names). Recorder ≥
+  v1.7 appends one more optional suffix `#p<slot>=<name>[|<slot>=<name>...]` carrying the
+  PARAMETER NAMES by first-instruction LVT slot (from the LocalVariableTable, falling back
+  to the MethodParameters attribute; omitted entirely when neither names the params) —
+  e.g. `(IJ)V#s#p0=amount|1=memo`. Names are Java identifiers (no escaping needed).
+  Readers strip both suffixes from `desc` and expose the slot→name map; recordings
+  without `#p` keep the `argN` fallback.
 - kind `FIELD`: `memberSym` = field name, `desc` = field type descriptor plus `#s`
   suffix when static, `line` = line of the write, `slot` = `-1`. `classSym` is the
   **field owner** class (may differ from the instrumented class).
@@ -270,6 +276,13 @@ first-seen list — never recursive). Levels count *dumps*, not field hops: dept
 "objects discovered inside a snapshot get their own snapshot; objects discovered inside
 THAT one get first-seen only". `snapshotDepth=1` reproduces the pre-v1.3 depth-1
 containment.
+
+**Always-dump containers** (recorder ≥ v1.7): the §3-unfolded containers — `java.base`
+maps/sets/collections and ALL arrays — are baseline-dumped at first sight at ANY nesting
+level (depth-exempt, like the wrappers below), so `HashMap`/`ConcurrentHashMap`/`HashSet`/
+`ArrayList`/`Vector`/... contents are inspectable no matter how deep the discovery, with
+the usual 64-entry cap. Unfolding stays restricted to `java.base` implementations (§3's
+safety rule: a custom collection's iterator may run arbitrary application code).
 
 **Always-dump wrappers** (recorder ≥ v1.3): the `java.base` single-value wrappers —
 `AtomicInteger`/`AtomicLong`/`AtomicBoolean`/`AtomicReference` (read via their `final`

@@ -55,7 +55,7 @@ class SiteRegistryTest {
     @Test
     void tsvRowsAreDenseEscapedAndSpecShaped() throws IOException {
         try (SiteRegistry registry = new SiteRegistry(dir, null, null, null)) {
-            registry.beginClassScan("com.example.Svc", "Svc.java", Map.of("work(I)V", 42));
+            registry.beginClassScan("com.example.Svc", "Svc.java", Map.of("work(I)V", 42), Map.of());
             registry.methodSite("com.example.Svc", "work", "(I)V", true);
             registry.endClassScan();
             registry.fieldSite("com.example.Owner", "count", "I", true, "Svc.java", 10);
@@ -99,6 +99,30 @@ class SiteRegistryTest {
             }
         }
         assertTrue(sawEscaped, "tab and backslash are escaped on disk per §4");
+    }
+
+    @Test
+    void paramSuffixFollowsStaticMarkerAndOnlyNamedMethodsCarryIt() throws IOException {
+        try (SiteRegistry registry = new SiteRegistry(dir, null, null, null)) {
+            registry.beginClassScan(
+                    "com.example.Svc",
+                    "Svc.java",
+                    Map.of(),
+                    Map.of("pay(IJ)V", "#p0=amount|1=memo", "give(I)V", "#p1=x"));
+            registry.methodSite("com.example.Svc", "pay", "(IJ)V", true);
+            registry.methodSite("com.example.Svc", "give", "(I)V", false);
+            registry.methodSite("com.example.Svc", "anon", "(I)V", true);
+            registry.endClassScan();
+            // Outside a scan (degraded path): no suffix even for a param-ful descriptor.
+            registry.methodSite("com.example.Other", "pay", "(IJ)V", false);
+        }
+
+        final Recorded parsed = Recorded.parse(dir);
+        assertEquals("(IJ)V#s#p0=amount|1=memo", parsed.sites.get(1).desc(),
+                "§5 order: static marker first, then parameter names");
+        assertEquals("(I)V#p1=x", parsed.sites.get(2).desc());
+        assertEquals("(I)V#s", parsed.sites.get(3).desc(), "no parked names, no #p suffix");
+        assertEquals("(IJ)V", parsed.sites.get(4).desc(), "no scan parked, no suffix at all");
     }
 
     @Test

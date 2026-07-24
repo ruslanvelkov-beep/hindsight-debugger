@@ -24,8 +24,10 @@ import org.junit.jupiter.api.io.TempDir;
  * right after its OBJECT_FIRST_SEEN; objects newly registered while a level-{@code L} dump
  * executes always get first-seen and, while {@code L < snapshotDepth}, a baseline dump of
  * their own at level {@code L + 1} ({@code snapshotDepth=1} pins the pre-v1.3 depth-1
- * containment); maps/sets/lists/arrays unfold into elements (§3 forms); enums carry their
- * constant name instead; the {@code snapshotFirstSeen} switch disables the whole behavior.
+ * containment); maps/sets/lists/arrays unfold into elements (§3 forms) and — recorder ≥
+ * v1.7 — are always-dumped at ANY discovery level (depth-exempt, like the wrappers); enums
+ * carry their constant name instead; the {@code snapshotFirstSeen} switch disables the
+ * whole behavior.
  */
 class FirstSeenSnapshotTest {
 
@@ -50,6 +52,24 @@ class FirstSeenSnapshotTest {
 
     static final class Leaf {
         int w = 21;
+    }
+
+    /** §7 always-dump-container probe (recorder ≥ v1.7): containers reachable only through two dumps. */
+    static final class ContainerHost {
+        Object carrier = new ContainerCarrier();
+    }
+
+    /** Field mix discovered at level 3: a big list and an array (depth-exempt) beside a plain object. */
+    static final class ContainerCarrier {
+        final java.util.ArrayList<Integer> items = new java.util.ArrayList<>();
+        final int[] codes = {5, 6};
+        final Object plain = new Leaf();
+
+        ContainerCarrier() {
+            for (int i = 0; i < 100; i++) {
+                items.add(i); // boxed elements travel by value — no extra registrations
+            }
+        }
     }
 
     @TempDir
@@ -168,6 +188,50 @@ class FirstSeenSnapshotTest {
             assertTrue(r.seq() > prev, "thread file seq-monotonic");
             prev = r.seq();
         }
+    }
+
+    @Test
+    void containersDiscoveredBeyondDepthStillGetBoundedBaselines() throws IOException {
+        final Path dir = bootWith(true); // spec default snapshotDepth = 2
+        HindsightRuntime.worker().recordLocalWriteObject(1, 0, new ContainerHost());
+        HindsightRuntime.shutdownForTests();
+
+        final List<Recordings.Rec> recs = Recordings.parseAll(dir);
+        final List<Recordings.Rec> firstSeens = byType(recs, Wire.TYPE_OBJECT_FIRST_SEEN);
+        final List<Recordings.Rec> snapshots = byType(recs, Wire.TYPE_SNAPSHOT);
+        assertEquals(5, firstSeens.size(), "host, carrier, list, array and the plain sibling are first-seen");
+
+        // Levels 1 and 2 follow the ordinary depth rules: host, then its carrier field.
+        final long hostId = byType(recs, Wire.TYPE_LOCAL_WRITE).get(0).after();
+        assertEquals(hostId, snapshots.get(0).target(), "the level-1 dump comes first");
+        final long carrierId = parseSnapshotFields(dir, snapshots.get(0).after()).get("carrier")[2];
+        assertEquals(carrierId, snapshots.get(1).target(), "the level-2 nested baseline follows");
+        final Map<String, long[]> carrierFields = parseSnapshotFields(dir, snapshots.get(1).after());
+        final long itemsId = carrierFields.get("items")[2];
+        final long codesId = carrierFields.get("codes")[2];
+        final long plainId = carrierFields.get("plain")[2];
+
+        // Level 3 is beyond snapshotDepth, but the §7 always-dump containers (recorder ≥
+        // v1.7) are depth-exempt: the ArrayList and the array still get baselines of their
+        // own — bounded by the usual 64-entry cap — while the plain sibling does not.
+        assertEquals(4, snapshots.size(), "host + carrier + the two depth-exempt containers");
+        final Recordings.Rec itemsSnap = snapshots.stream()
+                .filter(r -> r.target() == itemsId)
+                .findFirst()
+                .orElseThrow();
+        final Unfolded items = parseUnfolded(dir, itemsSnap.after(), Wire.SNAPSHOT_FORM_LIST);
+        assertEquals(100, items.totalSize, "the level-3 list dump carries the true size");
+        assertEquals(Wire.SNAPSHOT_MAX_FIELDS, items.entries.size(), "and stays bounded by the 64-entry cap");
+        assertEquals(0L, items.entries.get(0)[2], "unfolded contents are the list's elements");
+        final Recordings.Rec codesSnap = snapshots.stream()
+                .filter(r -> r.target() == codesId)
+                .findFirst()
+                .orElseThrow();
+        final Unfolded codes = parseUnfolded(dir, codesSnap.after(), Wire.SNAPSHOT_FORM_ARRAY);
+        assertEquals(2, codes.totalSize, "arrays are always-dump containers too");
+        assertEquals(5L, codes.entries.get(0)[2]);
+        assertTrue(snapshots.stream().noneMatch(r -> r.target() == plainId),
+                "a plain object discovered at level 3 still gets first-seen only at depth 2");
     }
 
     @Test

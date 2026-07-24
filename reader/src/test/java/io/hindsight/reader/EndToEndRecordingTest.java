@@ -93,6 +93,7 @@ final class EndToEndRecordingTest {
         long parsedCaptures = 0;
         long exceptionalExits = 0;
         boolean transferArgsSeen = false;
+        boolean transferParamNames = false;
         boolean balanceWriteConsistent = false;
         boolean localWithName = false;
         Set<String> strings = new HashSet<>();
@@ -107,11 +108,18 @@ final class EndToEndRecordingTest {
                 case Format.METHOD_ENTER -> {
                     enters++;
                     Site s = rec.site(r.location());
-                    if (s != null && "transfer".equals(rec.symbolText(s.memberSym()))
-                            && !transferArgsSeen) {
-                        prevEnter = r;
-                        argsAfterTransferEnter = r.idx();
-                        transferArgKinds.clear();
+                    if (s != null && "transfer".equals(rec.symbolText(s.memberSym()))) {
+                        // §5 recorder ≥ v1.7: Bank.transfer(String fromName, String toName,
+                        // long amount) is an instance method, so its #p suffix names the
+                        // first-instruction LVT slots 1, 2 and 3 (this owns slot 0).
+                        if (java.util.Map.of(1, "fromName", 2, "toName", 3, "amount").equals(s.paramNames())) {
+                            transferParamNames = true;
+                        }
+                        if (!transferArgsSeen) {
+                            prevEnter = r;
+                            argsAfterTransferEnter = r.idx();
+                            transferArgKinds.clear();
+                        }
                     }
                 }
                 case Format.ARG -> {
@@ -174,6 +182,8 @@ final class EndToEndRecordingTest {
         assertTrue(enters > 1000, "expected >1000 METHOD_ENTERs, got " + enters + diag);
         assertTrue(transferArgsSeen,
                 "no transfer ENTER with (BLOB string, BLOB string, INLINE long) args" + diag);
+        assertTrue(transferParamNames,
+                "transfer METHOD site must carry §5 #p names {1=fromName, 2=toName, 3=amount}" + diag);
         assertTrue(balanceWriteConsistent,
                 "no balance FIELD_WRITE with consistent differing inline longs" + diag);
         assertTrue(localWithName, "no LOCAL_WRITE with a resolvable variable name" + diag);

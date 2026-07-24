@@ -32,12 +32,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       id assignment and row writing share one lock so ids stay dense and rows uncorrupted.</li>
  * </ul>
  *
- * <p>Method-site rows also need the source file and the first line number of the method body
- * (§5) — information ByteBuddy's advice resolution cannot see, because it works on method
- * <em>descriptions</em>, not bytecode. The {@code MethodLinePrescan} visitor buffers each
- * class, extracts that information, and parks it here via {@link #beginClassScan} for the
- * duration of the class's replay through the downstream visitors (same thread, so a
- * {@link ThreadLocal} suffices and concurrent transforms cannot cross-contaminate).
+ * <p>Method-site rows also need the source file, the first line number of the method body and
+ * the §5 parameter-name suffix (recorder ≥ v1.7) — information ByteBuddy's advice resolution
+ * cannot see, because it works on method <em>descriptions</em>, not bytecode. The
+ * {@code MethodLinePrescan} visitor buffers each class, extracts that information, and parks
+ * it here via {@link #beginClassScan} for the duration of the class's replay through the
+ * downstream visitors (same thread, so a {@link ThreadLocal} suffices and concurrent
+ * transforms cannot cross-contaminate).
  *
  * <p>The registry also wires the §10 trigger: the first method site matching the configured
  * {@code trigger} class/method is handed to {@link HindsightRuntime#setTriggerSite(int)}.
@@ -95,12 +96,18 @@ public final class SiteRegistry implements AutoCloseable {
     // =====================================================================================
 
     /**
-     * Parks the given class's source file and per-method first-line map for the current thread
-     * while the class replays through the downstream visitors. {@code methodFirstLines} is
-     * keyed on {@code name + descriptor}.
+     * Parks the given class's source file, per-method first-line map and per-method
+     * parameter-name suffix map for the current thread while the class replays through the
+     * downstream visitors. Both maps are keyed on {@code name + descriptor};
+     * {@code methodParamSuffixes} values are ready-made §5 {@code #p<slot>=<name>|...}
+     * suffixes (methods without one simply have no entry).
      */
-    public void beginClassScan(String classBinaryName, String sourceFile, Map<String, Integer> methodFirstLines) {
-        currentScan.set(new ClassScan(classBinaryName, sourceFile, methodFirstLines));
+    public void beginClassScan(
+            String classBinaryName,
+            String sourceFile,
+            Map<String, Integer> methodFirstLines,
+            Map<String, String> methodParamSuffixes) {
+        currentScan.set(new ClassScan(classBinaryName, sourceFile, methodFirstLines, methodParamSuffixes));
     }
 
     /** Clears what {@link #beginClassScan} parked; call from a finally around the replay. */
@@ -114,8 +121,12 @@ public final class SiteRegistry implements AutoCloseable {
 
     /**
      * Resolves the METHOD site for one instrumented method, assigning it on first sight.
-     * Idempotent: enter and exit advice of the same method get the same id. Line and file
-     * come from the parked class scan when available, else 0 (§5 allows unknown).
+     * Idempotent: enter and exit advice of the same method get the same id. Line, file and
+     * the §5 {@code #p} parameter-name suffix (recorder ≥ v1.7) come from the parked class
+     * scan when available, else 0 / absent (§5 allows both unknown). Suffix order is fixed by
+     * §5: the {@code #s} static marker first, then {@code #p<slot>=<name>|...} — and because
+     * the prescan runs for FULL and callsOnly scopes alike, both scopes' sites carry names
+     * whenever the class file has an LVT or a MethodParameters attribute.
      */
     public int methodSite(String classBinaryName, String methodName, String descriptor, boolean isStatic) {
         final String desc = isStatic ? descriptor + STATIC_SUFFIX : descriptor;
@@ -131,6 +142,7 @@ public final class SiteRegistry implements AutoCloseable {
             }
             int line = 0;
             int fileSym = 0;
+            String suffixedDesc = desc;
             final ClassScan scan = currentScan.get();
             if (scan != null && scan.classBinaryName.equals(classBinaryName)) {
                 final Integer firstLine = scan.methodFirstLines.get(methodName + descriptor);
@@ -140,10 +152,14 @@ public final class SiteRegistry implements AutoCloseable {
                 if (scan.sourceFile != null) {
                     fileSym = symbol(SymbolKind.FILE, scan.sourceFile);
                 }
+                final String params = scan.methodParamSuffixes.get(methodName + descriptor);
+                if (params != null) {
+                    suffixedDesc = desc + params; // §5: #s first, then #p
+                }
             }
             final int classSym = symbol(SymbolKind.CLASS, classBinaryName);
             final int memberSym = symbol(SymbolKind.METHOD, methodName);
-            final int id = writeSite("METHOD", classSym, fileSym, line, memberSym, desc, -1);
+            final int id = writeSite("METHOD", classSym, fileSym, line, memberSym, suffixedDesc, -1);
             methodSiteIds.put(key, id);
             maybeBindTrigger(classBinaryName, methodName, id);
             return id;
@@ -375,5 +391,9 @@ public final class SiteRegistry implements AutoCloseable {
     }
 
     /** What one class transform learned ahead of advice resolution; see class doc. */
-    private record ClassScan(String classBinaryName, String sourceFile, Map<String, Integer> methodFirstLines) {}
+    private record ClassScan(
+            String classBinaryName,
+            String sourceFile,
+            Map<String, Integer> methodFirstLines,
+            Map<String, String> methodParamSuffixes) {}
 }
