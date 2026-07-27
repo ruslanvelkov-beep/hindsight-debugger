@@ -8,6 +8,7 @@ import io.hindsight.reader.Site;
 import io.hindsight.reader.ValueRenderer;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -178,7 +179,34 @@ public final class Engine implements AutoCloseable {
         this.globalRecordCount = total;
         sortObjectIndices();
         buildStaticOwnerLookup();
+        writeThreadKindCache();
         chooseInitialCursor();
+    }
+
+    /**
+     * Writes the §18.4 {@code viewer-thread-kinds.tsv} cache into the recording directory once
+     * the indices are built: one {@code tid<TAB>LINES|CALLS} row per thread, sorted by tid —
+     * {@code LINES} iff the thread carries {@code LINE} records ({@link #threadHasLines}). The
+     * file makes the classification available without replaying the recording; the live TUI
+     * colours from the in-memory indices regardless. Best-effort by design: any
+     * {@link IOException}/{@link SecurityException} is swallowed so a read-only recording
+     * still opens, and an existing file with identical content is left untouched.
+     */
+    private void writeThreadKindCache() {
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (int tid : recording.threadIds()) { // threadIds() is ascending — rows sorted by tid
+                sb.append(tid).append('\t').append(index(tid).hasLines() ? "LINES" : "CALLS").append('\n');
+            }
+            String content = sb.toString();
+            Path file = recording.dir().resolve("viewer-thread-kinds.tsv");
+            if (Files.exists(file) && content.equals(Files.readString(file))) {
+                return; // present and consistent — do not rewrite (§18.4)
+            }
+            Files.writeString(file, content);
+        } catch (IOException | SecurityException e) {
+            // Best-effort (§18.4): the engine must still open read-only recordings.
+        }
     }
 
     /**
@@ -690,6 +718,41 @@ public final class Engine implements AutoCloseable {
             return new SeqLocation(false, 0, 0L);
         }
         return new SeqLocation(true, cursorTid, ctx.get(frameIndex - unrecorded).asOfIndex());
+    }
+
+    /**
+     * Whether stack frame {@code frameIndex} executed any {@code LINE} record within its span
+     * (§18.3): {@code true} iff the frame is a recorded {@link #stack()} frame and at least one
+     * {@code LINE} record with {@code frameEnter} equal to its ENTER index exists in
+     * {@code [enterIndex, matchingExit]} — nested callees' lines belong to their own enters and
+     * never count. {@code false} for an unrecorded (capture-only) frame or an out-of-range index.
+     * Answered from the sorted {@link ThreadIndex} line positions (binary search + a walk bounded
+     * by the frame's span), never by scanning the thread's records.
+     *
+     * @param frameIndex a stack index, {@code 0} = outermost .. {@code stack().size()-1} = innermost
+     */
+    public boolean frameHasLines(final int frameIndex) {
+        int unrecorded = publicFrames.size() - ctx.size();
+        if (frameIndex < unrecorded || frameIndex >= publicFrames.size()) {
+            return false;
+        }
+        ThreadIndex ti = index(cursorTid);
+        int enter = ctx.get(frameIndex - unrecorded).frame().enterIndex();
+        long exit = ti.matchingExit[enter];
+        int t = Arrays.binarySearch(ti.lineIndices, enter);
+        if (t < 0) {
+            t = -t - 1;
+        }
+        for (; t < ti.lineIndices.length; t++) {
+            long j = ti.lineIndices[t];
+            if (j > exit) {
+                return false;
+            }
+            if (ti.frameEnter[(int) j] == enter) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void recompute() {
@@ -1257,6 +1320,19 @@ public final class Engine implements AutoCloseable {
         ThreadIndex ti = indices.get(tid);
         String name = ti != null ? ti.threadName : null;
         return name != null ? name : "t" + tid;
+    }
+
+    /**
+     * Whether thread {@code tid} carries any {@code LINE} record at all (§18.3) — {@code false}
+     * for an enter/exit-only (callsOnly) or metadata-only thread, and for an unknown tid. This is
+     * the classification behind the Threads window's green marking and the §18.4
+     * {@code viewer-thread-kinds.tsv} rows ({@code LINES} iff {@code true}).
+     *
+     * @param tid a dense thread id (see {@link #threads()})
+     */
+    public boolean threadHasLines(final int tid) {
+        ThreadIndex ti = indices.get(tid);
+        return ti != null && ti.hasLines();
     }
 
     // ---- method-call browse (§11.7) ----

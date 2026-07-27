@@ -10,13 +10,15 @@ import io.hindsight.viewer.highlight.JavaHighlighter;
  *
  * <p>Only the standard 16 ANSI colours are used (no RGB), so the scheme renders
  * identically on a plain xterm, an SSH session and a rich emulator — the viewer is
- * a terminal tool and must not assume truecolour. The one deliberate exception
- * (VIEWER.md §12.3) is {@link #FRAME_LINE_BG}, which uses xterm-256 indexed 236: no
- * ANSI-16 background is both darker than every syntax foreground and still visible
- * against the default background, and 256-colour support is ubiquitous. The choices
+ * a terminal tool and must not assume truecolour. The two deliberate exceptions are
+ * {@link #FRAME_LINE_BG} (VIEWER.md §12.3, xterm-256 indexed 236: no ANSI-16
+ * background is both darker than every syntax foreground and still visible against
+ * the default background) and {@link #EXEC_NOLINE_BG} (§18.3, xterm-256 indexed 22:
+ * a dark green with the same legibility property, distinguishable from the blue
+ * {@link #EXEC_LINE_BG} at a glance); 256-colour support is ubiquitous. The choices
  * favour readability of code over decoration: comments dimmed, string/number/keyword
- * each distinct, and the two current-line backgrounds (exec vs. merely-selected
- * frame) chosen to keep foreground syntax legible on top.
+ * each distinct, and the current-line backgrounds (exec vs. merely-selected frame)
+ * chosen to keep foreground syntax legible on top.
  */
 public final class Palette {
 
@@ -44,6 +46,21 @@ public final class Palette {
      * Indexed 236 = {@code #303030}, the palette's one step outside ANSI-16.
      */
     public static final TextColor FRAME_LINE_BG = new TextColor.Indexed(236);
+
+    /**
+     * Background of the exec (innermost) current line when the shown frame is recorded but
+     * line-less — enter/exit-only, no {@code LINE} records (§18.3). Indexed 22 = dark green,
+     * dark enough that every syntax foreground stays readable on it; the palette's second
+     * deliberate 256-colour exception alongside {@link #FRAME_LINE_BG}.
+     */
+    public static final TextColor EXEC_NOLINE_BG = new TextColor.Indexed(22);
+
+    /**
+     * Foreground of Stack rows whose recorded frame is line-less and of Threads rows whose
+     * thread carries no {@code LINE} records at all (§18.3) — the light-green "calls only"
+     * marking; selection inversion still wins.
+     */
+    public static final TextColor CALLS_ONLY_FG = TextColor.ANSI.GREEN_BRIGHT;
 
     /** Background of the selected row in a list/tree window. */
     public static final TextColor SELECTION_BG = TextColor.ANSI.CYAN;

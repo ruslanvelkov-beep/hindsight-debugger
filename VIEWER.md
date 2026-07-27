@@ -1006,3 +1006,50 @@ Reverse step / reverse step-over bind to: `F7`+shift and `F8`+shift (xterm `;2~`
 modifier form), PLUS `F15`/`F16` as aliases — Apple Terminal encodes Shift-F7/F8 with
 the legacy "+8" scheme (`ESC[28~`/`ESC[29~`), which lanterna decodes as plain F15/F16
 (user-verified). The F9/F10 fallbacks are REMOVED. Help texts say `⇧F7/⇧F8 reverse`.
+
+## 18. v1.8 additions & changes
+
+Authoritative over conflicting earlier text (§15.7, §17.5-§17.6). Viewer-only; works on
+all schema-4 recordings.
+
+### 18.1 Source title separator
+In exec mode the Source title no longer blanks the gap with spaces: the border's own
+dashes stay visible between the fixed title and the frame text, which is rendered as
+`␣<SimpleClass>.<method>␣` (one space on each side) at the same offset as before —
+`Source Code [c] ────── Class.method ──…`. Browse mode unchanged.
+
+### 18.2 Recording-name padding
+The §17.6 name block becomes `␣<name>␣` — shifted one column left so the trailing space
+(not the name) ends 2 columns before the top-right corner.
+
+### 18.3 Line-less recorded frames and threads (callsOnly visualization)
+New engine accessors: `boolean frameHasLines(int frameIndex)` — whether the RECORDED
+frame executed any LINE record within its span (false for unrecorded/out-of-range) — and
+`boolean threadHasLines(int tid)` — whether the thread carries any LINE record at all.
+- **Source**: when the shown frame is recorded but line-less, the highlight sits on the
+  method DECLARATION line — found by scanning the source upward from the frame's current
+  line (the site's first body line), at most 30 lines, for the first line containing the
+  method name followed by `(` (annotation/comment-only lines skipped; constructors use
+  the class's simple name; fallback = the frame's line). The EXEC highlight background
+  for such a frame is DARK GREEN (new `Palette.EXEC_NOLINE_BG`, xterm-256 indexed 22)
+  instead of blue; a selected non-innermost line-less frame keeps the §12.3 frame marker.
+- **Stack**: rows of recorded-but-line-less frames render with a LIGHT GREEN foreground
+  (new `Palette.CALLS_ONLY_FG`, ANSI bright green); unrecorded frames stay grey.
+- **Threads**: rows of threads with NO LINE records at all (enter/exit-only or metadata
+  only) render with the same light green; the current-thread `*` marker is unaffected.
+Help overlay gains one line explaining the green marking.
+
+### 18.4 Thread-kind cache file
+On open, after the indices are built, the engine writes `viewer-thread-kinds.tsv` into
+the recording directory (best-effort, silent on failure; not rewritten when present and
+consistent): one `tid<TAB>LINES|CALLS` row per thread — LINES = the thread carries LINE
+records. The file makes the classification available without replaying the recording
+(external tools, future fast-start); the live TUI colors from the in-memory indices
+regardless. The reader's `verify` must tolerate the extra file (it only looks at known
+names).
+
+### 18.5 Ctrl-D popup, selection-friendly
+The §17.6 popup becomes FULL terminal width with NO side decoration: a top border row
+(carrying the `Recording` title), the absolute path rendered on bare full-width lines
+(wrapped, no leading/trailing decoration characters), and a bottom border row — so a
+terminal selection of a long path grabs clean text. Esc still closes.

@@ -424,6 +424,7 @@ public final class ViewerApp {
     private void renderSource(final TextGraphics g, final Layout.Rect rect) {
         boolean focused = focus == Win.SOURCE;
         drawBox(g, rect, sourceTitle(), Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
+        drawSourceFrameText(g, rect, focused);
         if (sourceSearch.active) {
             // §16.4: the search field is drawn ON the title row, overwriting the title.
             renderSourceSearchField(g, rect);
@@ -443,17 +444,44 @@ public final class ViewerApp {
         }
     }
 
+    /** The exec-mode Source title; §18.1 renders the frame text separately, past a dashed gap. */
+    private static final String SOURCE_TITLE = "Source Code [c]";
+
     /**
-     * The Source window title (§15.7): browse mode keeps {@code Source Code [c] — <fileName>};
-     * exec mode appends the SELECTED frame's {@code SimpleClass.method} after exactly ten spaces
-     * (clipped by the border like any title), or nothing when there is no frame.
+     * The Source window title (§15.7/§18.1): browse mode keeps
+     * {@code Source Code [c] — <fileName>}; exec mode is the plain fixed title — the SELECTED
+     * frame's {@code SimpleClass.method} is drawn separately by {@link #drawSourceFrameText}
+     * so the border dashes stay visible in the ten-column gap.
      */
     private String sourceTitle() {
         if (browseMode) {
-            return "Source Code [c] — " + browseName;
+            return SOURCE_TITLE + " — " + browseName;
+        }
+        return SOURCE_TITLE;
+    }
+
+    /**
+     * The §18.1 exec-mode frame text: {@code ␣<SimpleClass>.<method>␣} (one space each side),
+     * put on the top border AFTER {@link #drawBox} at the offset the text previously started —
+     * title start + title length + ten — so the border's own dashes remain visible between the
+     * fixed title and the frame text, and after it. Browse mode (and a frame-less exec cursor)
+     * draws nothing.
+     */
+    private void drawSourceFrameText(final TextGraphics g, final Layout.Rect rect, final boolean focused) {
+        if (browseMode) {
+            return;
         }
         Frame f = selectedFrameOrNull();
-        return f == null ? "Source Code [c]" : "Source Code [c]" + " ".repeat(10) + FrameText.simple(f);
+        if (f == null) {
+            return;
+        }
+        int start = rect.col() + 3 + SOURCE_TITLE.length() + 10; // title text begins at col+3
+        int maxLen = rect.col() + rect.width() - 1 - start; // clip before the corner, like a title
+        if (maxLen <= 0) {
+            return;
+        }
+        put(g, start, rect.row(), clip(" " + FrameText.simple(f) + " ", maxLen),
+                focused ? Palette.FOCUS : Palette.UNFOCUS, Palette.BG, focused);
     }
 
     /** The currently selected stack frame — recorded or unrecorded (§14.5) — or {@code null}. */
@@ -475,6 +503,12 @@ public final class ViewerApp {
         srcResolved = src.isPresent();
         srcFileLines = src.map(List::size).orElse(0);
         int line = frame != null && frame.currentLine() >= 1 ? frame.currentLine() : 1;
+        // §18.3: a recorded but line-less frame highlights its method DECLARATION line — the
+        // frame's reported line is the site's first body line, which never executed as a LINE.
+        boolean frameLineless = frame != null && frame.recorded() && !engine.frameHasLines(sf);
+        if (frameLineless && srcResolved) {
+            line = DeclLine.find(src.get(), frame.methodName(), simpleClass(cls), line);
+        }
 
         boolean fileChanged = !Objects.equals(fileKey, shownFileKey);
         if (srcResolved) {
@@ -515,8 +549,13 @@ public final class ViewerApp {
         List<List<JavaHighlighter.Span>> spans =
                 highlightCache.computeIfAbsent(fileKey, k -> highlighter.highlight(lines));
         // §14.5: an unrecorded frame's line gets the frame-line highlight, never the exec one.
+        // §18.3: a line-less EXEC frame's highlight is dark green; a selected non-innermost
+        // line-less frame keeps the §12.3 frame marker.
         boolean exec = sf == frames.size() - 1 && frame.recorded();
-        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, exec, sourceCursorLine());
+        TextColor hlBg = !exec ? Palette.FRAME_LINE_BG
+                : frameLineless ? Palette.EXEC_NOLINE_BG
+                : Palette.EXEC_LINE_BG;
+        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, hlBg, sourceCursorLine());
     }
 
     private void renderBrowse(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -539,7 +578,8 @@ public final class ViewerApp {
         List<List<JavaHighlighter.Span>> spans =
                 highlightCache.computeIfAbsent(browseKey, k -> highlighter.highlight(browseLines));
         // Browse marks the requested line with the dim (frame) highlight, never the exec highlight.
-        renderCodeLines(g, ix, iy, iw, ih, browseLines, spans, srcTop, srcHcol, line, false, sourceCursorLine());
+        renderCodeLines(g, ix, iy, iw, ih, browseLines, spans, srcTop, srcHcol, line,
+                Palette.FRAME_LINE_BG, sourceCursorLine());
     }
 
     /** The §13.4 cursor line to render, or -1 — the cursor shows only while Source is focused. */
@@ -585,7 +625,7 @@ public final class ViewerApp {
             final int top,
             final int hcol,
             final int highlightLine,
-            final boolean execHighlight,
+            final TextColor highlightBg,
             final int cursorLine) {
         int fileLines = lines.size();
         int gutterW = Integer.toString(Math.max(1, fileLines)).length() + 1;
@@ -599,9 +639,8 @@ public final class ViewerApp {
             }
             int y = iy + row;
             boolean isHl = lineNo == highlightLine;
-            boolean isExec = isHl && execHighlight;
             boolean isCursor = lineNo == cursorLine;
-            TextColor lineBg = isHl ? (isExec ? Palette.EXEC_LINE_BG : Palette.FRAME_LINE_BG) : Palette.BG;
+            TextColor lineBg = isHl ? highlightBg : Palette.BG;
 
             // §13.4: the cursor line marks only its gutter cells; the code keeps its own colours.
             put(g, ix, y, String.format("%" + numW + "d ", lineNo),
@@ -643,22 +682,26 @@ public final class ViewerApp {
         }
         int cur = engine.currentTid();
         List<String> rows = new ArrayList<>();
+        List<TextColor> rowFg = new ArrayList<>();
         for (int tid : tids) {
             String mark = tid == cur ? "* " : "  ";
             rows.add(mark + "t" + tid + "  \"" + engine.threadName(tid) + "\"  (" + count(tid) + ")");
+            // §18.3: threads with no LINE records at all render light green; '*' text unchanged.
+            rowFg.add(engine.threadHasLines(tid) ? Palette.FG : Palette.CALLS_ONLY_FG);
         }
         threadSel = clamp(threadSel, 0, Math.max(0, rows.size() - 1));
         threadScroll = ScrollMath.adjustScroll(threadScroll, threadSel, ih, rows.size());
-        drawRows(g, ix, iy, iw, ih, rows, threadSel, threadScroll, threadsHcol, true);
+        drawRows(g, ix, iy, iw, ih, rows, threadSel, threadScroll, threadsHcol, true, rowFg);
     }
 
     /**
-     * The recording directory's NAME on the Threads window's top border (§17.6): right-aligned,
-     * its last character exactly 2 columns left of the top-right corner, drawn AFTER
-     * {@link #drawBox} so it overwrites border dashes, and kept to the right of the
-     * {@code Threads [t]} title. The §17.6 budget is {@link RecordingName#MAX_BORDER_NAME} (21,
-     * first-10 {@code …} last-10 beyond it); a narrower window shrinks the budget further so
-     * the name never collides with the title.
+     * The recording directory's NAME on the Threads window's top border (§17.6/§18.2):
+     * rendered as {@code ␣<name>␣} with the TRAILING space ending exactly 2 columns left of
+     * the top-right corner, drawn AFTER {@link #drawBox} so it overwrites border dashes, and
+     * kept to the right of the {@code Threads [t]} title. The §17.6 budget for the name itself
+     * is {@link RecordingName#MAX_BORDER_NAME} (21, first-10 {@code …} last-10 beyond it — the
+     * spaces are extra); a narrower window shrinks the budget further so the block never
+     * collides with the title.
      */
     private void drawRecordingName(final TextGraphics g, final Layout.Rect rect, final boolean focused) {
         if (recordingName.isEmpty()) {
@@ -666,9 +709,9 @@ public final class ViewerApp {
         }
         int x = rect.col();
         int w = rect.width();
-        int endCol = x + w - 3; // the name's last column: 2 left of the corner at x+w-1
+        int trailCol = x + w - 3; // the trailing space's column: 2 left of the corner at x+w-1
         int titleEnd = x + 2 + "Threads [t]".length() + 2; // first border column after " Threads [t] "
-        int maxLen = endCol - titleEnd; // keep >= 1 dash between title and name
+        int maxLen = trailCol - 1 - titleEnd; // name's last column is trailCol-1; leading space stays >= titleEnd
         if (maxLen < 1) {
             return;
         }
@@ -676,9 +719,9 @@ public final class ViewerApp {
         if (name.isEmpty()) {
             return;
         }
-        int start = endCol - name.length() + 1;
-        // A leading space visually separates the name from the border dashes, like a title.
-        put(g, start - 1, rect.row(), " " + name, focused ? Palette.FOCUS : Palette.UNFOCUS, Palette.BG, focused);
+        // The spaces visually separate the name from the border dashes, like a title (§18.2).
+        put(g, trailCol - name.length() - 1, rect.row(), " " + name + " ",
+                focused ? Palette.FOCUS : Palette.UNFOCUS, Palette.BG, focused);
     }
 
     private void renderStack(final TextGraphics g, final Layout.Rect rect) {
@@ -705,15 +748,19 @@ public final class ViewerApp {
         stackSel = clamp(stackSel, 0, Math.max(0, rows.size() - 1));
         stackScroll = ScrollMath.adjustScroll(stackScroll, stackSel, ih, rows.size());
         // §14.5: unrecorded (capture-only) frames render DIM, same row text; selection as usual.
+        // §18.3: recorded but line-less (enter/exit-only) frames render light green.
         for (int r = 0; r < ih; r++) {
             int idx = stackScroll + r;
             if (idx < 0 || idx >= rows.size()) {
                 continue;
             }
             boolean s = idx == stackSel;
-            boolean recorded = frames.get(frames.size() - 1 - idx).recorded();
+            int frameIndex = frames.size() - 1 - idx; // rows are innermost-first
+            TextColor fg = !frames.get(frameIndex).recorded() ? Palette.DIM
+                    : engine.frameHasLines(frameIndex) ? Palette.FG
+                    : Palette.CALLS_ONLY_FG;
             put(g, ix, iy + r, HScroll.clip(rows.get(idx), stackHcol, iw),
-                    s ? Palette.SELECTION_FG : (recorded ? Palette.FG : Palette.DIM),
+                    s ? Palette.SELECTION_FG : fg,
                     s ? Palette.SELECTION_BG : Palette.BG, false);
         }
     }
@@ -920,14 +967,35 @@ public final class ViewerApp {
             final int scroll,
             final int hcol,
             final boolean showSel) {
+        drawRows(g, ix, iy, iw, ih, rows, sel, scroll, hcol, showSel, null);
+    }
+
+    /**
+     * The per-row-foreground variant of {@link #drawRows(TextGraphics, int, int, int, int, List,
+     * int, int, int, boolean)} (§18.3, Threads green marking): {@code rowFg} supplies each row's
+     * unselected foreground ({@code null} = all {@link Palette#FG}); selection inversion still wins.
+     */
+    private void drawRows(
+            final TextGraphics g,
+            final int ix,
+            final int iy,
+            final int iw,
+            final int ih,
+            final List<String> rows,
+            final int sel,
+            final int scroll,
+            final int hcol,
+            final boolean showSel,
+            final List<TextColor> rowFg) {
         for (int r = 0; r < ih; r++) {
             int idx = scroll + r;
             if (idx < 0 || idx >= rows.size()) {
                 continue;
             }
             boolean s = showSel && idx == sel;
+            TextColor fg = rowFg != null ? rowFg.get(idx) : Palette.FG;
             put(g, ix, iy + r, HScroll.clip(rows.get(idx), hcol, iw),
-                    s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.BG, false);
+                    s ? Palette.SELECTION_FG : fg, s ? Palette.SELECTION_BG : Palette.BG, false);
         }
     }
 
@@ -1215,6 +1283,7 @@ public final class ViewerApp {
             "Tab in /              toggle calls ↔ instances;  ↑↓ enters the result",
             "                      list, / returns to the query, f = first mention",
             "F                     source-root file tree (file: = name regex, ↵ opens)",
+            "green                 enter/exit-only (no line records): frame/thread",
             "?  F1                 toggle this help",
             "q  Ctrl+C             quit (q asks to confirm)",
             "",
@@ -1256,24 +1325,22 @@ public final class ViewerApp {
     }
 
     /**
-     * The §17.6 {@code Recording} popup: a small centered box with the recording directory's
-     * FULL absolute path, hard-wrapped across lines as needed ({@link RecordingName#wrap}).
+     * The §17.6 {@code Recording} popup, selection-friendly per §18.5: FULL terminal width — a
+     * top border row carrying the {@code Recording} title (drawBox-style corners), the FULL
+     * absolute path wrapped at the terminal width ({@link RecordingName#wrap}) and rendered on
+     * bare full-width lines with NO side decoration (no {@code │}, no leading padding), then a
+     * bottom border row — so a terminal selection of a long path grabs clean text.
      */
     private void drawRecordingPopup(final TextGraphics g, final int cols, final int rows) {
-        int w = clamp(recordingPath.length() + 6, 24, Math.min(74, Math.max(24, cols - 4)));
-        List<String> lines = RecordingName.wrap(recordingPath, w - 6);
-        int h = Math.min(rows - 2, lines.size() + 4);
-        int x = Math.max(0, (cols - w) / 2);
+        List<String> lines = RecordingName.wrap(recordingPath, cols);
+        int h = Math.min(rows, lines.size() + 2);
         int y = Math.max(0, (rows - h) / 2);
-        g.setForegroundColor(Palette.FG);
-        g.setBackgroundColor(Palette.DIALOG_BG);
-        g.disableModifiers(SGR.BOLD);
-        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
-        drawBox(g, new Layout.Rect(x, y, w, h), "Recording", Palette.DIALOG_BG, Palette.FOCUS, true);
-        for (int i = 0; i < lines.size() && y + 1 + i < y + h - 2; i++) {
-            put(g, x + 3, y + 1 + i, clip(lines.get(i), w - 6), Palette.FG, Palette.DIALOG_BG, false);
+        put(g, 0, y, "┌" + "─".repeat(Math.max(0, cols - 2)) + "┐", Palette.FOCUS, Palette.DIALOG_BG, true);
+        put(g, 2, y, clip(" Recording ", cols - 3), Palette.FOCUS, Palette.DIALOG_BG, true);
+        for (int i = 0; i < lines.size() && y + 1 + i < y + h - 1; i++) {
+            put(g, 0, y + 1 + i, clipPad(lines.get(i), cols), Palette.FG, Palette.DIALOG_BG, false);
         }
-        put(g, x + 3, y + h - 2, clip("Esc close", w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+        put(g, 0, y + h - 1, "└" + "─".repeat(Math.max(0, cols - 2)) + "┘", Palette.FOCUS, Palette.DIALOG_BG, true);
     }
 
     /**
