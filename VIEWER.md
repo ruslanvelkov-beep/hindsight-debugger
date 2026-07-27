@@ -1053,3 +1053,60 @@ The §17.6 popup becomes FULL terminal width with NO side decoration: a top bord
 (carrying the `Recording` title), the absolute path rendered on bare full-width lines
 (wrapped, no leading/trailing decoration characters), and a bottom border row — so a
 terminal selection of a long path grabs clean text. Esc still closes.
+
+## 19. v1.9 additions & changes
+
+Authoritative over conflicting earlier text (§16.4, §18.3). Viewer-only; works on all
+schema-4 recordings. "Green context" = the INNERMOST (execution) frame is recorded but
+line-less (`!engine.frameHasLines(stack().size()-1)`) — the callsOnly case §18.3 colors.
+
+### 19.1 Declaration line only for the innermost line-less frame
+The §18.3 declaration-line highlight + dark-green background apply ONLY when the SELECTED
+frame IS the innermost (execution) frame. A selected NON-innermost line-less frame shows
+its own reconstructed `currentLine` (the call-site line the engine already reports) with
+the ordinary §12.3 frame marker — not the declaration line, not green. (Bug fix: v1.8
+ran `DeclLine` for every line-less selected frame, so selecting any outer callsOnly frame
+jumped to the same declaration line.)
+
+### 19.2 Jump to line-trace — `j` / `J`
+New engine `StepResult toLineTrace(boolean forward)`: moves the cursor to the next
+(`forward`) / previous LINE record in the CURRENT thread strictly after/before the cursor
+index; no-op `StepResult(false,"no further line-trace record in this thread")` when none.
+On a move it resets the selected frame and is driven through the normal `doStep`
+(afterMove + one history entry).
+- Keys `j` (forward) / `J` (reverse) are GLOBAL and active ONLY in a green context; there
+  they take precedence over the §16.3 Records-window `j` (seq dialog) — the seq dialog is
+  still reached from any line-traced record. This mirrors the help swap (19.3): the base
+  help slot shows `e/E exit-frame` when line-traced and `j/J jump to line-trace` when
+  green, and the two are mutually exclusive.
+- `e`/`E` (exit-frame) remain bound only when NOT in a green context.
+
+### 19.3 Green info-line suffix
+When in a green context, the status row keeps its normal focus-dependent position text
+(§14.4/§15.6 — seq·t·site for Source/Threads, the frame's full name for Stack, the value's
+full type for Locals) and then appends 10 spaces + `No line trace info available` rendered
+in the §18.3 `CALLS_ONLY_FG` green. A transient status message still takes precedence over
+the whole thing; the suffix is absent on any line-traced position. The base help slot
+swaps `e/E exit-frame` ↔ `j/J jump to line-trace` with the context.
+
+### 19.4 In-file search (`Alt-F`) overhaul (supersedes §16.4 rendering + motion)
+- **Fixed left-anchored field**: `[ Search: <input> ]` is a COMPACT box anchored at the
+  title start (`rect.col()+2`), NOT stretched to the right border; the `]` sits at a fixed
+  column and never moves as the query grows (a long query scrolls within the input area,
+  showing its tail). Black background, yellow letters (red when the query has no match at
+  all). Border corners preserved.
+- **Visible cursor**: the terminal cursor is shown one column after `Search: `, at the
+  input caret; it is not hidden while searching.
+- **Motion from the current line**: forward search starts at the current line and finds
+  the next occurrence AFTER the current one; reverse finds the previous one BEFORE it.
+  Keys: `Enter` or `↓` = forward, `Shift-Enter`/`Ctrl-Enter` or `↑` = reverse (arrows are
+  the universal fallback; Apple Terminal delivers Enter-modifiers unreliably). Each move
+  re-centres and sets `srcCursor` to the occurrence; the matched line carries the §13.4
+  highlight.
+- **Boundary invert, then wrap**: when a forward search finds no occurrence between the
+  current one and END of file, the WHOLE title line between the brackets (brackets
+  included) inverts colour and the cursor does NOT move; the NEXT forward press wraps to
+  the first occurrence from the top and restores normal colour. Reverse is symmetric
+  against the TOP of file, wrapping to the last occurrence. Any query edit or direction
+  change clears the pending-boundary state. An empty query clears occurrences/highlight
+  but stays in search mode. `Esc` exits and restores the title.

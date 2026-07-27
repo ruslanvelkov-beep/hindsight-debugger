@@ -17,6 +17,27 @@ public final class DeclLine {
     private DeclLine() {}
 
     /**
+     * §19.1: whether the "method-declaration line + dark-green {@code EXEC_NOLINE_BG}" treatment
+     * of §18.3 applies to the SELECTED frame — <em>only</em> when it is the innermost (execution)
+     * frame ({@code selectedFrame == stackSize - 1}), is a recorded frame and executed no
+     * {@code LINE} record of its own. A selected NON-innermost line-less frame instead keeps its
+     * own reconstructed call-site line with the ordinary §12.3 frame marker (this method returns
+     * {@code false} for it), fixing the v1.8 bug where selecting any outer callsOnly frame jumped
+     * to the declaration line.
+     *
+     * @param selectedFrame the selected stack index (0 = outermost)
+     * @param stackSize the number of frames in {@code stack()}
+     * @param recorded whether the selected frame is a recorded (non-capture) frame
+     * @param hasLines whether the selected frame executed a {@code LINE} of its own
+     *     ({@link io.hindsight.viewer.engine.Engine#frameHasLines})
+     * @return {@code true} iff the declaration-line + green treatment applies
+     */
+    public static boolean innermostLineless(
+            final int selectedFrame, final int stackSize, final boolean recorded, final boolean hasLines) {
+        return selectedFrame >= 0 && selectedFrame == stackSize - 1 && recorded && !hasLines;
+    }
+
+    /**
      * Finds the 1-based declaration line of {@code methodName} by scanning {@code lines}
      * upward from {@code min(bodyFirstLine, lines.size())} for at most {@value #MAX_SCAN}
      * lines (§18.3). A line matches when its text contains the method name — for a

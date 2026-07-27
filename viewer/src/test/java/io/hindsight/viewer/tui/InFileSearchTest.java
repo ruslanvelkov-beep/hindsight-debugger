@@ -3,15 +3,23 @@ package io.hindsight.viewer.tui;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * Pins the pure §16.4 in-file search logic: the case-insensitive one-per-line occurrence
+ * Pins the pure §16.4/§19.4 in-file search logic: the case-insensitive one-per-line occurrence
  * table, the "current occurrence on edit" selection (first at/after the cursor line, wrapping),
- * the cyclic next/previous indices, and the search-field string.
+ * the §19.4 non-cyclic from-current-line motion ({@link InFileSearch#nextFrom}), the two-press
+ * boundary-invert-then-wrap state machine ({@link InFileSearch#step}) and the fixed-width field's
+ * tail scroll ({@link InFileSearch#visibleInput}).
+ *
+ * <p>The v1.8 cyclic {@code next}/{@code prev} and the right-padded {@code field} helper were
+ * removed here: §19.4 supersedes §16.4's cyclic motion (with {@code nextFrom}+{@code step}) and its
+ * stretched field rendering (with the fixed-width tail-scrolling field), so their tests are
+ * replaced by the ones below.
  */
 final class InFileSearchTest {
 
@@ -49,30 +57,99 @@ final class InFileSearchTest {
         assertEquals(-1, InFileSearch.currentIndex(List.of(), 1)); // no occurrences
     }
 
+    // ---- §19.4 non-cyclic motion ----
+
     @Test
-    void nextAndPrevAreCyclic() {
-        assertEquals(1, InFileSearch.next(0, 3));
-        assertEquals(2, InFileSearch.next(1, 3));
-        assertEquals(0, InFileSearch.next(2, 3)); // wrap forward
-        assertEquals(2, InFileSearch.prev(0, 3)); // wrap backward
-        assertEquals(0, InFileSearch.prev(1, 3));
-        // from an unset current
-        assertEquals(0, InFileSearch.next(-1, 3));
-        assertEquals(2, InFileSearch.prev(-1, 3));
-        // degenerate size
-        assertEquals(-1, InFileSearch.next(0, 0));
-        assertEquals(-1, InFileSearch.prev(0, 0));
+    void nextFromMovesStrictlyPastTheReferenceLineWithoutWrapping() {
+        List<int[]> occ = InFileSearch.occurrences(LINES, "total"); // lines 1,3,4
+        // forward: the first occurrence with line strictly greater than refLine.
+        assertEquals(1, InFileSearch.nextFrom(occ, 1, true)); // after line 1 -> line 3 (idx 1)
+        assertEquals(1, InFileSearch.nextFrom(occ, 2, true)); // after line 2 -> line 3 (idx 1)
+        assertEquals(2, InFileSearch.nextFrom(occ, 3, true)); // after line 3 -> line 4 (idx 2)
+        assertEquals(InFileSearch.BOUNDARY, InFileSearch.nextFrom(occ, 4, true)); // none below -> boundary
+        // reverse: the last occurrence with line strictly less than refLine.
+        assertEquals(1, InFileSearch.nextFrom(occ, 4, false)); // before line 4 -> line 3 (idx 1)
+        assertEquals(0, InFileSearch.nextFrom(occ, 3, false)); // before line 3 -> line 1 (idx 0)
+        assertEquals(InFileSearch.BOUNDARY, InFileSearch.nextFrom(occ, 1, false)); // none above -> boundary
+        // empty occurrences are always a boundary.
+        assertEquals(InFileSearch.BOUNDARY, InFileSearch.nextFrom(List.of(), 2, true));
+        assertEquals(InFileSearch.BOUNDARY, InFileSearch.nextFrom(null, 2, false));
+    }
+
+    // ---- §19.4 boundary-invert-then-wrap state machine ----
+
+    @Test
+    void stepMovesFromCurrentLineWhenAnOccurrenceExists() {
+        List<int[]> occ = InFileSearch.occurrences(LINES, "total"); // lines 1,3,4
+        // disarmed forward from line 1 -> move to idx 1, still disarmed.
+        InFileSearch.Step s = InFileSearch.step(occ, 1, InFileSearch.Dir.FORWARD, null);
+        assertEquals(1, s.index());
+        assertNull(s.armed());
+        // disarmed reverse from line 4 -> move to idx 1, still disarmed.
+        s = InFileSearch.step(occ, 4, InFileSearch.Dir.REVERSE, null);
+        assertEquals(1, s.index());
+        assertNull(s.armed());
     }
 
     @Test
-    void fieldIsBracketedAndRightPaddedToWidth() {
-        assertEquals("[ Search: abc]      ", InFileSearch.field("abc", 20));
-        assertEquals("[ Search: ]", InFileSearch.field("", 11)); // exactly fits
-        // longer than the field is truncated
-        assertEquals("[ Search:", InFileSearch.field("abcdef", 9));
-        // non-positive width is empty
-        assertEquals("", InFileSearch.field("abc", 0));
-        // width is exact
-        assertEquals(20, InFileSearch.field("abc", 20).length());
+    void stepArmsTheBoundaryOnTheFirstPressThenWrapsOnTheSecond() {
+        List<int[]> occ = InFileSearch.occurrences(LINES, "total"); // lines 1,3,4
+        // forward at the last line: no occurrence below -> ARM forward, do NOT move.
+        InFileSearch.Step first = InFileSearch.step(occ, 4, InFileSearch.Dir.FORWARD, null);
+        assertEquals(InFileSearch.BOUNDARY, first.index(), "boundary press does not move");
+        assertEquals(InFileSearch.Dir.FORWARD, first.armed(), "the invert is armed forward");
+        // second forward press while armed forward: WRAP to the first occurrence, disarm.
+        InFileSearch.Step second = InFileSearch.step(occ, 4, InFileSearch.Dir.FORWARD, InFileSearch.Dir.FORWARD);
+        assertEquals(0, second.index(), "wraps to the first occurrence");
+        assertNull(second.armed(), "the invert is cleared after the wrap");
+
+        // reverse is symmetric against the top of file.
+        InFileSearch.Step top = InFileSearch.step(occ, 1, InFileSearch.Dir.REVERSE, null);
+        assertEquals(InFileSearch.BOUNDARY, top.index());
+        assertEquals(InFileSearch.Dir.REVERSE, top.armed());
+        InFileSearch.Step wrap = InFileSearch.step(occ, 1, InFileSearch.Dir.REVERSE, InFileSearch.Dir.REVERSE);
+        assertEquals(2, wrap.index(), "reverse wraps to the last occurrence");
+        assertNull(wrap.armed());
+    }
+
+    @Test
+    void stepDirectionChangeClearsTheArmedFlag() {
+        List<int[]> occ = InFileSearch.occurrences(LINES, "total"); // lines 1,3,4
+        // armed forward (sitting on the last line 4), then a REVERSE press: clear + move up.
+        InFileSearch.Step s = InFileSearch.step(occ, 4, InFileSearch.Dir.REVERSE, InFileSearch.Dir.FORWARD);
+        assertEquals(1, s.index(), "direction change moves in the new direction");
+        assertNull(s.armed(), "and clears the pending-boundary flag");
+        // a direction change with no occurrence in the new direction clears without moving/re-arming.
+        List<int[]> single = InFileSearch.occurrences(LINES, "new"); // line 2 only ("new Foo()")
+        InFileSearch.Step none = InFileSearch.step(single, 2, InFileSearch.Dir.REVERSE, InFileSearch.Dir.FORWARD);
+        assertEquals(InFileSearch.BOUNDARY, none.index(), "no earlier occurrence: no move");
+        assertNull(none.armed(), "still clears the flag (colour restored), no re-arm");
+    }
+
+    @Test
+    void stepOnAnEmptyOccurrenceTableNeverMovesOrArms() {
+        InFileSearch.Step s = InFileSearch.step(List.of(), 3, InFileSearch.Dir.FORWARD, null);
+        assertEquals(InFileSearch.BOUNDARY, s.index());
+        assertNull(s.armed());
+        // even if somehow armed, an empty table disarms without moving.
+        InFileSearch.Step armed = InFileSearch.step(List.of(), 3, InFileSearch.Dir.REVERSE, InFileSearch.Dir.REVERSE);
+        assertEquals(InFileSearch.BOUNDARY, armed.index());
+        assertNull(armed.armed());
+    }
+
+    // ---- §19.4 fixed-width field tail scroll ----
+
+    @Test
+    void visibleInputShowsTheWholeQueryOrItsTail() {
+        assertEquals("abc", InFileSearch.visibleInput("abc", 28)); // fits: shown whole
+        assertEquals("", InFileSearch.visibleInput("", 28));
+        // exactly the width: whole query, no scroll.
+        assertEquals("abcde", InFileSearch.visibleInput("abcde", 5));
+        // longer than the width: the TAIL of length inputWidth (keeps the caret end in view).
+        assertEquals("cde", InFileSearch.visibleInput("abcde", 3));
+        assertEquals("e", InFileSearch.visibleInput("abcde", 1));
+        // degenerate inputs.
+        assertEquals("", InFileSearch.visibleInput("abc", 0));
+        assertEquals("", InFileSearch.visibleInput(null, 5));
     }
 }

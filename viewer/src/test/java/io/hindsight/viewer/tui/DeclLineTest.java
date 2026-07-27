@@ -2,6 +2,8 @@
 package io.hindsight.viewer.tui;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -10,9 +12,30 @@ import org.junit.jupiter.api.Test;
 /**
  * Tests the §18.3 declaration-line finder used for line-less recorded frames: the upward
  * scan from the body's first line, the annotation/comment skip rules, the {@code '('}
- * requirement, the constructor rule and the fallback.
+ * requirement, the constructor rule and the fallback — plus the §19.1 {@link
+ * DeclLine#innermostLineless} gating that restricts that treatment to the innermost frame.
  */
 final class DeclLineTest {
+
+    // ---- §19.1 innermost-only gating ----
+
+    @Test
+    void innermostLinelessAppliesOnlyToTheSelectedInnermostRecordedLinelessFrame() {
+        int stackSize = 3; // frames 0,1,2 with 2 the innermost (execution) frame
+        // The innermost frame, recorded and line-less: the §18.3 decl-line + green treatment applies.
+        assertTrue(DeclLine.innermostLineless(2, stackSize, true, false));
+        // A NON-innermost line-less frame (the v1.8 bug): must NOT get the treatment (§19.1).
+        assertFalse(DeclLine.innermostLineless(1, stackSize, true, false));
+        assertFalse(DeclLine.innermostLineless(0, stackSize, true, false));
+        // The innermost frame WITH its own lines: ordinary blue exec highlight, not green.
+        assertFalse(DeclLine.innermostLineless(2, stackSize, true, true));
+        // An innermost UNRECORDED frame: never the treatment (no method to find a declaration for).
+        assertFalse(DeclLine.innermostLineless(2, stackSize, false, false));
+        // Degenerate: no selection / empty stack.
+        assertFalse(DeclLine.innermostLineless(-1, 0, true, false));
+        // A single-frame stack: frame 0 IS the innermost, so the treatment applies.
+        assertTrue(DeclLine.innermostLineless(0, 1, true, false));
+    }
 
     @Test
     void findsThePlainDeclarationLineAboveTheBody() {

@@ -210,11 +210,13 @@ public final class ViewerApp {
     }
 
     /**
-     * Live state of the §16.4 Source Code in-file search: the {@code active} flag (search mode
-     * on/off), the incrementally-edited {@code query}, the {@link InFileSearch#occurrences} table
-     * ({@code {line, col}} 1-based per matching line), the {@code current} index into it (or
-     * {@code -1}), and whether the current query has a match ({@code found}, drives the yellow vs.
-     * red field colour). One instance lives for the app; {@code active} toggles it.
+     * Live state of the §16.4/§19.4 Source Code in-file search: the {@code active} flag (search
+     * mode on/off), the incrementally-edited {@code query}, the {@link InFileSearch#occurrences}
+     * table ({@code {line, col}} 1-based per matching line), the {@code current} index into it (or
+     * {@code -1}), whether the current query has a match ({@code found}, drives the yellow vs. red
+     * field colour) and the §19.4 pending-boundary direction {@code boundary} ({@code null} =
+     * disarmed; non-{@code null} inverts the whole field colour and arms the two-press wrap). One
+     * instance lives for the app; {@code active} toggles it.
      */
     private static final class SourceSearch {
         boolean active;
@@ -222,6 +224,7 @@ public final class ViewerApp {
         List<int[]> occurrences = List.of();
         int current = -1;
         boolean found = true;
+        InFileSearch.Dir boundary;
     }
 
     private final Screen screen;
@@ -424,10 +427,12 @@ public final class ViewerApp {
     private void renderSource(final TextGraphics g, final Layout.Rect rect) {
         boolean focused = focus == Win.SOURCE;
         drawBox(g, rect, sourceTitle(), Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
-        drawSourceFrameText(g, rect, focused);
         if (sourceSearch.active) {
-            // §16.4: the search field is drawn ON the title row, overwriting the title.
-            renderSourceSearchField(g, rect);
+            // §19.4: the compact search field is drawn ON the title row; the §18.1 frame text is
+            // suppressed while searching so the row is not cluttered to the right of the field.
+            renderSourceSearchField(g, rect, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
+        } else {
+            drawSourceFrameText(g, rect, focused);
         }
         int ix = rect.col() + 1;
         int iy = rect.row() + 1;
@@ -491,6 +496,17 @@ public final class ViewerApp {
         return sf >= 0 && sf < frames.size() ? frames.get(sf) : null;
     }
 
+    /**
+     * §19: "green context" — the INNERMOST (execution) frame is recorded but line-less (the §18.3
+     * callsOnly case), so there is no line trace at the cursor. It gates the §19.2 {@code j}/{@code
+     * J} jump-to-line-trace bindings (which replace {@code e}/{@code E}), the §19.3 green info-line
+     * suffix and the base-help swap. Guards an empty stack.
+     */
+    private boolean greenContext() {
+        int innermost = engine.stack().size() - 1;
+        return innermost >= 0 && !engine.frameHasLines(innermost);
+    }
+
     private void renderExecSource(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
         List<Frame> frames = engine.stack();
         int sf = engine.selectedFrame();
@@ -503,10 +519,13 @@ public final class ViewerApp {
         srcResolved = src.isPresent();
         srcFileLines = src.map(List::size).orElse(0);
         int line = frame != null && frame.currentLine() >= 1 ? frame.currentLine() : 1;
-        // §18.3: a recorded but line-less frame highlights its method DECLARATION line — the
-        // frame's reported line is the site's first body line, which never executed as a LINE.
-        boolean frameLineless = frame != null && frame.recorded() && !engine.frameHasLines(sf);
-        if (frameLineless && srcResolved) {
+        // §18.3/§19.1: the method DECLARATION line + dark-green treatment applies ONLY when the
+        // INNERMOST (execution) frame is selected and is recorded but line-less. A selected
+        // non-innermost line-less frame keeps its own reconstructed call-site line (frame
+        // .currentLine()) with the ordinary §12.3 frame marker — never the declaration line.
+        boolean declTreatment = DeclLine.innermostLineless(
+                sf, frames.size(), frame != null && frame.recorded(), engine.frameHasLines(sf));
+        if (declTreatment && srcResolved) {
             line = DeclLine.find(src.get(), frame.methodName(), simpleClass(cls), line);
         }
 
@@ -549,11 +568,11 @@ public final class ViewerApp {
         List<List<JavaHighlighter.Span>> spans =
                 highlightCache.computeIfAbsent(fileKey, k -> highlighter.highlight(lines));
         // §14.5: an unrecorded frame's line gets the frame-line highlight, never the exec one.
-        // §18.3: a line-less EXEC frame's highlight is dark green; a selected non-innermost
-        // line-less frame keeps the §12.3 frame marker.
+        // §18.3/§19.1: the innermost line-less EXEC frame's highlight is dark green; a selected
+        // non-innermost line-less frame is not `exec`, so it keeps the §12.3 frame marker.
         boolean exec = sf == frames.size() - 1 && frame.recorded();
         TextColor hlBg = !exec ? Palette.FRAME_LINE_BG
-                : frameLineless ? Palette.EXEC_NOLINE_BG
+                : declTreatment ? Palette.EXEC_NOLINE_BG
                 : Palette.EXEC_LINE_BG;
         renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, hlBg, sourceCursorLine());
     }
@@ -587,22 +606,58 @@ public final class ViewerApp {
         return focus == Win.SOURCE ? srcCursor : -1;
     }
 
+    /** §19.4 fixed input-area width of the compact {@code [ Search: <input> ]} field. */
+    private static final int SEARCH_FIELD_INPUT_W = 28;
+
+    /** §19.4 fixed field prefix; {@code Search: } is followed by the input area then {@code ]}. */
+    private static final String SEARCH_PREFIX = "[ Search: ";
+
     /**
-     * The §16.4 search field drawn over the Source title row: from {@code rect.col()+2} (where the
-     * title text begins) to {@code rect.col()+width-3} (two columns before the corner, which the box
-     * border keeps). Black background, YELLOW letters — RED when the non-empty query has no match.
+     * The §19.4 in-file search field drawn over the Source title row: a COMPACT, LEFT-anchored box
+     * {@code [ Search: <input> ]} starting at {@code rect.col()+2} with a FIXED input width
+     * ({@link #SEARCH_FIELD_INPUT_W}), so the {@code ]} sits at a fixed column and never moves as
+     * the query grows — a query longer than the input area scrolls to show its TAIL
+     * ({@link InFileSearch#visibleInput}). Black background, yellow letters (RED when the non-empty
+     * query has no match); when the §19.4 pending-boundary flag is armed the WHOLE bracketed field
+     * inverts (fg/bg swap). The box is clamped to the inner width so it never overruns the border,
+     * whose corners {@link #drawBox} keeps. The terminal cursor is left visible at the input caret
+     * (§19.4) — one column after {@code Search: }, advanced by the visible query length, clamped
+     * into the input area.
      */
-    private void renderSourceSearchField(final TextGraphics g, final Layout.Rect rect) {
+    private void renderSourceSearchField(
+            final TextGraphics g, final Layout.Rect rect, final TextColor border, final boolean bold) {
         int startX = rect.col() + 2;
-        int endX = rect.col() + rect.width() - 3;
-        int fieldW = endX - startX + 1;
-        if (fieldW <= 0) {
-            return;
+        int maxEnd = rect.col() + rect.width() - 3; // ']' may sit at most 2 cols before the corner
+        int prefixLen = SEARCH_PREFIX.length();
+        int inputW = SEARCH_FIELD_INPUT_W;
+        // §19.4: clamp the whole box to the inner width — shrink the input area until ']' fits.
+        if (startX + prefixLen + inputW > maxEnd) {
+            inputW = maxEnd - startX - prefixLen;
         }
-        String text = InFileSearch.field(sourceSearch.query.toString(), fieldW);
-        // §16.4: RED when the (non-empty) query has no match — `found` is false only in that case.
-        put(g, startX, rect.row(), text, sourceSearch.found ? TextColor.ANSI.YELLOW : Palette.ERROR,
-                TextColor.ANSI.BLACK, false);
+        if (inputW <= 0) {
+            return; // too narrow to draw a sensible field
+        }
+        String visible = InFileSearch.visibleInput(sourceSearch.query.toString(), inputW);
+        StringBuilder box = new StringBuilder(SEARCH_PREFIX).append(visible);
+        while (box.length() < prefixLen + inputW) {
+            box.append(' ');
+        }
+        box.append(']');
+        // Colours: yellow-on-black normally (red-on-black when no match); armed inverts fg/bg.
+        TextColor base = sourceSearch.found ? TextColor.ANSI.YELLOW : Palette.ERROR;
+        boolean invert = sourceSearch.boundary != null;
+        put(g, startX, rect.row(), box.toString(),
+                invert ? TextColor.ANSI.BLACK : base,
+                invert ? base : TextColor.ANSI.BLACK, false);
+        // §19.4: restore the border dashes from the ']' to the corner, overwriting any leftover
+        // title text (browse mode's long "— <file>" title extends past the compact field).
+        int after = startX + box.length();
+        if (after <= maxEnd) {
+            put(g, after, rect.row(), "─".repeat(maxEnd - after + 1), border, Palette.BG, bold);
+        }
+        // §19.4 visible cursor: the caret column, clamped into the input area.
+        int caret = startX + prefixLen + Math.min(visible.length(), inputW - 1);
+        cursorPos = new TerminalPosition(caret, rect.row());
     }
 
     /** The lines currently shown in the Source window: browse lines, else the selected frame's source. */
@@ -832,10 +887,26 @@ public final class ViewerApp {
         drawRows(g, ix, iy, iw, ih, rows, recordsSel, recordsScroll, recordsHcol, true);
     }
 
+    /** §19.3 green info-line suffix appended (after 10 spaces) to the position text in a green context. */
+    private static final String GREEN_INFO_SUFFIX = "No line trace info available";
+
     private void renderStatus(final TextGraphics g, final int cols, final int row, final RecordInfo ri) {
         String pos = positionText(ri);
-        String line = status.isEmpty() ? pos : status + "   —   " + pos;
-        put(g, 0, row, clipPad(line, cols), Palette.FG, Palette.BG, false);
+        if (!status.isEmpty()) {
+            // A transient status message takes precedence over the whole line, incl. the §19.3 suffix.
+            put(g, 0, row, clipPad(status + "   —   " + pos, cols), Palette.FG, Palette.BG, false);
+            return;
+        }
+        // §19.3: the normal focus-dependent position text first, then — in a green context — 10
+        // spaces + "No line trace info available" in the §18.3 CALLS_ONLY_FG green (a second put()
+        // so the suffix carries its own colour). Absent on any line-traced (non-green) position.
+        put(g, 0, row, clipPad(pos, cols), Palette.FG, Palette.BG, false);
+        if (greenContext()) {
+            int at = pos.length() + 10;
+            if (at < cols) {
+                put(g, at, row, clip(GREEN_INFO_SUFFIX, cols - at), Palette.CALLS_ONLY_FG, Palette.BG, false);
+            }
+        }
     }
 
     /**
@@ -927,7 +998,10 @@ public final class ViewerApp {
     }
 
     private void renderHelp(final TextGraphics g, final int cols, final int row) {
-        String base = "F7 step  F8 over  ⇧F7/⇧F8 reverse  e/E exit-frame  ^R run  o origin  "
+        // §19.2/§19.3: the exit-frame/jump slot swaps with the context — the two are mutually
+        // exclusive: e/E exit-frame when line-traced, j/J jump-to-line-trace in a green context.
+        String exitOrJump = greenContext() ? "j/J jump to line-trace" : "e/E exit-frame";
+        String base = "F7 step  F8 over  ⇧F7/⇧F8 reverse  " + exitOrJump + "  ^R run  o origin  "
                 + "/ calls  . obj  F file  ^D recording  c/s/t/l/r focus  q quit";
         String ctx = switch (focus) {
             case SOURCE -> browseMode
@@ -1511,14 +1585,31 @@ public final class ViewerApp {
             doStepFromSelected(() -> engine.runToCurrentLine(false));
             return true;
         }
-        // Exit current frame (§11.6). Check E first so a shifted 'e' is not eaten by 'e'.
-        if (isChar(k, 'E') || (isChar(k, 'e') && k.isShiftDown())) {
-            doStepFromSelected(engine::exitFrameBackward);
-            return true;
-        }
-        if (isChar(k, 'e')) {
-            doStepFromSelected(engine::exitFrameForward);
-            return true;
+        // §19.2: in a GREEN context (the innermost frame is line-less) j/J jump between LINE-trace
+        // records and REPLACE the e/E exit-frame bindings — checked here in handleGlobal (BEFORE
+        // handleNav) so a green j wins even in Records focus over the §16.3 seq dialog. Outside a
+        // green context e/E work as before and j/J are NOT globally bound, so a Records-focus `j`
+        // still opens the seq dialog on any line-traced record. The two are mutually exclusive.
+        if (greenContext()) {
+            // Check J first so a shifted 'j' is not eaten by 'j' (mirrors the e/E order).
+            if (isChar(k, 'J') || (isChar(k, 'j') && k.isShiftDown())) {
+                doStep(engine.toLineTrace(false));
+                return true;
+            }
+            if (isChar(k, 'j')) {
+                doStep(engine.toLineTrace(true));
+                return true;
+            }
+        } else {
+            // Exit current frame (§11.6). Check E first so a shifted 'e' is not eaten by 'e'.
+            if (isChar(k, 'E') || (isChar(k, 'e') && k.isShiftDown())) {
+                doStepFromSelected(engine::exitFrameBackward);
+                return true;
+            }
+            if (isChar(k, 'e')) {
+                doStepFromSelected(engine::exitFrameForward);
+                return true;
+            }
         }
         // Recording-path popup (§17.6).
         if (k.isCtrlDown() && isChar(k, 'd')) {
@@ -2453,11 +2544,14 @@ public final class ViewerApp {
     }
 
     /**
-     * §16.4: recompute occurrences (case-insensitive substring, one per matching line) over the
-     * shown file, pick the current occurrence (first at/after the cursor line, wrapping) and center
-     * it. An empty query clears the match set without leaving search mode.
+     * §16.4/§19.4: recompute occurrences (case-insensitive substring, one per matching line) over
+     * the shown file, pick the current occurrence (first at/after the cursor line, wrapping) and
+     * center it. Called on entry and on every query edit — which per §19.4 also clears the
+     * pending-boundary state (restoring the normal field colour). An empty query clears the match
+     * set without leaving search mode.
      */
     private void recomputeSourceSearch() {
+        sourceSearch.boundary = null; // §19.4: a query edit clears the pending-boundary invert
         sourceSearch.occurrences = InFileSearch.occurrences(shownSourceLines(), sourceSearch.query.toString());
         if (sourceSearch.occurrences.isEmpty()) {
             sourceSearch.current = -1;
@@ -2480,23 +2574,33 @@ public final class ViewerApp {
         srcTop = ScrollMath.center(srcCursor, Math.max(1, srcViewH), fileLines);
     }
 
-    /** §16.4: cyclic next ({@code dir>0}) / previous ({@code dir<0}) occurrence, re-centering. */
-    private void moveOccurrence(final int dir) {
-        int size = sourceSearch.occurrences.size();
-        if (size == 0) {
-            return;
+    /**
+     * §19.4 one search-motion press in {@code dir}: computes the reference line (the current
+     * occurrence's line, or {@code srcCursor} when none is current), runs the pure
+     * {@link InFileSearch#step} boundary/wrap state machine, stores the new pending-boundary flag
+     * and — only when the step yields a move — re-centres on the resulting occurrence. Non-cyclic:
+     * hitting the file boundary arms the field-colour invert (no move) instead of wrapping; the
+     * next same-direction press wraps.
+     */
+    private void moveSearch(final InFileSearch.Dir dir) {
+        List<int[]> occ = sourceSearch.occurrences;
+        int refLine = sourceSearch.current >= 0 && sourceSearch.current < occ.size()
+                ? occ.get(sourceSearch.current)[0]
+                : srcCursor;
+        InFileSearch.Step s = InFileSearch.step(occ, refLine, dir, sourceSearch.boundary);
+        sourceSearch.boundary = s.armed();
+        if (s.index() >= 0) {
+            sourceSearch.current = s.index();
+            focusOccurrence();
         }
-        sourceSearch.current = dir > 0
-                ? InFileSearch.next(sourceSearch.current, size)
-                : InFileSearch.prev(sourceSearch.current, size);
-        focusOccurrence();
     }
 
     /**
-     * One key while §16.4 in-file search is active — consumes all keys (Ctrl-C still quits): Esc
-     * exits (cursor stays on the last occurrence), Backspace edits, Enter = next occurrence,
-     * Shift-Enter/Ctrl-Enter = previous, ↓ = next / ↑ = previous (universal fallback), printables
-     * extend the query.
+     * One key while §16.4/§19.4 in-file search is active — consumes all keys (Ctrl-C still quits):
+     * Esc exits (restoring the title; cursor stays on the last occurrence), Backspace edits, Enter
+     * = forward from the current line, Shift-Enter/Ctrl-Enter = reverse, ↓ = forward / ↑ = reverse
+     * (universal fallback), printables extend the query. §19.4 motion is non-cyclic with a
+     * two-press boundary-invert-then-wrap ({@link #moveSearch}); a query edit clears that state.
      */
     private void handleSourceSearch(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -2516,15 +2620,16 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.Enter) {
-            moveOccurrence(k.isShiftDown() || k.isCtrlDown() ? -1 : 1);
+            // §19.4: Enter = forward; Shift-Enter / Ctrl-Enter = reverse (terminal-dependent).
+            moveSearch(k.isShiftDown() || k.isCtrlDown() ? InFileSearch.Dir.REVERSE : InFileSearch.Dir.FORWARD);
             return;
         }
         if (t == KeyType.ArrowDown) {
-            moveOccurrence(1);
+            moveSearch(InFileSearch.Dir.FORWARD); // §19.4 universal forward fallback
             return;
         }
         if (t == KeyType.ArrowUp) {
-            moveOccurrence(-1);
+            moveSearch(InFileSearch.Dir.REVERSE); // §19.4 universal reverse fallback
             return;
         }
         if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {

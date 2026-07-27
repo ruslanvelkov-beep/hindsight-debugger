@@ -59,6 +59,7 @@ public final class Engine implements AutoCloseable {
     static final String ALREADY_HERE = "already here";
     static final String ALREADY_AT_FRAME_RETURN = "already at frame return";
     static final String ALREADY_AT_FRAME_ENTRY = "already at frame entry";
+    static final String NO_FURTHER_LINE_TRACE = "no further line-trace record in this thread";
     static final String UNSUPPORTED_WATCH =
             "unsupported expression (v1 accepts #id or Class.field.path)";
 
@@ -503,6 +504,38 @@ public final class Engine implements AutoCloseable {
             }
         }
         return new StepResult(false, NO_PREV_APPEARANCE);
+    }
+
+    /**
+     * Jump the cursor to the next ({@code forward}) / previous {@code LINE} record in the CURRENT
+     * thread, strictly after / before the cursor index (§19.2, keys {@code j}/{@code J} in a
+     * "green" callsOnly context). The thread's sorted {@link ThreadIndex#lineIndices} is
+     * binary-searched for the insertion point and the following (forward) / preceding entry is the
+     * landing — so the jump hops straight over any callsOnly gap (the {@code METHOD_ENTER}/
+     * {@code METHOD_EXIT} records between two line-traced records). No-op ({@link
+     * StepResult#moved()} {@code false}, {@link #NO_FURTHER_LINE_TRACE}) when there is no such
+     * record — the cursor already sits on the thread's last/first {@code LINE}, or the thread
+     * carries no {@code LINE} records at all. On a move the selected frame resets to innermost
+     * through the normal {@link #moveTo} path, so the TUI's {@code doStep} handles {@code afterMove}
+     * and the single history entry exactly like every other navigation.
+     *
+     * @param forward {@code true} to advance to the next LINE, {@code false} to the previous one
+     */
+    public StepResult toLineTrace(final boolean forward) {
+        ThreadIndex ti = index(cursorTid);
+        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+        if (forward) {
+            int start = idx >= 0 ? idx + 1 : -idx - 1;
+            if (start < ti.lineIndices.length) {
+                return moveTo(cursorTid, ti.lineIndices[start]);
+            }
+        } else {
+            int start = idx >= 0 ? idx - 1 : -idx - 2;
+            if (start >= 0) {
+                return moveTo(cursorTid, ti.lineIndices[start]);
+            }
+        }
+        return new StepResult(false, NO_FURTHER_LINE_TRACE);
     }
 
     /**
