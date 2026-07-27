@@ -31,12 +31,24 @@ final class TestBed implements AutoCloseable {
     final SiteRegistry registry;
     final HindsightTransformer transformer;
     final ClassLoader loader;
+    private final Map<String, byte[]> transformedBytes;
 
-    private TestBed(Path recordingDir, SiteRegistry registry, HindsightTransformer transformer, ClassLoader loader) {
+    private TestBed(
+            Path recordingDir,
+            SiteRegistry registry,
+            HindsightTransformer transformer,
+            ClassLoader loader,
+            Map<String, byte[]> transformedBytes) {
         this.recordingDir = recordingDir;
         this.registry = registry;
         this.transformer = transformer;
         this.loader = loader;
+        this.transformedBytes = transformedBytes;
+    }
+
+    /** The instrumented bytes of a transformed class, for direct bytecode inspection. */
+    byte[] transformedBytes(String className) {
+        return transformedBytes.get(className);
     }
 
     /**
@@ -73,7 +85,7 @@ final class TestBed implements AutoCloseable {
             transformed.put(className, made.getBytes());
         }
         final ClassLoader loader = new FixtureLoader(TestBed.class.getClassLoader(), transformed);
-        return new TestBed(recordingDir, registry, transformer, loader);
+        return new TestBed(recordingDir, registry, transformer, loader, transformed);
     }
 
     /** Loads (and links, surfacing any VerifyError) an instrumented class. */

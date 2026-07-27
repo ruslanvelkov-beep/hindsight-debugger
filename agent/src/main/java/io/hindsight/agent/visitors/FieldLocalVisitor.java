@@ -150,7 +150,16 @@ public final class FieldLocalVisitor extends AsmVisitorWrapper.AbstractBase {
         @Override
         public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
             final MethodVisitor downstream = super.visitMethod(access, name, descriptor, signature, exceptions);
-            if (downstream == null || (access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) {
+            // Skip codeless methods and synthetic BRIDGE methods. A javac bridge (covariant
+            // return / generic-interface erasure wrapper) carries a LineNumberTable that points
+            // at the CLASS DECLARATION line, so splicing a LINE record into it emits a phantom
+            // line at e.g. Foo.java:<class-decl> — and, since the method bracket matcher already
+            // excludes bridges (HindsightTransformer's not(isBridge())), that phantom would show
+            // up with no ENTER of its own, inside an unrelated caller frame. Mirror that exclusion
+            // here so the line/local/branch pass never touches a bridge. NB: only ACC_BRIDGE, not
+            // ACC_SYNTHETIC — lambda bodies (lambda$...) are synthetic and MUST stay instrumented.
+            if (downstream == null
+                    || (access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) != 0) {
                 return downstream;
             }
             return new MethodNode(Opcodes.ASM9, access, name, descriptor, signature, exceptions) {
