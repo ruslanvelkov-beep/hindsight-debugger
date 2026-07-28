@@ -1099,8 +1099,9 @@ swaps `e/E exit-frame` ↔ `j/J jump to line-trace` with the context.
   input caret; it is not hidden while searching.
 - **Motion from the current line**: forward search starts at the current line and finds
   the next occurrence AFTER the current one; reverse finds the previous one BEFORE it.
-  Keys: `Enter` or `↓` = forward, `Shift-Enter`/`Ctrl-Enter` or `↑` = reverse (arrows are
-  the universal fallback; Apple Terminal delivers Enter-modifiers unreliably). Each move
+  Keys: `Enter` or `↓` = forward, `Shift-Enter`/`Ctrl-Enter` or `↑` = reverse — `Alt-Enter` is preferred (it arrives as Enter+alt via ESC+CR and is
+  distinguishable on Apple Terminal, where Shift/Ctrl-Enter are not); arrows are the
+  universal fallback. Each move
   re-centres and sets `srcCursor` to the occurrence; the matched line carries the §13.4
   highlight.
 - **Boundary invert, then wrap**: when a forward search finds no occurrence between the

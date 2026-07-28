@@ -1351,7 +1351,7 @@ public final class ViewerApp {
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
             "v                     variable history for the Source cursor line",
-            "Alt-F                 Source in-file search (↵ next  ⇧↵/↑↓ prev)",
+            "Alt-F                 Source in-file search (↵ next  ⌥↵/↑↓ prev)",
             "j                     Records: jump to a record by seq",
             "/  .  F               browse calls/instances / find object / open file",
             "Tab in /              toggle calls ↔ instances;  ↑↓ enters the result",
@@ -2620,8 +2620,12 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.Enter) {
-            // §19.4: Enter = forward; Shift-Enter / Ctrl-Enter = reverse (terminal-dependent).
-            moveSearch(k.isShiftDown() || k.isCtrlDown() ? InFileSearch.Dir.REVERSE : InFileSearch.Dir.FORWARD);
+            // §19.4: Enter = forward; Alt-Enter / Shift-Enter / Ctrl-Enter = reverse. Alt-Enter
+            // arrives as Enter+isAltDown (the terminal sends ESC+CR, which lanterna pairs like
+            // Alt-F/Alt-R) and is the reliable reverse key on terminals where Shift/Ctrl-Enter
+            // are indistinguishable from Enter (Apple Terminal).
+            boolean reverse = k.isAltDown() || k.isShiftDown() || k.isCtrlDown();
+            moveSearch(reverse ? InFileSearch.Dir.REVERSE : InFileSearch.Dir.FORWARD);
             return;
         }
         if (t == KeyType.ArrowDown) {
