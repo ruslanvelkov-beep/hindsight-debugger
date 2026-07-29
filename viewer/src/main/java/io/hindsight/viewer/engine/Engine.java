@@ -86,8 +86,8 @@ public final class Engine implements AutoCloseable {
     /** One static FIELD_WRITE, ordered by {@code seq}, for watch resolution. */
     private record WriteRef(long seq, int tid, long index) {}
 
-    /** A {@code (classBinary, line)} source location, the key of the §21.7 LINE-site index. */
-    private record ClassLine(String classBinary, int line) {}
+    /** A {@code (fileBaseName, line)} source location, the key of the §22.14 LINE-site index. */
+    private record FileLine(String fileBaseName, int line) {}
 
     /** A stack frame plus the record index whose state its locals reflect (§2.4). */
     private record FrameCtx(Frame frame, long asOfIndex) {}
@@ -193,10 +193,12 @@ public final class Engine implements AutoCloseable {
     private Map<Long, Instance> firstMentionById;
     private Map<String, List<WriteRef>> fieldWriteRefsByName;
 
-    // Lazily built once on first runToLine() call (§21.7): every distinct LINE site that actually
-    // appears in the recording, keyed by its (classBinary, line) source location → the site id(s) at
-    // that location. A source line can compile to more than one LINE site, so the value is an array.
-    private Map<ClassLine, int[]> lineSitesByLocation;
+    // Lazily built once on first runToLine() call (§22.14): every distinct LINE site that actually
+    // appears in the recording, keyed by its (fileBaseName, line) source location → the site id(s) at
+    // that location. Keying by the source file's base name (not the class) lets inner classes that
+    // share a file, and browse mode where there is no frame, resolve the shown file's line. A source
+    // line can compile to more than one LINE site, so the value is an array.
+    private Map<FileLine, int[]> lineSitesByLocation;
 
     private Engine(final Recording recording) throws IOException {
         this.recording = recording;
@@ -557,34 +559,37 @@ public final class Engine implements AutoCloseable {
 
     /**
      * Run to the next ({@code forward}) / previous LINE record passing through a chosen source line
-     * {@code (classBinary, line)} — the SELECTED source line in the shown frame's file, not the
-     * cursor record's own line (§21.7, supersedes §20.10's "current line"). The line is resolved to
-     * its LINE site id(s) via {@link #lineSitesByLocation}; a source line can compile to more than
-     * one LINE site, so a record matches when its {@code location()} is any of them.
+     * {@code (fileName, line)} — the SELECTED source line in the SHOWN file, not the cursor record's
+     * own line (§22.5/§22.14, supersedes the §21.7 {@code (classBinary, line)} resolution). The line
+     * is resolved to its LINE site id(s) via {@link #lineSitesByLocation}, keyed by the file symbol's
+     * base name so it covers inner classes sharing the file and browse mode (where there is no frame);
+     * a source line can compile to more than one LINE site, so a record matches when its
+     * {@code location()} is any of them.
      *
      * <ul>
      *   <li>{@code sameThread == true} ({@code Ctrl-R}/{@code Ctrl-Q}) — searches only the current
      *       thread's {@link ThreadIndex#lineIndices} strictly after / before the cursor index, so it
-     *       stays on this thread (loop re-hits, etc.).</li>
+     *       stays on this thread (loop re-hits, etc.). The backward branch mirrors the forward one
+     *       exactly, so {@code Ctrl-Q} lands on the immediately-preceding pass.</li>
      *   <li>{@code sameThread == false} ({@code Ctrl-T}/{@code Ctrl-W}) — searches ALL threads by
      *       global {@code seq}, landing on the record with the nearest {@code seq} strictly greater /
      *       less than the cursor's {@code seq}; it may move to another thread.</li>
      * </ul>
      *
      * <p>No move with {@link #NO_LATER_PASS}/{@link #NO_EARLIER_PASS} when no such record exists in
-     * the run direction, or {@link #NO_LINE_RECORD_FOR_LINE} when {@code (classBinary, line)} never
+     * the run direction, or {@link #NO_LINE_RECORD_FOR_LINE} when {@code (fileName, line)} never
      * appears as a LINE record (an unresolvable line, e.g. a blank/comment line the TUI resolved to
      * nothing). On a move the selected frame resets to innermost through {@link #moveTo}, exactly
      * like every other navigation.
      *
-     * @param classBinary the binary class name of the selected source line's owner
+     * @param fileName the source file of the selected line (its base name is used, e.g. {@code Foo.java})
      * @param line the selected source line number
      * @param forward {@code true} to run to the next pass, {@code false} to the previous one
      * @param sameThread {@code true} to stay in the current thread, {@code false} to search all threads
      */
     public StepResult runToLine(
-            final String classBinary, final int line, final boolean forward, final boolean sameThread) {
-        int[] siteIds = lineSiteIdsFor(classBinary, line);
+            final String fileName, final int line, final boolean forward, final boolean sameThread) {
+        int[] siteIds = lineSiteIdsFor(fileName, line);
         if (siteIds.length == 0) {
             return new StepResult(false, NO_LINE_RECORD_FOR_LINE);
         }
@@ -691,20 +696,30 @@ public final class Engine implements AutoCloseable {
         return false;
     }
 
-    /** The LINE site id(s) at source location {@code (classBinary, line)}, or an empty array (§21.7). */
-    private int[] lineSiteIdsFor(final String classBinary, final int line) {
+    /** The LINE site id(s) at source location {@code (fileBaseName, line)}, or an empty array (§22.14). */
+    private int[] lineSiteIdsFor(final String fileName, final int line) {
         ensureLineSiteIndex();
-        int[] ids = lineSitesByLocation.get(new ClassLine(classBinary, line));
+        int[] ids = lineSitesByLocation.get(new FileLine(baseName(fileName), line));
         return ids != null ? ids : EMPTY_SITE_IDS;
     }
 
     private static final int[] EMPTY_SITE_IDS = new int[0];
 
+    /** The file name without any directory prefix, for the §22.14 {@code (fileBaseName, line)} index. */
+    private static String baseName(final String path) {
+        if (path == null) {
+            return null;
+        }
+        int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        return slash >= 0 ? path.substring(slash + 1) : path;
+    }
+
     /**
      * Builds {@link #lineSitesByLocation} on first {@link #runToLine} use: the distinct LINE site ids
      * that appear as {@code LINE} record locations across all threads, grouped by their
-     * {@code (classBinary, line)}. Only lines that actually executed are indexed — a line with no
-     * record cannot be run to anyway — mirroring the lazy full-pass caches
+     * {@code (fileBaseName, line)} — the site's {@code fileSym} base name so inner classes sharing a
+     * file collapse to one key (§22.14). Only lines that actually executed are indexed — a line with
+     * no record cannot be run to anyway — mirroring the lazy full-pass caches
      * ({@link #ensureMethodSites}/{@link #ensureInstanceIndex}). Distinct site ids are collected
      * first so each site's symbols resolve once regardless of how many times its line ran.
      */
@@ -718,20 +733,20 @@ public final class Engine implements AutoCloseable {
                 siteIds.add(rec(tid, li).location());
             }
         }
-        Map<ClassLine, List<Integer>> byLocation = new HashMap<>();
+        Map<FileLine, List<Integer>> byLocation = new HashMap<>();
         for (int siteId : siteIds) {
             Site s = recording.site(siteId);
             if (s == null) {
                 continue;
             }
-            String cls = recording.symbolText(s.classSym());
-            if (cls == null) {
+            String file = s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null;
+            if (file == null) {
                 continue;
             }
-            byLocation.computeIfAbsent(new ClassLine(cls, s.line()), k -> new ArrayList<>()).add(siteId);
+            byLocation.computeIfAbsent(new FileLine(baseName(file), s.line()), k -> new ArrayList<>()).add(siteId);
         }
-        Map<ClassLine, int[]> out = new HashMap<>();
-        for (Map.Entry<ClassLine, List<Integer>> e : byLocation.entrySet()) {
+        Map<FileLine, int[]> out = new HashMap<>();
+        for (Map.Entry<FileLine, List<Integer>> e : byLocation.entrySet()) {
             int[] arr = new int[e.getValue().size()];
             for (int i = 0; i < arr.length; i++) {
                 arr[i] = e.getValue().get(i);
@@ -856,6 +871,52 @@ public final class Engine implements AutoCloseable {
             }
         }
         return new SeqLocation(false, 0, 0L);
+    }
+
+    /**
+     * The highest-{@code seq} record across the whole recording (§22.13): the {@code (tid, index)}
+     * of the record carrying {@link #maxSeq()}. Each thread's records are seq-ascending, so the
+     * global maximum is whichever thread's LAST record has the greatest {@code seq}; that record's
+     * thread and index are returned. Backs the global {@code l} "jump to last record" command and the
+     * jump-to-record modal's last-record hint. {@link SeqLocation#found()} is {@code false} (with
+     * {@code tid == 0}, {@code index == 0}) only for a recording with no records at all — which
+     * {@link #open} rejects, so it is defensive.
+     */
+    public SeqLocation lastRecord() {
+        int bestTid = -1;
+        long bestIndex = 0;
+        long bestSeq = Long.MIN_VALUE;
+        for (int tid : recording.threadIds()) {
+            ThreadIndex ti = index(tid);
+            if (ti.count <= 0) {
+                continue;
+            }
+            long lastIndex = ti.count - 1L;
+            long seq = rec(tid, lastIndex).seq();
+            if (seq > bestSeq) {
+                bestSeq = seq;
+                bestTid = tid;
+                bestIndex = lastIndex;
+            }
+        }
+        return bestTid < 0 ? new SeqLocation(false, 0, 0L) : new SeqLocation(true, bestTid, bestIndex);
+    }
+
+    /**
+     * The highest global {@code seq} in the recording (§22.13) — the {@code <max>} in the
+     * jump-to-record modal's {@code 1..<max>} hint. {@code 0} for a recording with no records
+     * (defensive; {@link #open} rejects an empty recording). Computed from each thread's last
+     * (seq-greatest) record, the same records {@link #lastRecord} chooses between.
+     */
+    public long maxSeq() {
+        long max = 0;
+        for (int tid : recording.threadIds()) {
+            ThreadIndex ti = index(tid);
+            if (ti.count > 0) {
+                max = Math.max(max, rec(tid, ti.count - 1L).seq());
+            }
+        }
+        return max;
     }
 
     /**
@@ -1352,7 +1413,10 @@ public final class Engine implements AutoCloseable {
         List<ObjectNode> out = new ArrayList<>();
         if (rc.form == Format.FORM_FIELDS) {
             for (Map.Entry<String, Value> e : rc.fields.entrySet()) {
-                out.add(childNode(e.getKey() + " = ", e.getValue(), path));
+                String name = e.getKey();
+                Value fv = e.getValue();
+                // §22.12: an ID-named field is drillable when it holds an object ref.
+                out.add(valueChildNode(name + " = ", fv, fv.display(), path, NumberFormatUtil.isIdName(name)));
             }
         } else if (rc.form == Format.FORM_MAP) {
             int pairs = rc.keys.size();
@@ -1365,8 +1429,15 @@ public final class Engine implements AutoCloseable {
                 out.add(moreLeaf(rc.totalSize - pairs));
             }
         } else {
+            // §22.9: right-align the element column when every element is numeric (all ints/all floats);
+            // a mixed or non-numeric list is returned unchanged, so refs/strings render as before.
+            List<String> displays = new ArrayList<>(rc.elements.size());
+            for (Value ev : rc.elements) {
+                displays.add(ev.display());
+            }
+            List<String> aligned = NumberFormatUtil.alignNumericElements(displays);
             for (int i = 0; i < rc.elements.size(); i++) {
-                out.add(childNode("[" + i + "] = ", rc.elements.get(i), path));
+                out.add(valueChildNode("[" + i + "] = ", rc.elements.get(i), aligned.get(i), path, false));
             }
             if (rc.totalSize > rc.elements.size()) {
                 out.add(moreLeaf(rc.totalSize - rc.elements.size()));
@@ -1376,11 +1447,29 @@ public final class Engine implements AutoCloseable {
     }
 
     private ObjectNode childNode(final String prefix, final Value v, final Set<Long> path) {
+        return valueChildNode(prefix, v, v.display(), path, false);
+    }
+
+    /**
+     * Builds a value child node with an explicit {@code display}, so §22.9-aligned element text can be
+     * substituted for {@link Value#display()} (map keys/values and fields pass the value's own
+     * display). A back-reference already on {@code path} becomes a non-expandable {@code ↺ (cycle)}
+     * leaf; otherwise the node is expandable when its value is a non-null {@link Value.Ref} that is
+     * itself expandable. Per §22.12, an ID-named field ({@code idName}) holding a non-null ref is
+     * forced expandable UNLESS that ref is a scalar wrapper (AtomicInteger/Long/Boolean/StringBuilder/
+     * StringBuffer, whose value shows inline) — reinforcing for an ordinary object (already
+     * expandable) while still letting an {@code AtomicReference}-typed id be drilled into.
+     */
+    private ObjectNode valueChildNode(final String prefix, final Value v, final String display,
+            final Set<Long> path, final boolean idName) {
         if (v instanceof Value.Ref r && r.objectId() != 0 && path.contains(r.objectId())) {
             return new ObjectNode(prefix + "↺ #" + r.objectId() + " (cycle)", v, false);
         }
         boolean expandable = v instanceof Value.Ref r2 && r2.objectId() != 0 && r2.expandable();
-        return new ObjectNode(prefix + v.display(), v, expandable);
+        if (idName && v instanceof Value.Ref idRef && idRef.objectId() != 0 && !isScalarWrapper(idRef.objectId())) {
+            expandable = true;
+        }
+        return new ObjectNode(prefix + display, v, expandable);
     }
 
     private ObjectNode moreLeaf(final long n) {
@@ -1850,23 +1939,41 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
-     * Every {@code FIELD_WRITE} whose field name contains {@code nameSubstring} (case-insensitive;
-     * {@code null}/empty matches all), ascending by global {@code seq}, stopping at {@code cap} hits
-     * — the global variable-change list behind {@code V} (§20.9). Reuses the per-name write index
-     * {@link #fieldWriteRefsByName}, merging the matching names' (already seq-ordered) lists. Owner,
-     * static-ness, file and line are resolved exactly as {@link #fieldWrites}; {@code before}/
-     * {@code after} are rendered via the same {@code ValueRenderer} path (statics and instances mixed,
-     * no owner-file filter — this lists changes across the whole recording).
+     * The all-threads overload of {@link #fieldWriteChanges(String, int, int)} (§20.9): no thread
+     * filter (tid {@code 0}). Kept for callers that do not narrow by thread.
      *
      * @param nameSubstring case-insensitive field-name filter, or {@code null}/empty for all
      * @param cap the maximum number of hits to return
      */
     public List<FieldWriteHit> fieldWriteChanges(final String nameSubstring, final int cap) {
+        return fieldWriteChanges(nameSubstring, 0, cap);
+    }
+
+    /**
+     * Every {@code FIELD_WRITE} whose field name contains {@code nameSubstring} (case-insensitive;
+     * {@code null}/empty matches all) and — when {@code tid > 0} — whose write happened on thread
+     * {@code tid} ({@code tid <= 0} = all threads, §22.11), ascending by global {@code seq}, stopping
+     * at {@code cap} hits — the global variable-change list behind {@code V} (§20.9). Reuses the
+     * per-name write index {@link #fieldWriteRefsByName}, merging the matching names' (already
+     * seq-ordered) lists. Owner, static-ness, file and line are resolved exactly as
+     * {@link #fieldWrites}; {@code before}/{@code after} are rendered via the same
+     * {@code ValueRenderer} path (statics and instances mixed, no owner-file filter — this lists
+     * changes across the whole recording). {@code cap == Integer.MAX_VALUE} is the §22.11 uncapped
+     * request and is safe: the loop never trips the {@code out.size() >= cap} guard.
+     *
+     * @param nameSubstring case-insensitive field-name filter, or {@code null}/empty for all
+     * @param tid the thread id to restrict to, or {@code <= 0} for all threads
+     * @param cap the maximum number of hits to return
+     */
+    public List<FieldWriteHit> fieldWriteChanges(final String nameSubstring, final int tid, final int cap) {
         ensureInstanceIndex();
         if (cap <= 0) {
             return List.of();
         }
         List<WriteRef> matched = matchingWriteRefs(nameSubstring);
+        if (tid > 0) {
+            matched.removeIf(w -> w.tid() != tid);
+        }
         matched.sort(Comparator.comparingLong(WriteRef::seq)
                 .thenComparingInt(WriteRef::tid)
                 .thenComparingLong(WriteRef::index));
@@ -1900,19 +2007,40 @@ public final class Engine implements AutoCloseable {
     /**
      * The total number of {@code FIELD_WRITE}s {@link #fieldWriteChanges} would match for
      * {@code nameSubstring} with an unbounded cap — the {@code of N} in the §20.9 {@code showing
-     * first 1000 of N} note. Sums the matching names' index sizes, so it stays cheap against millions
-     * of writes. Every ref in the index has a resolvable site with a member symbol (that is how it
-     * was indexed), so the count matches the pre-cap size of {@link #fieldWriteChanges}.
+     * first 1000 of N} note. The all-threads overload of {@link #countFieldWriteChanges(String, int)}.
      *
      * @param nameSubstring case-insensitive field-name filter, or {@code null}/empty for all
      */
     public long countFieldWriteChanges(final String nameSubstring) {
+        return countFieldWriteChanges(nameSubstring, 0);
+    }
+
+    /**
+     * The number of {@code FIELD_WRITE}s {@link #fieldWriteChanges(String, int, int)} would match for
+     * {@code nameSubstring} on thread {@code tid} ({@code tid <= 0} = all threads, §22.11) with an
+     * unbounded cap. For all threads it sums the matching names' index sizes; for one thread it
+     * counts the matching names' refs on that thread — both cheap (no rendering) against millions of
+     * writes. Every ref in the index has a resolvable site with a member symbol (that is how it was
+     * indexed), so the count matches the pre-cap size of {@link #fieldWriteChanges}.
+     *
+     * @param nameSubstring case-insensitive field-name filter, or {@code null}/empty for all
+     * @param tid the thread id to restrict to, or {@code <= 0} for all threads
+     */
+    public long countFieldWriteChanges(final String nameSubstring, final int tid) {
         ensureInstanceIndex();
         String needle = nameSubstring == null ? "" : nameSubstring.toLowerCase(Locale.ROOT);
         long n = 0;
         for (Map.Entry<String, List<WriteRef>> e : fieldWriteRefsByName.entrySet()) {
             if (needle.isEmpty() || e.getKey().toLowerCase(Locale.ROOT).contains(needle)) {
-                n += e.getValue().size();
+                if (tid <= 0) {
+                    n += e.getValue().size();
+                } else {
+                    for (WriteRef w : e.getValue()) {
+                        if (w.tid() == tid) {
+                            n++;
+                        }
+                    }
+                }
             }
         }
         return n;
@@ -2069,12 +2197,13 @@ public final class Engine implements AutoCloseable {
 
     /**
      * The §21.5 container-size suffix for an object id: {@code , size=<totalSize>} when the id's
-     * latest snapshot at/before the cursor is a container form (MAP/SET/LIST/ARRAY), else {@code ""}.
-     * {@code totalSize} is the container's true size at snapshot time (not the ≤64 captured-entry
-     * count). Reads only the snapshot header — no element values are built — so it is safe to call
-     * from {@link #makeRef} without recursing on a self-referential container. Uses the SAME
-     * {@link #latestSnapshotAsOf} selection as {@link #reconstruct}, so a ref labelled {@code size=N}
-     * always expands into that snapshot's contents.
+     * latest snapshot at/before the cursor is a MAP/SET/LIST form, else {@code ""}. Per §22.9 an
+     * ARRAY gets NO suffix — its length already shows in its type name (e.g. {@code int[8192]#id}) —
+     * and a FIELDS object never had one. {@code totalSize} is the container's true size at snapshot
+     * time (not the ≤64 captured-entry count). Reads only the snapshot header — no element values are
+     * built — so it is safe to call from {@link #makeRef} without recursing on a self-referential
+     * container. Uses the SAME {@link #latestSnapshotAsOf} selection as {@link #reconstruct}, so a ref
+     * labelled {@code size=N} always expands into that snapshot's contents.
      */
     private String containerSizeSuffix(final long id) {
         ObjEvent snap = latestSnapshotAsOf(id, currentSeq());
@@ -2082,7 +2211,7 @@ public final class Engine implements AutoCloseable {
             return "";
         }
         Recording.Snapshot parsed = snapshotAt(snap.tid(), rec(snap.tid(), snap.index()).after());
-        if (parsed == null || parsed.form() == Format.FORM_FIELDS) {
+        if (parsed == null || parsed.form() == Format.FORM_FIELDS || parsed.form() == Format.FORM_ARRAY) {
             return "";
         }
         return ", size=" + parsed.totalSize();

@@ -162,7 +162,9 @@ final class EngineV21Test {
             assertEquals("ArrayList#600, size=2", root.label());
             List<ObjectNode> kids = e.children(root);
             assertEquals(2, kids.size());
-            assertEquals("[0] = 42  0x0000002A", kids.get(0).label());
+            // §22.9: [42, millis] are both integral, so 42's decimal right-aligns to the 13-digit
+            // millis width; the hex tail follows the padded decimal unchanged.
+            assertEquals("[0] = " + " ".repeat(11) + "42  0x0000002A", kids.get(0).label());
             // §21.1: a bare list element is nameless — hex, but NO date even though it is in range.
             assertEquals("[1] = " + MILLIS_HEX, kids.get(1).label());
             assertFalse(kids.get(1).label().contains("UTC"), "nameless element gets no date");
@@ -180,9 +182,11 @@ final class EngineV21Test {
             assertEquals("…+1 more", setKids.get(2).label());
 
             ObjectNode arr = e.objectTree(800L);
-            assertEquals("int[]#800, size=3", arr.label());
+            // §22.9: arrays omit the ", size=N" suffix — their length shows in the type name.
+            assertEquals("int[]#800", arr.label());
             List<ObjectNode> arrKids = e.children(arr);
             assertEquals(3, arrKids.size());
+            // Elements 10/20/30 are already the same width, so alignment is a no-op here.
             assertEquals("[2] = 30  0x0000001E", arrKids.get(2).label());
         }
     }
@@ -207,7 +211,8 @@ final class EngineV21Test {
             assertTrue(items.expandable(), "a container-valued field node stays expandable");
             List<ObjectNode> elems = e.children(items);
             assertEquals(2, elems.size(), "the container-valued field populates");
-            assertEquals("[0] = 42  0x0000002A", elems.get(0).label());
+            // §22.9: 42 right-aligns to the 13-digit millis element in the same list.
+            assertEquals("[0] = " + " ".repeat(11) + "42  0x0000002A", elems.get(0).label());
         }
     }
 
@@ -277,12 +282,12 @@ final class EngineV21Test {
     void runToLineSameThreadForwardAndBack(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(buildRunToLine(dir))) {
             e.seek(1, 3); // t1 LINE10 (A)
-            StepResult fwd = e.runToLine("com.ex.Foo", 10, true, true);
+            StepResult fwd = e.runToLine("Foo.java", 10, true, true);
             assertTrue(fwd.moved());
             assertEquals(1, e.currentTid());
             assertEquals(5, e.currentIndex(), "same-thread forward reaches t1's next LINE10 (C), skipping LINE11");
 
-            StepResult back = e.runToLine("com.ex.Foo", 10, false, true);
+            StepResult back = e.runToLine("Foo.java", 10, false, true);
             assertTrue(back.moved());
             assertEquals(1, e.currentTid());
             assertEquals(3, e.currentIndex(), "same-thread backward returns to A");
@@ -293,13 +298,13 @@ final class EngineV21Test {
     void runToLineCrossThreadUsesGlobalSeq(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(buildRunToLine(dir))) {
             e.seek(1, 3); // t1 LINE10 (A, seq 6)
-            StepResult fwd = e.runToLine("com.ex.Foo", 10, true, false);
+            StepResult fwd = e.runToLine("Foo.java", 10, true, false);
             assertTrue(fwd.moved());
             assertEquals(2, e.currentTid(), "cross-thread forward lands on t2's LINE10 (B, seq 8) before t1's C (seq 10)");
             assertEquals(3, e.currentIndex());
 
             e.seek(1, 5); // t1 LINE10 (C, seq 10)
-            StepResult back = e.runToLine("com.ex.Foo", 10, false, false);
+            StepResult back = e.runToLine("Foo.java", 10, false, false);
             assertTrue(back.moved());
             assertEquals(2, e.currentTid(), "cross-thread backward lands on t2's B (seq 8) before t1's A (seq 6)");
             assertEquals(3, e.currentIndex());
@@ -310,28 +315,28 @@ final class EngineV21Test {
     void runToLineNoAppearanceInDirection(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(buildRunToLine(dir))) {
             e.seek(1, 5); // t1's last LINE10 (C)
-            StepResult fwd = e.runToLine("com.ex.Foo", 10, true, true);
+            StepResult fwd = e.runToLine("Foo.java", 10, true, true);
             assertFalse(fwd.moved());
             assertEquals(Engine.NO_LATER_PASS, fwd.message());
 
             // LINE11 occurs once (t1 idx 4); no earlier / later pass in either thread mode.
             e.seek(1, 4);
-            assertFalse(e.runToLine("com.ex.Foo", 11, false, true).moved());
-            assertEquals(Engine.NO_EARLIER_PASS, e.runToLine("com.ex.Foo", 11, false, true).message());
-            assertEquals(Engine.NO_LATER_PASS, e.runToLine("com.ex.Foo", 11, true, false).message());
+            assertFalse(e.runToLine("Foo.java", 11, false, true).moved());
+            assertEquals(Engine.NO_EARLIER_PASS, e.runToLine("Foo.java", 11, false, true).message());
+            assertEquals(Engine.NO_LATER_PASS, e.runToLine("Foo.java", 11, true, false).message());
         }
     }
 
     @Test
     void runToLineUnresolvableLine(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(buildRunToLine(dir))) {
-            StepResult noLine = e.runToLine("com.ex.Foo", 99, true, true);
+            StepResult noLine = e.runToLine("Foo.java", 99, true, true);
             assertFalse(noLine.moved());
             assertEquals(Engine.NO_LINE_RECORD_FOR_LINE, noLine.message(), "a line with no LINE record is unresolvable");
 
-            StepResult noClass = e.runToLine("com.ex.Nope", 10, true, false);
-            assertFalse(noClass.moved());
-            assertEquals(Engine.NO_LINE_RECORD_FOR_LINE, noClass.message());
+            StepResult noFile = e.runToLine("Nope.java", 10, true, false);
+            assertFalse(noFile.moved());
+            assertEquals(Engine.NO_LINE_RECORD_FOR_LINE, noFile.message(), "an unknown file is unresolvable");
         }
     }
 }

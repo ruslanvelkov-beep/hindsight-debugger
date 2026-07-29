@@ -106,7 +106,6 @@ public final class ViewerApp {
     private static final int HSTEP = 4;
     private static final int RESULT_CAP = 200;
     private static final int VAR_HISTORY_CAP = 500;
-    private static final int VAR_CHANGE_CAP = 1000;
     private static final long SEEK_CAP = 5_000_000L;
     private static final String DOT = " · ";
 
@@ -149,6 +148,10 @@ public final class ViewerApp {
         // §21.6: the `/` browser's second field — a thread id (digits) that filters results to that
         // thread (blank = all threads). Edited in THREAD focus; persists across reopen like `query`.
         final StringBuilder threadQuery = new StringBuilder();
+        // §22.4: a caret index into each field ([0, len]); ←/→ move it, typing/Backspace act at it,
+        // and it drives the terminal cursor column + the regex↔thread edge crossing.
+        int caretRegex;
+        int caretThread;
         List<String> rows = List.of();
         List<long[]> targets = List.of();
         // §20.3: for the `.` (OBJECT) dialog, the object id each result row references (0 = none),
@@ -254,16 +257,22 @@ public final class ViewerApp {
     }
 
     /**
-     * Live state of the §20.9 global variable-change window ({@code V}): a case-insensitive
-     * field-name {@code filter} (empty = all), the currently-built rows/hits/cap-note (rebuilt on
-     * every filter keystroke via {@link #rebuildVarChanges}, capped at {@link #VAR_CHANGE_CAP}), the
-     * §15.2-style QUERY/LIST {@code focus} (the filter line edits vs. the result list navigates),
-     * the list selection/scroll/hscroll and the visible row count captured at render for paging.
-     * Rows are formatted by the shared {@link VarHistory#row} so they render identically to the v1.6
+     * Live state of the §20.9/§22.11 global variable-change window ({@code V}): a case-insensitive
+     * field-name {@code filter} (empty = all) plus a §22.11 {@code thread:} id filter, the
+     * currently-built rows/hits/count-note (rebuilt on every filter/thread keystroke via
+     * {@link #rebuildVarChanges}, UNTRIMMED so every write is explorable), the §15.2/§22.4-style
+     * QUERY/THREAD/LIST {@code focus} (the two input fields edit vs. the result list navigates), the
+     * list selection/scroll/hscroll and the visible row count captured at render for paging. Rows are
+     * formatted by the shared {@link VarHistory#row} so they render identically to the v1.6
      * variable-history window. One instance lives while the window is open ({@code varChanges != null}).
      */
     private static final class VarChangeWindow {
         final StringBuilder filter = new StringBuilder();
+        // §22.11: a thread-id filter field (digits) to the right of the name filter (blank = all),
+        // with the §22.4 edge-crossing caret behaviour; one caret per field.
+        final StringBuilder threadQuery = new StringBuilder();
+        int caretFilter;
+        int caretThread;
         DialogFocus focus = DialogFocus.QUERY;
         List<String> rows = List.of();
         List<FieldWriteHit> hits = List.of();
@@ -666,7 +675,7 @@ public final class ViewerApp {
 
     /**
      * The §20.7/§21.2 in-file search field drawn over the Source title row: a FULL-WIDTH, symmetric
-     * box {@code [ Search↓: <query………> ]} whose {@code [} sits at {@code rect.col()+2} and {@code ]}
+     * box {@code [ Search ↓: <query………> ]} whose {@code [} sits at {@code rect.col()+2} and {@code ]}
      * at {@code rect.col()+width-3} (two columns inside each corner), so it covers the whole title
      * row — including any browse-mode {@code — <file>} title. Foreground is ALWAYS yellow on black;
      * the §19.4 pending-boundary flag still inverts the WHOLE field (fg/bg swap) to signal
@@ -960,6 +969,15 @@ public final class ViewerApp {
     private static final String GREEN_INFO_SUFFIX = "No line trace info available";
 
     private void renderStatus(final TextGraphics g, final int cols, final int row, final RecordInfo ri) {
+        // §22.2: while the F file browser is open, its selected row's full path (folder in browse
+        // mode, file in flat-filter mode) — or the invalid-regex note — is shown on the global INFO
+        // line, not inside the dialog. This wins over the transient status while the browser is open;
+        // closing it restores the normal line.
+        if (fileDialogOpen && fileDialog != null) {
+            String info = fileDialog.tree.filterValid() ? selectedFilePath() : "invalid regex";
+            put(g, 0, row, clipPad(info, cols), Palette.FG, Palette.BG, false);
+            return;
+        }
         String pos = positionText(ri);
         if (!status.isEmpty()) {
             // A transient status message takes precedence over the whole line, incl. the §19.3 suffix.
@@ -1081,7 +1099,7 @@ public final class ViewerApp {
             case THREADS -> "↑↓ select  ↵ switch  ←→/<> hscroll";
             case STACK -> "↑↓ select frame  ←→/<> hscroll";
             case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  <> hscroll";
-            case RECORDS -> "↑↓ select  ↵ jump  c record#  ←→/<> hscroll"; // §20.12: c (was j)
+            case RECORDS -> "↑↓ select  ↵ jump  r record#  ←→/<> hscroll"; // §22.13: r (was c)
         };
         put(g, 0, row, clipPad(ctx + "  |  " + base, cols), Palette.DIM, Palette.BG, false);
     }
@@ -1218,8 +1236,11 @@ public final class ViewerApp {
     }
 
     private void drawDialog(final TextGraphics g, final int cols, final int rows) {
-        int w = clamp(cols - 6, 24, 74);
-        int h = clamp(rows - 6, 8, 20);
+        // §22.10: the `/` browser (METHOD) is 2/3 of the terminal width and 3/4 of its height; the
+        // `.` object dialog keeps its original compact size.
+        boolean slash = dialog.kind == DialogKind.METHOD;
+        int w = slash ? clamp(cols * 2 / 3, 30, cols - 2) : clamp(cols - 6, 24, 74);
+        int h = slash ? clamp(rows * 3 / 4, 8, rows - 2) : clamp(rows - 6, 8, 20);
         int x = Math.max(0, (cols - w) / 2);
         int y = Math.max(0, (rows - h) / 2);
         g.setForegroundColor(Palette.FG);
@@ -1253,12 +1274,13 @@ public final class ViewerApp {
             put(g, threadX, iy, clipPad(threadPrompt + dialog.threadQuery, threadFieldW),
                     Palette.FG, Palette.DIALOG_BG, false);
             if (dialog.focus == DialogFocus.QUERY) {
+                // §22.4: the terminal cursor sits at the field's CARET column, not its end.
                 cursorPos = new TerminalPosition(
-                        Math.min(ix + regexW - 1, ix + prompt.length() + dialog.query.length()), iy);
+                        Math.min(ix + regexW - 1, ix + prompt.length() + dialog.caretRegex), iy);
             } else if (dialog.focus == DialogFocus.THREAD) {
                 cursorPos = new TerminalPosition(
                         Math.min(threadX + threadFieldW - 1,
-                                threadX + threadPrompt.length() + dialog.threadQuery.length()), iy);
+                                threadX + threadPrompt.length() + dialog.caretThread), iy);
             }
             // §15.2: the cursor stays hidden (cursorPos == null) while the LIST has the focus.
         } else {
@@ -1308,7 +1330,10 @@ public final class ViewerApp {
             if (idx >= dialog.rows.size()) {
                 break;
             }
-            boolean s = idx == dialog.sel;
+            // §22.3: the `/` browser clears its list highlight when focus is on an input field; the
+            // `.` object dialog has no input/list focus split, so its selection always highlights.
+            boolean s = idx == dialog.sel
+                    && (dialog.kind != DialogKind.METHOD || dialog.focus == DialogFocus.LIST);
             String text = numbered
                     ? DialogFormat.number(idx, dialog.rows.size()) + dialog.rows.get(idx)
                     : dialog.rows.get(idx);
@@ -1357,7 +1382,8 @@ public final class ViewerApp {
                     ? DialogFormat.number(rootOrdinal(row.key()), roots)
                     : DialogFormat.childPad(roots);
             String text = prefix + "  ".repeat(row.depth()) + glyph + row.node().label();
-            boolean s = idx == tree.selection();
+            // §22.3: clear the list highlight while the input (regex/thread) field has focus.
+            boolean s = dialog.focus == DialogFocus.LIST && idx == tree.selection();
             put(g, ix, iy + r, clipPad(HScroll.clip(text, dialog.hcol, iw), iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
@@ -1430,11 +1456,11 @@ public final class ViewerApp {
     }
 
     /**
-     * The §20.9 global variable-change window: a centered modal (75% width, like the §16.1
-     * variable-history window) with a {@code filter:} line (a visible caret in QUERY focus), a DIM
-     * count note ({@code showing first 1000 of N} / {@code N results}), the ascending-seq field-write
-     * rows (shared {@link VarHistory#row} formatting, §13.1 edge-only scrolling, Left/Right {@code hcol}
-     * clip) and a hint row.
+     * The §20.9/§22.11 global variable-change window: a centered modal (75% width, like the §16.1
+     * variable-history window) with a {@code filter:} line and a §22.11 {@code thread:} field sharing
+     * the top row (a visible caret in the focused field, §22.4), a DIM {@code N results} count note
+     * (§22.11 dropped the cap), the ascending-seq field-write rows (shared {@link VarHistory#row}
+     * formatting, §13.1 edge-only scrolling, Left/Right {@code hcol} clip) and a hint row.
      */
     private void drawVarChanges(final TextGraphics g, final int cols, final int rows) {
         VarChangeWindow w = varChanges;
@@ -1450,14 +1476,27 @@ public final class ViewerApp {
         int ix = x + 1;
         int iy = y + 1;
         int iw = width - 2;
-        String filterLine = "filter: " + w.filter;
-        put(g, ix, iy, clipPad(filterLine, iw), Palette.FG, Palette.DIALOG_BG, false);
+        // §22.11: two fields share the row — the name filter (left) and a `thread:` id (right, fixed
+        // width), with the §22.4 caret + edge crossing (see handleVarChangesQuery/Thread).
+        String prompt = "filter: ";
+        String threadPrompt = "thread: ";
+        int threadFieldW = Math.min(threadPrompt.length() + 9, Math.max(0, iw / 2));
+        int filterW = Math.max(1, iw - threadFieldW - 1); // one-column gap between the fields
+        int threadX = ix + iw - threadFieldW;
+        put(g, ix, iy, clipPad(prompt + w.filter, filterW), Palette.FG, Palette.DIALOG_BG, false);
+        put(g, threadX, iy, clipPad(threadPrompt + w.threadQuery, threadFieldW),
+                Palette.FG, Palette.DIALOG_BG, false);
         if (w.focus == DialogFocus.QUERY) {
-            cursorPos = new TerminalPosition(Math.min(x + width - 2, ix + filterLine.length()), iy);
+            cursorPos = new TerminalPosition(
+                    Math.min(ix + filterW - 1, ix + prompt.length() + w.caretFilter), iy);
+        } else if (w.focus == DialogFocus.THREAD) {
+            cursorPos = new TerminalPosition(
+                    Math.min(threadX + threadFieldW - 1, threadX + threadPrompt.length() + w.caretThread), iy);
         }
         put(g, ix, iy + 1, clip(w.note, iw), Palette.DIM, Palette.DIALOG_BG, false);
         int hintRow = y + h - 2;
-        put(g, ix, hintRow, clip("type filter  ↑↓ select  ←→/<> hscroll  ^F/^B pg  g/G ends  ↵ jump  Esc", iw),
+        put(g, ix, hintRow,
+                clip("filter  → thread  ↑↓ select  <> hscroll  ^F/^B pg  g/G ends  ↵ jump  Esc", iw),
                 Palette.DIM, Palette.DIALOG_BG, false);
         int listTop = iy + 2;
         int listH = hintRow - listTop;
@@ -1475,7 +1514,8 @@ public final class ViewerApp {
             if (idx >= count) {
                 break;
             }
-            boolean s = idx == w.sel;
+            // §22.3: clear the list highlight while an input field (filter/thread) has focus.
+            boolean s = w.focus == DialogFocus.LIST && idx == w.sel;
             put(g, ix, listTop + r, HScroll.clip(w.rows.get(idx), w.hcol, iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
@@ -1499,7 +1539,7 @@ public final class ViewerApp {
             "o                     origin — return Source to the exec line",
             "Ctrl+D                show the recording directory's full path",
             "c t s l r             focus Source/Threads/Stack/Locals/Records",
-            "c (in Records)        jump to a record by seq  (Tab → Source)",
+            "r (in Records)        jump to a record by seq  (l fills the last)",
             "Tab / Shift+Tab       cycle focus forward / backward",
             "Arrows PgUp PgDn      navigate the focused window",
             "Ctrl+U / Ctrl+N       scroll focused window up / down one line",
@@ -1587,11 +1627,13 @@ public final class ViewerApp {
     /** The §16.3 "jump to record number" modal: a digit input line and (when present) an error line. */
     private void drawRecordJump(final TextGraphics g, final int cols, final int rows) {
         String prompt = "seq: " + recordJump.text();
+        // §22.13: the range hint shows the highest record seq (engine.maxSeq()) as `1..<max>`.
+        String range = "record # (1.." + engine.maxSeq() + ")";
         String err = recordJump.error();
-        String hint = "digits then ↵ jump    Esc close";
-        int content = Math.max(prompt.length(), Math.max(err.length(), hint.length()));
+        String hint = "l last  digits then ↵ jump  Esc close";
+        int content = Math.max(Math.max(prompt.length(), range.length()), Math.max(err.length(), hint.length()));
         int w = Math.min(cols - 2, Math.max(24, content + 6));
-        int h = Math.min(rows - 2, err.isEmpty() ? 5 : 6);
+        int h = Math.min(rows - 2, err.isEmpty() ? 6 : 7);
         int x = Math.max(0, (cols - w) / 2);
         int y = Math.max(0, (rows - h) / 2);
         g.setForegroundColor(Palette.FG);
@@ -1600,9 +1642,10 @@ public final class ViewerApp {
         g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
         drawBox(g, new Layout.Rect(x, y, w, h), "Jump to record", Palette.DIALOG_BG, Palette.FOCUS, true);
         put(g, x + 3, y + 1, clip(prompt, w - 6), Palette.FG, Palette.DIALOG_BG, false);
+        put(g, x + 3, y + 2, clip(range, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
         int hintRow = y + h - 2;
         if (!err.isEmpty()) {
-            put(g, x + 3, y + 2, clip(err, w - 6), Palette.ERROR, Palette.DIALOG_BG, false);
+            put(g, x + 3, y + 3, clip(err, w - 6), Palette.ERROR, Palette.DIALOG_BG, false);
         }
         put(g, x + 3, hintRow, clip(hint, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
         cursorPos = new TerminalPosition(Math.min(x + w - 2, x + 3 + prompt.length()), y + 1);
@@ -1845,12 +1888,8 @@ public final class ViewerApp {
             if (ch != null) {
                 switch (ch) {
                     case 'c' -> {
-                        // §20.12: from the Records window, `c` opens the seq-jump dialog (handled in
-                        // navRecords) instead of switching focus — break out so handleNav gets it.
-                        // (Reach Source from Records via Tab.) Every other focus: `c` focuses Source.
-                        if (focus == Win.RECORDS) {
-                            break;
-                        }
+                        // §22.13: `c` focuses Source from EVERY window, including Records — undoing
+                        // the §20.12 yield now that the seq-jump dialog moved to `r` (see navRecords).
                         focus = Win.SOURCE;
                         return true;
                     }
@@ -1867,6 +1906,13 @@ public final class ViewerApp {
                         return true;
                     }
                     case 'r' -> {
+                        // §22.13: from the Records window `r` opens the jump-to-record modal (handled
+                        // in navRecords) instead of re-focusing Records — break out so handleNav gets
+                        // it (mirroring the §20.12 focus-letter yield, now on `r`). Elsewhere `r`
+                        // focuses Records.
+                        if (focus == Win.RECORDS) {
+                            break;
+                        }
                         focus = Win.RECORDS;
                         return true;
                     }
@@ -2053,9 +2099,10 @@ public final class ViewerApp {
         Character ch = k.getCharacter();
         int page = Math.max(1, recordsViewH - 1);
         int last = Math.max(0, entries.size() - 1);
-        // §20.12: the seq-jump dialog moved from `j` to `c` (freeing `j` for the §19.2 green jump).
-        // handleGlobal yields `c` to Records rather than switching focus to Source (reach Source via Tab).
-        if (isChar(k, 'c') && !k.isCtrlDown() && !k.isAltDown()) {
+        // §22.13: in the Records window `r` opens the seq-jump modal (was `c` in §20.12, was `j` in
+        // §16.3). handleGlobal yields `r` to Records rather than re-focusing Records; `c` now focuses
+        // Source from here like everywhere else.
+        if (isChar(k, 'r') && !k.isCtrlDown() && !k.isAltDown()) {
             recordJump = new RecordJump(); // §16.3
             return;
         }
@@ -2101,6 +2148,10 @@ public final class ViewerApp {
                 recomputeDialog();
             } else {
                 dialog = searchDialog;
+                // §22.4: reopen with each field's caret at its end (least-surprising for the persisted
+                // query/thread text; §15.5 keeps the rest of the state).
+                searchDialog.caretRegex = searchDialog.query.length();
+                searchDialog.caretThread = searchDialog.threadQuery.length();
             }
             return;
         }
@@ -2171,51 +2222,86 @@ public final class ViewerApp {
         }
     }
 
+    /** §22.4: the regex field as an editable {@code (text, caret)}; {@link #setRegexField} stores back. */
+    private FieldEdit regexField() {
+        return new FieldEdit(dialog.query.toString(), dialog.caretRegex);
+    }
+
+    private void setRegexField(final FieldEdit fe) {
+        dialog.query.setLength(0);
+        dialog.query.append(fe.text());
+        dialog.caretRegex = fe.caret();
+    }
+
+    /** §22.4: the {@code thread:} field as an editable {@code (text, caret)}; {@link #setThreadField} stores back. */
+    private FieldEdit threadField() {
+        return new FieldEdit(dialog.threadQuery.toString(), dialog.caretThread);
+    }
+
+    private void setThreadField(final FieldEdit fe) {
+        dialog.threadQuery.setLength(0);
+        dialog.threadQuery.append(fe.text());
+        dialog.caretThread = fe.caret();
+    }
+
     /**
-     * QUERY-focus keys (§15.2): printables edit, Backspace deletes one character, and
-     * Ctrl-Backspace clears the query with its results and count line in one stroke — with
-     * Ctrl-U and Ctrl-W accepted as portable synonyms, because on classic xterm-style
-     * encodings Ctrl-Backspace reaches lanterna as a plain {@code KeyType.Backspace}
-     * (indistinguishable from an unmodified one; only kitty-/win32-style terminals report
-     * the Ctrl modifier on Backspace). ↑/↓ hand the focus to the result list, performing
-     * the first move — only when there are results to move over; § 21.6: → moves to the
-     * {@code thread:} field.
+     * QUERY-focus keys of the {@code /} regex field (§15.2 + the §22.4 caret): printables INSERT at
+     * the caret and Backspace deletes the character BEFORE it (not just the tail); Ctrl-Backspace
+     * (with Ctrl-U/Ctrl-W as portable synonyms — classic terminals deliver Ctrl-Backspace as a plain
+     * {@code Backspace}) clears the query, results and count line in one stroke. {@code ←}/{@code →}
+     * move the caret; {@code →} at the right-most caret CROSSES to the {@code thread:} field (caret at
+     * its start). {@code ↓} enters the result list (§22.3 {@code ↑}-at-top returns); {@code ↑} here is
+     * a no-op (nothing sits above the regex field).
      */
     private void handleSearchQueryKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
         boolean ctrl = k.isCtrlDown();
         if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
             dialog.query.setLength(0);
+            dialog.caretRegex = 0;
             dialog.sel = 0;
             dialog.scroll = 0;
             recomputeDialog(); // empties rows and note, so the §15.3 count line disappears too
             return;
         }
         if (t == KeyType.Backspace) {
-            if (dialog.query.length() > 0) {
-                dialog.query.deleteCharAt(dialog.query.length() - 1);
+            FieldEdit fe = regexField();
+            if (!fe.atStart()) {
+                setRegexField(fe.backspace());
                 dialog.sel = 0;
                 dialog.scroll = 0;
                 recomputeDialog();
             }
             return;
         }
-        if (t == KeyType.ArrowRight) {
-            dialog.focus = DialogFocus.THREAD; // §21.6: move to the thread: field on the right
+        if (t == KeyType.ArrowLeft) {
+            setRegexField(regexField().left());
             return;
         }
-        if (t == KeyType.ArrowUp || t == KeyType.ArrowDown) {
+        if (t == KeyType.ArrowRight) {
+            FieldEdit fe = regexField();
+            if (fe.atEnd()) {
+                dialog.focus = DialogFocus.THREAD; // §22.4: cross to the thread: field (caret at 0)
+                dialog.caretThread = 0;
+            } else {
+                setRegexField(fe.right());
+            }
+            return;
+        }
+        if (t == KeyType.ArrowDown) {
             if (!dialog.rows.isEmpty()) {
-                // §15.2: the first arrow only ENTERS the list — the already-highlighted
-                // row stays selected; moving on entry would skip the first result.
+                // §15.2/§22.4: ↓ only ENTERS the list — the already-highlighted row stays selected.
                 dialog.focus = DialogFocus.LIST;
             }
             return;
         }
+        if (t == KeyType.ArrowUp) {
+            return; // §22.4: nothing above the regex field
+        }
         if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
             Character ch = k.getCharacter();
             if (ch != null && ch >= ' ') {
-                dialog.query.append(ch.charValue());
+                setRegexField(regexField().insert(ch.charValue())); // §22.4: insert at the caret
                 dialog.sel = 0;
                 dialog.scroll = 0;
                 recomputeDialog();
@@ -2224,10 +2310,12 @@ public final class ViewerApp {
     }
 
     /**
-     * §21.6 THREAD-focus keys of the {@code /} browser's {@code thread:} field: DIGITS edit the
-     * thread id (capped at 9 digits so it always parses as an {@code int}), Backspace deletes,
-     * Ctrl-U/Ctrl-W/Ctrl-Backspace clear it, {@code ←} returns to the regex field, {@code ↓} enters
-     * the result list; every edit recomputes with the new thread filter (blank = all threads).
+     * THREAD-focus keys of the {@code /} browser's {@code thread:} field (§21.6 + the §22.4 caret):
+     * DIGITS insert at the caret (capped at 9 digits so it always parses as an {@code int}), Backspace
+     * deletes the digit before it, Ctrl-U/Ctrl-W/Ctrl-Backspace clear it. {@code ←}/{@code →} move the
+     * caret; {@code ←} at the left-most caret returns to the regex field (caret at its END, §22.4).
+     * {@code ↓} enters the result list (§22.3 {@code ↑}-at-top returns); {@code ↑} here is a no-op.
+     * Every edit recomputes with the new thread filter (blank = all threads).
      */
     private void handleSearchThreadKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -2235,6 +2323,7 @@ public final class ViewerApp {
         if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
             if (dialog.threadQuery.length() > 0) {
                 dialog.threadQuery.setLength(0);
+                dialog.caretThread = 0;
                 dialog.sel = 0;
                 dialog.scroll = 0;
                 recomputeDialog();
@@ -2242,8 +2331,9 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.Backspace) {
-            if (dialog.threadQuery.length() > 0) {
-                dialog.threadQuery.deleteCharAt(dialog.threadQuery.length() - 1);
+            FieldEdit fe = threadField();
+            if (!fe.atStart()) {
+                setThreadField(fe.backspace());
                 dialog.sel = 0;
                 dialog.scroll = 0;
                 recomputeDialog();
@@ -2251,7 +2341,17 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.ArrowLeft) {
-            dialog.focus = DialogFocus.QUERY;
+            FieldEdit fe = threadField();
+            if (fe.atStart()) {
+                dialog.focus = DialogFocus.QUERY; // §22.4: back to the regex field, caret at its end
+                dialog.caretRegex = dialog.query.length();
+            } else {
+                setThreadField(fe.left());
+            }
+            return;
+        }
+        if (t == KeyType.ArrowRight) {
+            setThreadField(threadField().right()); // §22.4: caret right (no further crossing)
             return;
         }
         if (t == KeyType.ArrowDown) {
@@ -2260,10 +2360,13 @@ public final class ViewerApp {
             }
             return;
         }
+        if (t == KeyType.ArrowUp) {
+            return; // §22.4: nothing above the thread field
+        }
         if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
             Character ch = k.getCharacter();
             if (ch != null && ch >= '0' && ch <= '9' && dialog.threadQuery.length() < 9) {
-                dialog.threadQuery.append(ch.charValue());
+                setThreadField(threadField().insert(ch.charValue())); // digits only, at the caret
                 dialog.sel = 0;
                 dialog.scroll = 0;
                 recomputeDialog();
@@ -2293,7 +2396,14 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.ArrowUp) {
-            moveSearchSelection(-1);
+            // §22.3: ↑ on the FIRST list row returns focus to the LEFT (regex) field and clears the
+            // list highlight; otherwise it moves the selection up.
+            boolean atTop = dialog.instancesMode ? dialog.instanceTree.selection() == 0 : dialog.sel == 0;
+            if (atTop) {
+                dialog.focus = DialogFocus.QUERY;
+            } else {
+                moveSearchSelection(-1);
+            }
             return;
         }
         if (t == KeyType.ArrowDown) {
@@ -2501,11 +2611,17 @@ public final class ViewerApp {
             List<String> rows = new ArrayList<>(res.rows().size());
             List<ObjectNode> roots = new ArrayList<>(res.rows().size());
             for (InstanceBrowse.Row r : res.rows()) {
-                String label = "seq " + r.seq() + DOT + "t" + r.tid() + DOT + r.display();
+                // §22.8: build the root from engine.objectTree(id).value() (a sized, correctly-
+                // expandable Ref) instead of a bare Value.Ref, so a map/set/list instance shows its
+                // ", size=N" suffix and gets the right expandable flag; the "seq N · tX · " prefix
+                // stays, only the trailing display now carries the size.
+                Value rootValue = r.objectId() != 0
+                        ? engine.objectTree(r.objectId()).value()
+                        : new Value.Ref(0, r.display(), false);
+                String label = "seq " + r.seq() + DOT + "t" + r.tid() + DOT + rootValue.display();
                 rows.add(label);
-                // §14.2: the row itself is an expandable object-tree root (label unchanged).
-                roots.add(new ObjectNode(
-                        label, new Value.Ref(r.objectId(), r.display()), r.objectId() != 0));
+                // §14.2: the row itself is an expandable object-tree root (expandability from the ref).
+                roots.add(ObjectNode.of(label, rootValue));
             }
             dialog.rows = rows;
             dialog.instanceRows = res.rows();
@@ -2831,16 +2947,19 @@ public final class ViewerApp {
     }
 
     /**
-     * §20.9: rebuilds the window's rows from {@link Engine#fieldWriteChanges} for the current filter
-     * (capped at {@link #VAR_CHANGE_CAP}, ascending seq), formats them with the shared
-     * {@link VarHistory#row}, sets the DIM count note ({@code showing first 1000 of N} when capped,
-     * else {@code N results}) and resets the selection/scroll/hscroll — called on open and on every
-     * filter keystroke.
+     * §20.9/§22.11: rebuilds the window's rows from {@link Engine#fieldWriteChanges} for the current
+     * name filter AND {@code thread:} id ({@code 0} = all threads), UNTRIMMED ({@code
+     * Integer.MAX_VALUE} cap) so every matching write is explorable, formats them with the shared
+     * {@link VarHistory#row}, sets the DIM count note ({@code N results} — the §22.11 uncap dropped
+     * the old {@code showing first 1000} note; the {@code showing first N of M} branch is now only a
+     * defensive guard that never fires) and resets the selection/scroll/hscroll — called on open and
+     * on every filter/thread keystroke.
      */
     private void rebuildVarChanges(final VarChangeWindow w) {
         String filter = w.filter.toString();
-        List<FieldWriteHit> hits = engine.fieldWriteChanges(filter, VAR_CHANGE_CAP);
-        long total = engine.countFieldWriteChanges(filter);
+        int tid = varChangeThread(w);
+        List<FieldWriteHit> hits = engine.fieldWriteChanges(filter, tid, Integer.MAX_VALUE);
+        long total = engine.countFieldWriteChanges(filter, tid);
         List<String> rows = new ArrayList<>(hits.size());
         for (FieldWriteHit hit : hits) {
             rows.add(VarHistory.row(hit));
@@ -2848,11 +2967,17 @@ public final class ViewerApp {
         w.hits = hits;
         w.rows = rows;
         w.note = total > rows.size()
-                ? "showing first " + VAR_CHANGE_CAP + " of " + total
+                ? "showing first " + rows.size() + " of " + total
                 : rows.size() + " results";
         w.sel = 0;
         w.scroll = 0;
         w.hcol = 0;
+    }
+
+    /** §22.11: the V window's {@code thread:} filter as an int ({@code 0} = all threads). */
+    private int varChangeThread(final VarChangeWindow w) {
+        String s = w.threadQuery.toString();
+        return s.isEmpty() ? 0 : Integer.parseInt(s);
     }
 
     /**
@@ -2872,16 +2997,42 @@ public final class ViewerApp {
         }
         if (varChanges.focus == DialogFocus.QUERY) {
             handleVarChangesQuery(k);
+        } else if (varChanges.focus == DialogFocus.THREAD) {
+            handleVarChangesThread(k);
         } else {
             handleVarChangesList(k);
         }
     }
 
+    /** §22.11: the V window's name-filter field as an editable {@code (text, caret)}. */
+    private FieldEdit varChangeFilterField() {
+        return new FieldEdit(varChanges.filter.toString(), varChanges.caretFilter);
+    }
+
+    private void setVarChangeFilterField(final FieldEdit fe) {
+        varChanges.filter.setLength(0);
+        varChanges.filter.append(fe.text());
+        varChanges.caretFilter = fe.caret();
+    }
+
+    /** §22.11: the V window's {@code thread:} field as an editable {@code (text, caret)}. */
+    private FieldEdit varChangeThreadField() {
+        return new FieldEdit(varChanges.threadQuery.toString(), varChanges.caretThread);
+    }
+
+    private void setVarChangeThreadField(final FieldEdit fe) {
+        varChanges.threadQuery.setLength(0);
+        varChanges.threadQuery.append(fe.text());
+        varChanges.caretThread = fe.caret();
+    }
+
     /**
-     * §20.9 QUERY focus: printables edit the filter (recompute per keystroke), Backspace deletes,
-     * Ctrl-U/Ctrl-W/Ctrl-Backspace clear it, ←/→ hscroll, and ↑/↓ (and the paging keys) hand focus
-     * to the result LIST — mirroring the §15.2 {@code /} dialog so field names containing {@code g}
-     * or {@code <} can still be typed instead of triggering the list's g/G/</> commands.
+     * §20.9 QUERY focus, with the §22.11/§22.4 caret: printables INSERT at the caret (recompute per
+     * keystroke), Backspace deletes the character before it, Ctrl-U/Ctrl-W/Ctrl-Backspace clear it.
+     * {@code ←}/{@code →} move the caret; {@code →} at the right-most caret CROSSES to the {@code
+     * thread:} field. {@code ↓} (and the paging keys) hand focus to the result LIST — mirroring the
+     * §15.2 {@code /} dialog so field names containing {@code g}/{@code <} type instead of triggering
+     * the list commands. {@code ↑} here is a no-op (nothing above the filter field).
      */
     private void handleVarChangesQuery(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -2889,39 +3040,108 @@ public final class ViewerApp {
         VarChangeWindow w = varChanges;
         if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
             w.filter.setLength(0);
+            w.caretFilter = 0;
             rebuildVarChanges(w);
             return;
         }
         if (t == KeyType.Backspace) {
-            if (w.filter.length() > 0) {
-                w.filter.deleteCharAt(w.filter.length() - 1);
+            FieldEdit fe = varChangeFilterField();
+            if (!fe.atStart()) {
+                setVarChangeFilterField(fe.backspace());
                 rebuildVarChanges(w);
             }
             return;
         }
         if (t == KeyType.ArrowLeft) {
-            w.hcol = Math.max(0, w.hcol - HSTEP);
+            setVarChangeFilterField(varChangeFilterField().left());
             return;
         }
         if (t == KeyType.ArrowRight) {
-            w.hcol += HSTEP;
+            FieldEdit fe = varChangeFilterField();
+            if (fe.atEnd()) {
+                w.focus = DialogFocus.THREAD; // §22.11/§22.4: cross to the thread: field (caret at 0)
+                w.caretThread = 0;
+            } else {
+                setVarChangeFilterField(fe.right());
+            }
             return;
         }
-        if (t == KeyType.ArrowUp || t == KeyType.ArrowDown
-                || t == KeyType.PageUp || t == KeyType.PageDown
+        if (t == KeyType.ArrowDown || t == KeyType.PageUp || t == KeyType.PageDown
                 || (ctrl && (isChar(k, 'f') || isChar(k, 'b')))) {
             if (!w.rows.isEmpty()) {
-                w.focus = DialogFocus.LIST; // §15.2: the first arrow only ENTERS; paging applies now
-                if (t != KeyType.ArrowUp && t != KeyType.ArrowDown) {
+                w.focus = DialogFocus.LIST; // §15.2/§22.4: ↓ ENTERS; paging applies now
+                if (t != KeyType.ArrowDown) {
                     handleVarChangesList(k);
                 }
             }
             return;
         }
+        if (t == KeyType.ArrowUp) {
+            return; // §22.4: nothing above the filter field
+        }
         if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
             Character ch = k.getCharacter();
             if (ch != null && ch >= ' ') {
-                w.filter.append(ch.charValue());
+                setVarChangeFilterField(varChangeFilterField().insert(ch.charValue()));
+                rebuildVarChanges(w);
+            }
+        }
+    }
+
+    /**
+     * §22.11 THREAD focus of the V window's {@code thread:} field (the §22.4 caret): DIGITS insert at
+     * the caret (≤ 9 digits so it parses as an {@code int}), Backspace deletes, Ctrl-U/Ctrl-W/Ctrl-
+     * Backspace clear it. {@code ←}/{@code →} move the caret; {@code ←} at the left-most caret returns
+     * to the filter field (caret at its END). {@code ↓} enters the list; {@code ↑} is a no-op. Every
+     * edit recomputes with the new thread filter (blank = all threads).
+     */
+    private void handleVarChangesThread(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        VarChangeWindow w = varChanges;
+        if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
+            if (w.threadQuery.length() > 0) {
+                w.threadQuery.setLength(0);
+                w.caretThread = 0;
+                rebuildVarChanges(w);
+            }
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            FieldEdit fe = varChangeThreadField();
+            if (!fe.atStart()) {
+                setVarChangeThreadField(fe.backspace());
+                rebuildVarChanges(w);
+            }
+            return;
+        }
+        if (t == KeyType.ArrowLeft) {
+            FieldEdit fe = varChangeThreadField();
+            if (fe.atStart()) {
+                w.focus = DialogFocus.QUERY; // §22.4: back to the filter field, caret at its end
+                w.caretFilter = w.filter.length();
+            } else {
+                setVarChangeThreadField(fe.left());
+            }
+            return;
+        }
+        if (t == KeyType.ArrowRight) {
+            setVarChangeThreadField(varChangeThreadField().right());
+            return;
+        }
+        if (t == KeyType.ArrowDown) {
+            if (!w.rows.isEmpty()) {
+                w.focus = DialogFocus.LIST;
+            }
+            return;
+        }
+        if (t == KeyType.ArrowUp) {
+            return; // §22.4: nothing above the thread field
+        }
+        if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= '0' && ch <= '9' && w.threadQuery.length() < 9) {
+                setVarChangeThreadField(varChangeThreadField().insert(ch.charValue()));
                 rebuildVarChanges(w);
             }
         }
@@ -2948,10 +3168,17 @@ public final class ViewerApp {
                 w.filter.deleteCharAt(w.filter.length() - 1);
                 rebuildVarChanges(w);
             }
+            w.caretFilter = w.filter.length(); // §22.4: caret at the (new) end of the filter
             return;
         }
         if (t == KeyType.ArrowUp) {
-            w.sel = Math.max(0, w.sel - 1);
+            // §22.3: ↑ at the top returns focus to the input (filter field), clearing the highlight.
+            if (w.sel <= 0) {
+                w.sel = 0;
+                w.focus = DialogFocus.QUERY;
+            } else {
+                w.sel--;
+            }
         } else if (t == KeyType.ArrowDown) {
             w.sel = Math.min(last, w.sel + 1);
         } else if (t == KeyType.ArrowLeft) {
@@ -3004,6 +3231,13 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.Enter) {
+            submitRecordJump();
+            return;
+        }
+        if ((isChar(k, 'l') || isChar(k, 'L')) && !k.isCtrlDown() && !k.isAltDown()) {
+            // §22.13: `l` jumps straight to the last record — the highest seq (the modal's
+            // `1..<max>` hint). Kept inside the modal so the global `l` = focus Locals is unbroken.
+            recordJump.setDigits(engine.maxSeq());
             submitRecordJump();
             return;
         }
@@ -3381,7 +3615,7 @@ public final class ViewerApp {
      */
     private void drawFileDialog(final TextGraphics g, final int cols, final int rows) {
         int w = clamp(cols * 2 / 3, 30, cols - 2); // §21.3: 2/3 of the terminal width
-        int h = clamp(rows - 6, 8, 20);
+        int h = clamp(rows * 3 / 4, 8, rows - 2); // §22.10: 3/4 of the terminal height
         int x = Math.max(0, (cols - w) / 2);
         int y = Math.max(0, (rows - h) / 2);
         g.setForegroundColor(Palette.FG);
@@ -3400,10 +3634,8 @@ public final class ViewerApp {
             cursorPos = new TerminalPosition(
                     Math.min(x + w - 2, ix + prompt.length() + fileDialog.query.length()), iy);
         }
-        // §21.3 info line: the selected row's full path (current folder path in BROWSE, selected
-        // file's full path in FLAT), or the invalid-regex note.
-        String info = fileDialog.tree.filterValid() ? selectedFilePath() : "invalid regex";
-        put(g, ix, iy + 1, clip(info, iw), Palette.DIM, Palette.DIALOG_BG, false);
+        // §22.2: the selected path moved OUT of the dialog to the global INFO line (renderStatus), so
+        // the list now starts directly under the filter line (one more visible row).
 
         int hintRow = y + h - 2;
         String hint;
@@ -3416,7 +3648,7 @@ public final class ViewerApp {
         }
         put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
-        int listTop = iy + 2;
+        int listTop = iy + 1; // §22.2: no in-dialog info line anymore
         int listH = hintRow - listTop;
         fileDialog.listViewH = Math.max(1, listH);
         int count = fileRowCount();
@@ -3432,17 +3664,42 @@ public final class ViewerApp {
         boolean listFocus = fileDialog.focus == DialogFocus.LIST;
         List<FileTree.Row> browseRows = flat ? List.of() : fileDialog.tree.rows();
         List<FileTree.FlatRow> flatRows = flat ? fileDialog.tree.flatRows() : List.of();
+        String query = fileDialog.query.toString();
         for (int r = 0; r < listH; r++) {
             int idx = fileDialog.scroll + r;
             if (idx >= count) {
                 break;
             }
-            String text = flat
-                    ? FileTree.suffixView(flatRows.get(idx).rel(), iw, fileDialog.hcol)
-                    : browseRowText(browseRows.get(idx));
             boolean s = listFocus && idx == fileDialog.sel; // §21.3: highlight only in LIST focus
-            put(g, ix, listTop + r, clipPad(text, iw),
-                    s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+            TextColor fg = s ? Palette.SELECTION_FG : Palette.FG;
+            TextColor bg = s ? Palette.SELECTION_BG : Palette.DIALOG_BG;
+            if (flat) {
+                drawFlatFileRow(g, ix, listTop + r, iw, flatRows.get(idx).rel(), query, fg, bg);
+            } else {
+                put(g, ix, listTop + r, clipPad(browseRowText(browseRows.get(idx)), iw), fg, bg, false);
+            }
+        }
+    }
+
+    /**
+     * §22.2 flat-filter row: the root-relative path {@link FileTree#rightAlign right-aligned} into
+     * {@code iw} columns (file name flush-right, prefix clips/scrolls on the left) painted in the
+     * row's base colours, then EVERY occurrence of the filter {@code query} within the visible text
+     * repainted reverse-video ({@link Palette#SEARCH_MATCH_FG}/{@link Palette#SEARCH_MATCH_BG}), so
+     * matches stand out on selected and unselected rows alike (matches are found case-insensitively
+     * on the already-clipped text, so a match scrolled partly off the left edge simply is not shown).
+     */
+    private void drawFlatFileRow(final TextGraphics g, final int ix, final int y, final int iw,
+            final String rel, final String query, final TextColor fg, final TextColor bg) {
+        String text = FileTree.rightAlign(rel, iw, fileDialog.hcol);
+        put(g, ix, y, text, fg, bg, false);
+        for (int[] span : InFileSearch.regexMatchColumns(text, query, TAB_WIDTH)) {
+            int from = Math.max(0, span[0]);
+            int to = Math.min(text.length(), span[1]);
+            if (to > from) {
+                put(g, ix + from, y, text.substring(from, to),
+                        Palette.SEARCH_MATCH_FG, Palette.SEARCH_MATCH_BG, false);
+            }
         }
     }
 
@@ -3507,30 +3764,35 @@ public final class ViewerApp {
     }
 
     /**
-     * §21.7 run-to-line: run to the next ({@code forward}) / previous record passing through the
-     * SELECTED source line — the highlighted-number line {@code srcCursor} in the shown frame's
-     * file, resolved by the engine to that {@code (classBinary, line)}'s LINE site — in the current
-     * thread ({@code sameThread}) or any thread. {@code cls} is the selected frame's binary class.
-     * Browse mode or no resolvable frame yields an info-line message and no move; the engine's own
-     * {@link StepResult} (a move, or "no earlier/later pass"/"no LINE record for this line") flows
-     * through {@link #doStep} so a move appends exactly one history entry and a non-move just shows
-     * the message.
+     * §22.5 run-to-line on the SHOWN file (supersedes §21.7's frame-only resolution): run to the
+     * next ({@code forward}) / previous record passing through the SELECTED source line — the
+     * highlighted-number line {@code srcCursor} in the shown file — in the current thread
+     * ({@code sameThread}) or any thread. The engine resolves LINE sites by the file's BASE NAME
+     * (§22.14), so it works in BOTH modes: in exec mode the shown file is the selected frame's
+     * {@link Frame#fileName()}, in browse mode it is the browsed file ({@code browseName}) — browse
+     * mode no longer bails, which (together with passing the file name rather than the binary class
+     * the old code wrongly fed the file-name parameter) is the {@code Ctrl-Q} fix. Only "no shown
+     * file / no resolvable line" is reported by us; the engine's own {@link StepResult} (a move, or
+     * "no earlier/later pass"/"no LINE record for this line") flows through {@link #doStep} so a move
+     * appends exactly one history entry and leaves browse mode via {@link #afterMove}.
      *
      * @param forward {@code true} to run to the next pass, {@code false} to the previous one
      * @param sameThread {@code true} to stay in the current thread ({@code Ctrl-R}/{@code Ctrl-Q}),
      *     {@code false} to search all threads ({@code Ctrl-T}/{@code Ctrl-W})
      */
     private void runToSelectedLine(final boolean forward, final boolean sameThread) {
+        String fileName;
         if (browseMode) {
-            status = "run-to-line: not available in browse mode (o to return to execution)";
+            fileName = browseName; // the browsed file's base name (browse has no frame)
+        } else {
+            Frame f = selectedFrameOrNull();
+            fileName = f != null ? f.fileName() : null;
+        }
+        if (fileName == null || fileName.isEmpty()) {
+            status = "run-to-line: no shown file to resolve the selected line";
             return;
         }
-        Frame f = selectedFrameOrNull();
-        if (f == null || f.classBinary() == null) {
-            status = "run-to-line: no frame to resolve the selected line";
-            return;
-        }
-        doStep(engine.runToLine(f.classBinary(), srcCursor, forward, sameThread));
+        doStep(engine.runToLine(fileName, srcCursor, forward, sameThread));
     }
 
     /**

@@ -27,6 +27,16 @@ public final class RecordJump {
         }
     }
 
+    /**
+     * Replaces the buffer with {@code value}'s decimal digits and clears the error — the §22.13
+     * {@code l} shortcut that fills in the last record's seq (a negative value fills {@code 0}).
+     */
+    public void setDigits(final long value) {
+        digits.setLength(0);
+        digits.append(Long.toString(Math.max(0L, value)));
+        error = "";
+    }
+
     /** Deletes the last digit (when any) and clears the error. */
     public void backspace() {
         if (digits.length() > 0) {

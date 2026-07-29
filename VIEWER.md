@@ -1310,3 +1310,104 @@ globally it scrolls the focused window up.
 `Ctrl-R`/`Ctrl-Q`/`Ctrl-T`/`Ctrl-W` (run-to-line family), `V`, `Ctrl-X` and the scroll keys
 appear in the `F1` help WINDOW but NOT on the trimmed status line, which keeps ending
 `F1 help`.
+
+## 22. v2.2 additions & changes
+
+Authoritative over conflicting earlier text (§21). Viewer-only except §22.7 (recorder/
+script). All schema-4 recordings.
+
+### 22.1 Broader, token-based date gate
+The §21.1 date gate becomes richer and TOKEN-based (not raw substring, which mis-fired on
+`update`⊇`date`, `runtime`⊇`time`). The variable name is split into lowercase tokens on
+camelCase boundaries and `_`/`$`; a date is shown when ANY token is in the time set AND the
+value is a non-negative int/long in a seconds/millis/nanos range. Time-token set (tunable):
+`time, date, datetime, instant, timestamp, ts, second, seconds, sec, milli, millis, ms,
+nano, nanos, micro, micros, start, end, epoch, expiry, expiration, expires, deadline,
+elapsed, since, until, created, updated, modified`. Valid dates are ≥ 1970-01-01 (negative
+values never dated — already enforced). Hex still on every integral regardless of name.
+
+### 22.2 `F` dialog: prefix on the Info line; right-aligned names; match highlight
+In flat-filter mode: the selected file's full path is shown on the global INFO line
+(screen's last-but-one row), NOT inside the dialog. Rows RIGHT-ALIGN the (root-relative)
+path so the file name is always flush-right/visible; the query's matches within each row
+are HIGHLIGHTED (all occurrences, possibly several per row). Horizontal scroll still
+reveals the clipped prefix.
+
+### 22.3 Up-at-top returns to the input field (all list windows)
+In every window/dialog that has a text-input field above a list (the `/` browser, the `V`
+window, the `F` dialog), pressing `↑` while the selection is on the FIRST list row returns
+focus to the input field and clears the list highlight. In the `/` browser this returns to
+the LEFT (regex) field.
+
+### 22.4 `/` dialog: in-field cursor + edge crossing
+The `/` dialog's two inputs become real text fields with a caret: `←`/`→` move the caret
+within the focused field. From the LEFT (regex) field, `→` at the right-most caret moves
+focus to the `thread:` field (caret at its start). From the `thread:` field, `←` at the
+left-most caret returns to the regex field (caret at its end). `↓` from either field enters
+the list (§22.3 `↑` returns). Backspace/typing act at the caret. (Digits-only still enforced
+in `thread:`.)
+
+### 22.5 Run-to-line works on the shown file (browse + exec) — supersedes §21.7 resolution
+Run-to-line targets the SHOWN file's `srcCursor` line regardless of mode: engine gains
+`runToLine(String fileName, int line, boolean forward, boolean sameThread)` resolving LINE
+sites by the file symbol's base name (covers inner classes sharing the file, and browse
+mode where there is no frame). The TUI passes the shown file's base name (the selected
+frame's file in exec mode, the browsed file in browse mode) + `srcCursor`. `Ctrl-R`/`Ctrl-Q`
+(same-thread fwd/back) and `Ctrl-T`/`Ctrl-W` (any-thread fwd/back) all work in browse mode
+and on the current stepped-into file. FIX `Ctrl-Q`: verify the same-thread BACKWARD search
+actually moves (investigate the reported failure end-to-end — binding, engine backward
+scan, and the browse-mode bail that currently blocks it). Unresolvable file/line ⇒ info
+message.
+
+### 22.6 `Alt-F`: space before the arrow
+The field prompt is `[ Search ↓: <query> ]` / `[ Search ↑: <query> ]` — one space between
+`Search` and the direction arrow.
+
+### 22.7 Timestamp always preserved (recorder/script)
+The recording script adds `com.hedera.hapi.node.base.Timestamp` to `snapshotAlways` so
+Timestamp instances are baseline-dumped at any depth (their `seconds`/`nanos` never come
+out `<No info available>`). Needs a fresh recording.
+
+### 22.8 Container sizes in the `/` instance-explore
+The `, size=N` container label (§21.5) must also appear when exploring an instance's tree
+inside the `/` dialog (its nodes currently omit it). Route the `/` explore tree through the
+same ref-rendering as Locals so map/set/list sizes show there too.
+
+### 22.9 Numeric element alignment; arrays omit the size suffix
+When a container's elements are all integers, RIGHT-ALIGN them padded with spaces to the
+width of the longest `Integer.toString` in that container (per-container). When all
+elements are floating-point, right-align on the INTEGER PART (pad the text before the
+decimal point to the max integer-part width). Mixed/non-numeric: unchanged. ARRAYS do NOT
+get the `, size=N` suffix (their length already shows in the type, e.g. `int[8192]#id`);
+maps/sets/lists keep it.
+
+### 22.10 `/` and `F` dialog geometry
+Both the `/` browser and the `F` file dialog are 2/3 of the terminal WIDTH and 3/4 of its
+HEIGHT.
+
+### 22.11 `V` window: thread filter + uncapped
+The `V` variable-change window gains a `thread:` filter field with the §22.4 edge-crossing
+behaviour, filtering transitions to that thread (blank = all). The list is UNTRIMMED (all
+matching writes, `Integer.MAX_VALUE` cap) so every item is explorable. Engine
+`fieldWriteChanges`/`countFieldWriteChanges` gain a thread-id filter param.
+
+### 22.12 ID fields are expandable
+A field whose name denotes an ID — exactly `id` (any case), or ending `Id`/`ID`, or
+starting `id` followed by an uppercase letter / `_` / `$` — is marked EXPANDABLE when its
+value is a reference (object id), UNLESS the value is a primitive or a boxed/atomic number
+(those stay non-expandable). So an `accountId = AccountID#5` (or an id holding any recorded
+object) can always be drilled into.
+
+### 22.13 Jump-to-record: last-record hint + `l`; Records opens it with `r`
+The `Jump to record` modal shows the highest record seq as a hint (`1..<max>`). A new
+global `l` jumps to the LAST record (highest seq → nearest exec record). Engine
+`lastRecord() -> SeqLocation` (or `maxSeq()`), reused by both. In the RECORDS window the
+modal now opens with `r` (not `c`), so `c` again switches focus to the Source window from
+Records (undoing the §20.12 yield). `r` elsewhere still switches focus to Records.
+
+### 22.14 (engine) run-to-line by file name
+`runToLine(String fileName,int line,boolean forward,boolean sameThread)`: lazily index LINE
+sites by `(fileBaseName, line) -> siteIds`; same-thread scans the current thread's
+`lineIndices` strictly after/before the cursor for any of those sites; any-thread scans all
+threads by global seq. Keep the §21.7 `(classBinary,...)` overload if still referenced, or
+migrate its callers/tests.

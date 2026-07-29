@@ -19,8 +19,8 @@ public final class InFileSearch {
     /** {@link #nextFrom} sentinel: no occurrence exists in the requested direction (§19.4). */
     public static final int BOUNDARY = -1;
 
-    /** The 0-based offset of the direction arrow within {@link #searchPrefix} (after {@code "[ Search"}). */
-    public static final int ARROW_OFFSET = "[ Search".length();
+    /** The 0-based offset of the direction arrow within {@link #searchPrefix} (after {@code "[ Search "}). */
+    public static final int ARROW_OFFSET = "[ Search ".length();
 
     /** Search motion direction (§19.4): forward (down the file) or reverse (up). */
     public enum Dir {
@@ -42,15 +42,16 @@ public final class InFileSearch {
     }
 
     /**
-     * The §21.2 in-file search field prefix — everything up to (and including) the space before
-     * the query input area: {@code "[ Search↓: "} forward, {@code "[ Search↑: "} reverse. The
-     * direction arrow sits at {@link #ARROW_OFFSET}.
+     * The §21.2/§22.6 in-file search field prefix — everything up to (and including) the space
+     * before the query input area: {@code "[ Search ↓: "} forward, {@code "[ Search ↑: "} reverse.
+     * §22.6 inserts one space between {@code Search} and the direction arrow; the arrow sits at
+     * {@link #ARROW_OFFSET}.
      *
      * @param reverse whether the field is in the reverse (up) direction
      * @return the field prefix ending in {@code ": "}
      */
     public static String searchPrefix(final boolean reverse) {
-        return "[ Search" + directionArrow(reverse) + ": ";
+        return "[ Search " + directionArrow(reverse) + ": ";
     }
 
     /**
@@ -219,6 +220,46 @@ public final class InFileSearch {
             int end = idx + needle.length();
             out.add(new int[] {visAt[idx], visAt[end]});
             from = end; // non-overlapping: continue past this match
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * Like {@link #matchColumns} but matching {@code regex} (case-insensitive) — the §22.2 F-dialog
+     * highlight, whose filter is itself a regex, so a metacharacter query (e.g. {@code Foo.*}) marks
+     * its matched span rather than nothing. An invalid regex or a zero-width match yields no spans
+     * (never throws, never loops). Empty matches are skipped so the scan always advances.
+     */
+    public static List<int[]> regexMatchColumns(final String line, final String regex, final int tabWidth) {
+        if (line == null || regex == null || regex.isEmpty()) {
+            return List.of();
+        }
+        final java.util.regex.Pattern pattern;
+        try {
+            pattern = java.util.regex.Pattern.compile(regex, java.util.regex.Pattern.CASE_INSENSITIVE);
+        } catch (java.util.regex.PatternSyntaxException e) {
+            return List.of();
+        }
+        int n = line.length();
+        int[] visAt = new int[n + 1];
+        int col = 0;
+        for (int i = 0; i < n; i++) {
+            visAt[i] = col;
+            col = line.charAt(i) == '\t' && tabWidth > 0 ? ((col / tabWidth) + 1) * tabWidth : col + 1;
+        }
+        visAt[n] = col;
+        List<int[]> out = new ArrayList<>();
+        java.util.regex.Matcher m = pattern.matcher(line);
+        int from = 0;
+        while (from <= n && m.find(from)) {
+            int s = m.start();
+            int e = m.end();
+            if (e > s) {
+                out.add(new int[] {visAt[s], visAt[e]});
+                from = e;
+            } else {
+                from = s + 1; // zero-width match: advance to avoid an infinite loop
+            }
         }
         return List.copyOf(out);
     }

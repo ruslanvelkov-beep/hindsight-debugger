@@ -52,6 +52,19 @@ final class RecordJumpTest {
     }
 
     @Test
+    void setDigitsFillsTheBufferAndClearsTheError() {
+        RecordJump j = new RecordJump();
+        j.appendDigit('9');
+        j.setError("boom");
+        j.setDigits(4200); // §22.13: `l` fills the last record's seq
+        assertEquals("4200", j.text());
+        assertEquals("", j.error(), "filling clears the error");
+        assertEquals(OptionalLong.of(4200L), j.parse());
+        j.setDigits(-5); // defensive: a negative value fills 0
+        assertEquals("0", j.text());
+    }
+
+    @Test
     void parseIsEmptyForNothingTypedOrOverflow() {
         RecordJump empty = new RecordJump();
         assertTrue(empty.parse().isEmpty());

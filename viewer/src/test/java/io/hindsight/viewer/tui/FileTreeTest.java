@@ -296,4 +296,21 @@ final class FileTreeTest {
         assertEquals("", FileTree.suffixView(null, 12, 0));
         assertEquals("", FileTree.suffixView(full, 0, 0));
     }
+
+    @Test
+    void rightAlignFlushesTheFileNameRight() {
+        String full = "com/foo/bar/Baz.java"; // length 20
+        // Fits: left-padded to the width so the name is flush-right (whole path visible).
+        assertEquals("        " + full, FileTree.rightAlign(full, 28, 0)); // 8 pad + 20
+        assertEquals(full, FileTree.rightAlign(full, 20, 0)); // exact fit, no padding
+        // Narrower: the tail already fills the width (same as suffixView), still flush-right.
+        assertEquals("bar/Baz.java", FileTree.rightAlign(full, 12, 0));
+        assertEquals("foo/bar/Baz.", FileTree.rightAlign(full, 12, 4));
+        // Every result is exactly `width` columns wide.
+        assertEquals(28, FileTree.rightAlign(full, 28, 0).length());
+        assertEquals(12, FileTree.rightAlign(full, 12, 0).length());
+        // Degenerate inputs.
+        assertEquals("", FileTree.rightAlign(null, 0, 0));
+        assertEquals("     ", FileTree.rightAlign(null, 5, 0)); // null path -> all padding
+    }
 }

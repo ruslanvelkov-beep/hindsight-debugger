@@ -5,7 +5,12 @@ import io.hindsight.reader.Format;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.regex.Pattern;
 
 /**
  * Pure numeric decoration for INLINE primitive values (VIEWER.md §20.5 hex, §20.4/§21.1 date).
@@ -27,12 +32,18 @@ import java.util.Locale;
  * zero-padded uppercase to the type width — byte 2, char 4, short 4, int 8, long 16 hex digits.
  * Booleans, floats and doubles get none. A char keeps its {@code 'c'} form then its {@code 0x00NN}.
  *
- * <p><b>Date (§20.4/§21.1).</b> An int/long whose value lands in one of three non-overlapping epoch
- * ranges — seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)} — has a
- * UTC wall-clock suffix {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text) available via
- * {@link #dateSuffix}. Per §21.1 the suffix is only appended when the value's variable name contains
- * {@code time}, {@code date} or {@code instant} (case-insensitive); {@link #decorateNamed} applies
- * that gate. An int only reaches the seconds range; a long reaches all three. The date follows the hex.
+ * <p><b>Date (§20.4/§21.1/§22.1).</b> An int/long whose value lands in one of three non-overlapping
+ * epoch ranges — seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)} — has
+ * a UTC wall-clock suffix {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text) available via
+ * {@link #dateSuffix}. Per §22.1 the suffix is only appended when the value's variable name has a
+ * time-like <em>token</em> (see {@link #nameSuggestsTime}); {@link #decorateNamed} applies that gate.
+ * The §22.1 token gate replaces the §21.1 raw {@code contains} test, which mis-fired on {@code update}
+ * (⊇ {@code date}) and {@code runtime} (⊇ {@code time}). An int only reaches the seconds range; a long
+ * reaches all three. The date follows the hex.
+ *
+ * <p>This class also hosts the two pure §22 name/element predicates that share the render pipeline:
+ * {@link #isIdName} (§22.12, an ID-denoting field name) and {@link #alignNumericElements} (§22.9,
+ * right-aligning a container's all-numeric element column).
  */
 final class NumberFormatUtil {
 
@@ -98,13 +109,177 @@ final class NumberFormatUtil {
         return nameSuggestsTime(varName) ? hexDecorated + dateSuffix(tag, slot) : hexDecorated;
     }
 
-    /** Whether a variable name (case-insensitive) contains {@code time}, {@code date} or {@code instant} (§21.1). */
-    private static boolean nameSuggestsTime(final String varName) {
-        if (varName == null) {
+    /**
+     * The §22.1 time-like token set: a variable name whose {@link #tokenize tokens} include ANY of
+     * these opens the date gate. Tokens are matched exactly — {@code update} tokenises to
+     * {@code [update]} (not {@code date}) and {@code runtime} to {@code [runtime]} (not {@code time}),
+     * so the substring false positives of the old §21.1 gate no longer date.
+     */
+    private static final Set<String> TIME_TOKENS = Set.of(
+            "time", "date", "datetime", "instant", "timestamp", "ts",
+            "second", "seconds", "sec", "milli", "millis", "ms",
+            "nano", "nanos", "micro", "micros",
+            "start", "end", "epoch", "expiry", "expiration", "expires",
+            "deadline", "elapsed", "since", "until", "created", "updated", "modified");
+
+    /**
+     * Whether a variable name has a time-like token (§22.1): the name is split into lowercase tokens
+     * on camelCase boundaries (lower→Upper, and either direction of letter↔digit) and on {@code _}/
+     * {@code $}, and the gate opens iff any token is in {@link #TIME_TOKENS}. So {@code startTime},
+     * {@code endMillis}, {@code expirationSecond} and {@code createdAt} qualify, while {@code update},
+     * {@code runtime}, {@code renderCount} and {@code append} do not.
+     */
+    static boolean nameSuggestsTime(final String varName) {
+        for (final String token : tokenize(varName)) {
+            if (TIME_TOKENS.contains(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Splits {@code name} into lowercase tokens (§22.1): {@code _} and {@code $} are separators, a
+     * lower→upper transition starts a new token (camelCase), and either direction of a letter↔digit
+     * transition does too. {@code null}/empty yields an empty list. Consecutive uppercase letters
+     * stay together (acronyms), which is harmless since no time token is a multi-letter acronym.
+     */
+    static List<String> tokenize(final String name) {
+        final List<String> tokens = new ArrayList<>();
+        if (name == null || name.isEmpty()) {
+            return tokens;
+        }
+        final StringBuilder cur = new StringBuilder();
+        char prev = 0;
+        for (int i = 0; i < name.length(); i++) {
+            final char c = name.charAt(i);
+            if (c == '_' || c == '$') {
+                flush(tokens, cur);
+                prev = 0;
+                continue;
+            }
+            if (cur.length() > 0 && prev != 0 && isTokenBoundary(prev, c)) {
+                flush(tokens, cur);
+            }
+            cur.append(c);
+            prev = c;
+        }
+        flush(tokens, cur);
+        return tokens;
+    }
+
+    /** A camelCase (lower→Upper) or letter↔digit boundary between {@code prev} and {@code c} (§22.1). */
+    private static boolean isTokenBoundary(final char prev, final char c) {
+        final boolean lowerToUpper = Character.isLowerCase(prev) && Character.isUpperCase(c);
+        final boolean letterDigit = (Character.isLetter(prev) && Character.isDigit(c))
+                || (Character.isDigit(prev) && Character.isLetter(c));
+        return lowerToUpper || letterDigit;
+    }
+
+    private static void flush(final List<String> tokens, final StringBuilder cur) {
+        if (cur.length() > 0) {
+            tokens.add(cur.toString().toLowerCase(Locale.ROOT));
+            cur.setLength(0);
+        }
+    }
+
+    /**
+     * Whether a field name denotes an ID (§22.12): exactly {@code id} (any case), or ending in
+     * {@code Id} (after a lowercase letter or digit) or {@code ID}, or starting with {@code id}
+     * followed by an uppercase letter, {@code _} or {@code $}. So {@code id}, {@code Id}, {@code ID},
+     * {@code accountId}, {@code nodeID}, {@code idField}, {@code id_x} and {@code id$} are ids, while
+     * {@code notanid} and {@code valid} are not.
+     */
+    static boolean isIdName(final String name) {
+        if (name == null || name.isEmpty()) {
             return false;
         }
-        String n = varName.toLowerCase(Locale.ROOT);
-        return n.contains("time") || n.contains("date") || n.contains("instant");
+        return name.equalsIgnoreCase("id")
+                || name.matches(".*[a-z0-9]Id$")
+                || name.endsWith("ID")
+                || name.matches("^id[A-Z_$].*");
+    }
+
+    private static final String HEX_MARK = "  0x";
+    private static final Pattern INTEGRAL_HEAD = Pattern.compile("-?\\d+");
+    private static final Pattern FLOAT_TEXT = Pattern.compile("-?\\d+\\.\\d+([eE][+-]?\\d+)?");
+
+    /**
+     * Right-aligns the numeric column of a container's element displays (§22.9), returning a same-size
+     * list. When EVERY display is integral — its decimal head (the text before the {@code   0x} hex, or
+     * the whole string when there is none) is {@code -?\d+} — each head is left-padded with spaces to
+     * the widest head, the {@code   0x…} tail (if any) following unchanged. When EVERY display is
+     * floating-point (a {@code -?\d+\.\d+} with optional exponent, no hex) the INTEGER PART (before the
+     * {@code .}) is padded to the widest integer part, the fractional part unchanged. Any other mix —
+     * refs, strings, {@code null}, booleans, {@code NaN} — returns the input unchanged (no alignment).
+     * Pure and order-preserving, so callers map the result back to their elements by index.
+     */
+    static List<String> alignNumericElements(final List<String> displays) {
+        if (displays == null || displays.size() < 2) {
+            return displays;
+        }
+        boolean allIntegral = true;
+        boolean allFloat = true;
+        for (final String d : displays) {
+            final int kind = numericKind(d);
+            allIntegral &= kind == 1;
+            allFloat &= kind == 2;
+        }
+        if (allIntegral) {
+            return padColumn(displays, NumberFormatUtil::decimalHead);
+        }
+        if (allFloat) {
+            return padColumn(displays, NumberFormatUtil::integerPart);
+        }
+        return displays;
+    }
+
+    /** Left-pads each display's {@code segment} to the widest segment, keeping the rest verbatim. */
+    private static List<String> padColumn(final List<String> displays, final Function<String, String> segment) {
+        int width = 0;
+        for (final String d : displays) {
+            width = Math.max(width, segment.apply(d).length());
+        }
+        final List<String> out = new ArrayList<>(displays.size());
+        for (final String d : displays) {
+            final String seg = segment.apply(d);
+            out.add(padLeft(seg, width) + d.substring(seg.length()));
+        }
+        return out;
+    }
+
+    /** {@code 1} integral ({@code -?\d+} head), {@code 2} floating-point, {@code 0} neither (§22.9). */
+    private static int numericKind(final String d) {
+        if (d == null) {
+            return 0;
+        }
+        if (INTEGRAL_HEAD.matcher(decimalHead(d)).matches()) {
+            return 1;
+        }
+        return d.indexOf(HEX_MARK) < 0 && FLOAT_TEXT.matcher(d).matches() ? 2 : 0;
+    }
+
+    /** The decimal text before the {@code   0x} hex, or the whole display when it carries no hex. */
+    private static String decimalHead(final String d) {
+        final int hex = d.indexOf(HEX_MARK);
+        return hex >= 0 ? d.substring(0, hex) : d;
+    }
+
+    /** The integer part before the first {@code .}, or the whole display when it has none. */
+    private static String integerPart(final String d) {
+        final int dot = d.indexOf('.');
+        return dot >= 0 ? d.substring(0, dot) : d;
+    }
+
+    private static String padLeft(final String s, final int width) {
+        if (s.length() >= width) {
+            return s;
+        }
+        final StringBuilder b = new StringBuilder(width);
+        for (int i = s.length(); i < width; i++) {
+            b.append(' ');
+        }
+        return b.append(s).toString();
     }
 
     /** {@code   0x<HEX>}: {@code slot} masked to {@code digits} nibbles, zero-padded uppercase. */

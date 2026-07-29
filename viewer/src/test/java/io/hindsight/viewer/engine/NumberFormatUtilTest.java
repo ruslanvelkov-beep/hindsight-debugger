@@ -2,8 +2,11 @@
 package io.hindsight.viewer.engine;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.hindsight.reader.Format;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -109,5 +112,69 @@ final class NumberFormatUtilTest {
         // A time name but an out-of-range value: the gate opens but dateSuffix is empty → hex only.
         String hexSmall = NumberFormatUtil.decorate("42", Format.TAG_LONG, 42L);
         assertEquals(hexSmall, NumberFormatUtil.decorateNamed(hexSmall, "timestamp", Format.TAG_LONG, 42L));
+    }
+
+    // ---- §22.1 token-based date gate ----
+
+    @Test
+    void nameSuggestsTimeMatchesTokensNotSubstrings() {
+        // Positive: a time-like token in the camelCase / '_' / '$' split opens the gate.
+        assertTrue(NumberFormatUtil.nameSuggestsTime("startTime"));
+        assertTrue(NumberFormatUtil.nameSuggestsTime("endMillis"));
+        assertTrue(NumberFormatUtil.nameSuggestsTime("expirationSecond"));
+        assertTrue(NumberFormatUtil.nameSuggestsTime("createdAt"), "'created' is a token");
+        assertTrue(NumberFormatUtil.nameSuggestsTime("epoch_ms"), "'_' split + 'ms' token");
+        assertTrue(NumberFormatUtil.nameSuggestsTime("ts"), "whole name is a token");
+        // Negative: the old §21.1 substring gate mis-fired on these; token matching fixes it.
+        assertFalse(NumberFormatUtil.nameSuggestsTime("update"), "⊇ 'date' but the token is 'update'");
+        assertFalse(NumberFormatUtil.nameSuggestsTime("runtime"), "⊇ 'time' but the token is 'runtime'");
+        assertFalse(NumberFormatUtil.nameSuggestsTime("renderCount"));
+        assertFalse(NumberFormatUtil.nameSuggestsTime("append"));
+        assertFalse(NumberFormatUtil.nameSuggestsTime(null));
+    }
+
+    @Test
+    void decorateNamedTokenGateFixesOldFalsePositives() {
+        // An in-range long that WOULD have been dated by the §21.1 substring gate on 'update'/'runtime'.
+        String hex = NumberFormatUtil.decorate("1000000000000", Format.TAG_LONG, 1_000_000_000_000L);
+        String dated = hex + "  (2001-09-09 01:46:40 UTC)";
+        assertEquals(dated, NumberFormatUtil.decorateNamed(hex, "startTime", Format.TAG_LONG, 1_000_000_000_000L));
+        assertEquals(hex, NumberFormatUtil.decorateNamed(hex, "update", Format.TAG_LONG, 1_000_000_000_000L));
+        assertEquals(hex, NumberFormatUtil.decorateNamed(hex, "runtime", Format.TAG_LONG, 1_000_000_000_000L));
+    }
+
+    // ---- §22.12 ID-name predicate ----
+
+    @Test
+    void isIdNameMatrix() {
+        for (String id : new String[] {"id", "Id", "ID", "accountId", "nodeID", "idField", "id_x", "id$"}) {
+            assertTrue(NumberFormatUtil.isIdName(id), id + " denotes an id");
+        }
+        for (String notId : new String[] {"notanid", "valid", "identifier", "count", "", null}) {
+            assertFalse(NumberFormatUtil.isIdName(notId), notId + " does not denote an id");
+        }
+    }
+
+    // ---- §22.9 numeric element alignment ----
+
+    @Test
+    void alignNumericElementsRightAlignsIntegersAndFloats() {
+        // Integers: pad decimals to the widest (width 3).
+        assertEquals(List.of("  1", " 22", "333"),
+                NumberFormatUtil.alignNumericElements(List.of("1", "22", "333")));
+        // The hex tail follows the padded decimal (width is computed on the decimal only).
+        assertEquals(List.of(" 7  0x07", "42  0x2A"),
+                NumberFormatUtil.alignNumericElements(List.of("7  0x07", "42  0x2A")));
+        // A negative counts its sign toward the width.
+        assertEquals(List.of("-3", " 5"),
+                NumberFormatUtil.alignNumericElements(List.of("-3", "5")));
+        // Floats: pad the integer part; the fractional part is kept as-is.
+        assertEquals(List.of("  1.5", " 22.25", "333.0"),
+                NumberFormatUtil.alignNumericElements(List.of("1.5", "22.25", "333.0")));
+        // Mixed (ref, or int+float) / non-numeric: returned unchanged.
+        assertEquals(List.of("1", "Bar#100"),
+                NumberFormatUtil.alignNumericElements(List.of("1", "Bar#100")));
+        assertEquals(List.of("1", "2.5"),
+                NumberFormatUtil.alignNumericElements(List.of("1", "2.5")));
     }
 }

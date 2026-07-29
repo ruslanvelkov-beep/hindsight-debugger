@@ -164,6 +164,19 @@ final class InFileSearchTest {
     }
 
     @Test
+    void regexMatchColumnsHighlightsRegexMatchesAndToleratesBadInput() {
+        // §22.2: the F filter is a regex, so metacharacter queries highlight their matched span.
+        // "Foo.*" over "FooBar.java" (case-insensitive) matches "FooBar.java" -> {0,11}.
+        assertArrayEquals(
+                new int[] {0, 11}, InFileSearch.regexMatchColumns("FooBar.java", "Foo.*", 4).get(0));
+        // multiple matches: "a" over "banana" -> three single-column spans.
+        assertEquals(3, InFileSearch.regexMatchColumns("banana", "a", 4).size());
+        // invalid regex -> no spans, no throw; a zero-width match (empty alt) -> no spans, no loop.
+        assertEquals(List.of(), InFileSearch.regexMatchColumns("x", "[", 4));
+        assertEquals(List.of(), InFileSearch.regexMatchColumns("x", "y*", 4));
+    }
+
+    @Test
     void matchColumnsAccountsForTabExpansion() {
         // A leading tab expands to 4 visual columns, so "total" starts at visual col 4 (raw index 1).
         List<int[]> m = InFileSearch.matchColumns("\ttotal", "total", 4);
@@ -201,8 +214,8 @@ final class InFileSearchTest {
     void directionArrowAndPrefixReflectTheDirection() {
         assertEquals('↓', InFileSearch.directionArrow(false), "forward is down");
         assertEquals('↑', InFileSearch.directionArrow(true), "reverse is up");
-        assertEquals("[ Search↓: ", InFileSearch.searchPrefix(false));
-        assertEquals("[ Search↑: ", InFileSearch.searchPrefix(true));
+        assertEquals("[ Search ↓: ", InFileSearch.searchPrefix(false)); // §22.6: space before the arrow
+        assertEquals("[ Search ↑: ", InFileSearch.searchPrefix(true));
         // ARROW_OFFSET indexes the arrow within the prefix, in either direction.
         assertEquals('↓', InFileSearch.searchPrefix(false).charAt(InFileSearch.ARROW_OFFSET));
         assertEquals('↑', InFileSearch.searchPrefix(true).charAt(InFileSearch.ARROW_OFFSET));

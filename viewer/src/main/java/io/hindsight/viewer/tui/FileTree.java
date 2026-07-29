@@ -338,4 +338,25 @@ public final class FileTree {
         int start = maxHcol - h;
         return full.substring(start, start + width);
     }
+
+    /**
+     * The §22.2 flat-filter row view: {@link #suffixView} widened to exactly {@code width} columns
+     * and RIGHT-ALIGNED, so the file name is always flush against the right edge and the leading
+     * directories clip/scroll on the left. When the whole path fits it is left-padded with spaces;
+     * when it does not, the tail (the last {@code width} columns, shifted by {@code hcol}) already
+     * fills the width. The result is always exactly {@code width} columns (empty for a non-positive
+     * {@code width}), ready to paint directly without further padding.
+     *
+     * @param full the row's full (root-relative) path text
+     * @param width the visible column count
+     * @param hcol the horizontal scroll offset (0 shows the suffix; larger reveals the prefix)
+     * @return the row text, exactly {@code width} columns, the file name flush-right
+     */
+    public static String rightAlign(final String full, final int width, final int hcol) {
+        if (width <= 0) {
+            return "";
+        }
+        String view = suffixView(full, width, hcol);
+        return view.length() < width ? " ".repeat(width - view.length()) + view : view;
+    }
 }
