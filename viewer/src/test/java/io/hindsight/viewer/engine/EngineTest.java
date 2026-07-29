@@ -327,6 +327,82 @@ final class EngineTest {
         }
     }
 
+    /**
+     * §20.10 regression: on a {@code METHOD_EXIT} the cursor's own {@code location()} is a METHOD
+     * site, not a LINE site — the pre-fix code compared that against LINE sites, never matched, and
+     * always reported "no appearance". The fix resolves the innermost frame's current line (its last
+     * executed LINE) and hops to another occurrence of it. From {@code main}'s EXIT the current line
+     * is line 11 (idx 18, its last LINE); reverse reaches it, then the earlier appearance (idx 7).
+     */
+    @Test
+    void runToCurrentLineFromExitCursorResolvesFrameLine(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            e.seek(1, IDX_EXIT_MAIN);
+            StepResult back = e.runToCurrentLine(false);
+            assertTrue(back.moved(), "EXIT cursor resolves the frame line and runs (the fix)");
+            assertEquals(IDX_LINE11_AGAIN, e.currentIndex());
+
+            StepResult again = e.runToCurrentLine(false);
+            assertTrue(again.moved());
+            assertEquals(IDX_LINE11, e.currentIndex());
+
+            // Forward from the EXIT: line 11 has no later appearance.
+            e.seek(1, IDX_EXIT_MAIN);
+            StepResult fwd = e.runToCurrentLine(true);
+            assertFalse(fwd.moved());
+            assertEquals(Engine.NO_NEXT_APPEARANCE, fwd.message());
+        }
+    }
+
+    /** §20.10: from an inner frame's EXIT (helper, idx 16) the current line is line 21 (idx 14). */
+    @Test
+    void runToCurrentLineFromInnerExitCursor(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            e.seek(1, IDX_EXIT_HELPER);
+            StepResult back = e.runToCurrentLine(false);
+            assertTrue(back.moved());
+            assertEquals(IDX_LINE21, e.currentIndex());
+        }
+    }
+
+    /**
+     * §20.10: a {@code METHOD_ENTER} is its frame's first record — the frame has executed no LINE
+     * yet, so there is no current line to run to. A safe no-op with the direction message (the
+     * initial-cursor case in {@link #runToCurrentLineWithNoOtherAppearance} is the same, checked via
+     * a non-outermost frame here).
+     */
+    @Test
+    void runToCurrentLineFromFreshEnterIsANoOp(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            e.seek(1, IDX_ENTER_HELPER);
+            StepResult fwd = e.runToCurrentLine(true);
+            assertFalse(fwd.moved());
+            assertEquals(Engine.NO_NEXT_APPEARANCE, fwd.message());
+            StepResult back = e.runToCurrentLine(false);
+            assertFalse(back.moved());
+            assertEquals(Engine.NO_PREV_APPEARANCE, back.message());
+        }
+    }
+
+    /** §20.10: a thread carrying no LINE records reports {@link Engine#NO_LINE_RECORDS}. */
+    @Test
+    void runToCurrentLineLinelessThread(@TempDir final Path dir) throws IOException {
+        SyntheticRecording r = new SyntheticRecording(dir);
+        int file = r.sym("FILE", "C.java");
+        int cls = r.sym("CLASS", "com.ex.C");
+        int meth = r.sym("METHOD", "run");
+        int site = r.methodSite(cls, file, 5, meth, "()V", true);
+        int voidNone = SyntheticRecording.flags(Format.KIND_NONE, Format.KIND_NONE, 0);
+        r.threadStart(1, "t", 1L, 0L);
+        r.rec(1, Format.METHOD_ENTER, 0, 0, 0, site, 0, 0, 0);
+        r.rec(1, Format.METHOD_EXIT, voidNone, Format.TAG_VOID, 0, site, 0, 0, 0);
+        try (Engine e = Engine.open(r.write())) {
+            StepResult res = e.runToCurrentLine(true);
+            assertFalse(res.moved());
+            assertEquals(Engine.NO_LINE_RECORDS, res.message());
+        }
+    }
+
     @Test
     void localsReconstructParamThisAndWrite(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(build(dir))) {
@@ -343,12 +419,12 @@ final class EngineTest {
             Local arg = locals.get(1);
             assertEquals(1, arg.slot());
             assertEquals("arg0", arg.name());
-            assertEquals("7", arg.value().display());
+            assertEquals("7  0x00000007", arg.value().display());
 
             Local x = locals.get(2);
             assertEquals(2, x.slot());
             assertEquals("x", x.name());
-            assertEquals("42", x.value().display());
+            assertEquals("42  0x0000002A", x.value().display());
 
             // The static outer frame has no locals.
             assertTrue(e.locals(0).isEmpty());
@@ -380,7 +456,7 @@ final class EngineTest {
             Local arg = locals.get(1);
             assertEquals(1, arg.slot());
             assertEquals("count", arg.name(), "named from the site's #p map, not argN");
-            assertEquals("7", arg.value().display());
+            assertEquals("7  0x00000007", arg.value().display());
             assertEquals("(I)I", e.stack().get(0).descriptor(), "suffix stripped from desc");
         }
     }
@@ -422,7 +498,7 @@ final class EngineTest {
             assertEquals("Bar#100", root.label());
             List<ObjectNode> children = e.children(root);
             assertEquals(1, children.size());
-            assertEquals("balance = 1000", children.get(0).label());
+            assertEquals("balance = 1000  0x000003E8", children.get(0).label());
 
             // After the field write: the next exec landing is helper's EXIT (§17.1), whose
             // seq is past the write — the object tree reconstructs the override there.
@@ -430,7 +506,7 @@ final class EngineTest {
             assertEquals(IDX_EXIT_HELPER, e.currentIndex());
             List<ObjectNode> after = e.children(e.objectTree(100L));
             assertEquals(1, after.size());
-            assertEquals("balance = 900", after.get(0).label());
+            assertEquals("balance = 900  0x00000384", after.get(0).label());
         }
     }
 
@@ -453,7 +529,7 @@ final class EngineTest {
             assertNull(w.error());
             assertNotNull(w.root());
             List<ObjectNode> children = e.children(w.root());
-            assertEquals("balance = 1000", children.get(0).label());
+            assertEquals("balance = 1000  0x000003E8", children.get(0).label());
 
             // bare id (no #) resolves identically
             assertNull(e.resolveWatch("100").error());
@@ -467,7 +543,7 @@ final class EngineTest {
             WatchResult w = e.resolveWatch("Foo.COUNT");
             assertNull(w.error());
             assertNotNull(w.root());
-            assertEquals("5", w.root().value().display());
+            assertEquals("5  0x00000005", w.root().value().display());
 
             // binary name also resolves
             assertNull(e.resolveWatch("com.ex.Foo.COUNT").error());
@@ -624,7 +700,7 @@ final class EngineTest {
             assertEquals("this", locals.get(0).name());
             assertEquals(200L, ((Value.Ref) locals.get(0).value()).objectId());
             assertEquals("arg0", locals.get(1).name());
-            assertEquals("7", locals.get(1).value().display());
+            assertEquals("7  0x00000007", locals.get(1).value().display());
 
             // recordInfo/position reflect the ENTER record itself.
             RecordInfo info = e.recordInfo();
@@ -652,7 +728,7 @@ final class EngineTest {
             List<Local> locals = e.locals(1);
             assertEquals(3, locals.size());
             assertEquals("x", locals.get(2).name());
-            assertEquals("42", locals.get(2).value().display());
+            assertEquals("42  0x0000002A", locals.get(2).value().display());
 
             RecordInfo info = e.recordInfo();
             assertEquals("METHOD_EXIT", info.typeName());
@@ -661,7 +737,7 @@ final class EngineTest {
             // Watches resolve as-of the exit: the balance write just before it is visible.
             WatchResult w = e.resolveWatch("#100");
             assertNull(w.error());
-            assertEquals("balance = 900", e.children(w.root()).get(0).label());
+            assertEquals("balance = 900  0x00000384", e.children(w.root()).get(0).label());
         }
     }
 
@@ -708,7 +784,7 @@ final class EngineTest {
             assertEquals(2, seeded.size());
             assertEquals("this", seeded.get(0).name());
             assertEquals("arg0", seeded.get(1).name());
-            assertEquals("7", seeded.get(1).value().display());
+            assertEquals("7  0x00000007", seeded.get(1).value().display());
 
             assertTrue(e.stepInto().moved());
             assertEquals(6, e.currentIndex()); // helper's EXIT: the frame is about to pop
@@ -876,7 +952,7 @@ final class EngineTest {
             assertEquals(3, entries.size(), "2 captured entries + the …+1 more sentinel");
 
             ObjectNode first = entries.get(0);
-            assertEquals("Bar#100 -> 7", first.label());
+            assertEquals("Bar#100 -> 7  0x00000007", first.label());
             assertTrue(first.expandable(), "a map entry is always expandable (§17.3)");
             assertTrue(first.isMapEntry());
 
@@ -888,14 +964,14 @@ final class EngineTest {
             assertInstanceOf(Value.Ref.class, key.value());
             assertTrue(key.expandable(), "a Ref key is independently explorable");
             ObjectNode val = kv.get(1);
-            assertEquals("value = 7", val.label());
+            assertEquals("value = 7  0x00000007", val.label());
             assertInstanceOf(Value.Primitive.class, val.value());
             assertFalse(val.expandable());
 
             // The Ref key explores like any other object node.
             List<ObjectNode> barFields = e.children(key);
             assertEquals(1, barFields.size());
-            assertEquals("balance = 1000", barFields.get(0).label());
+            assertEquals("balance = 1000  0x000003E8", barFields.get(0).label());
 
             // The …+N more sentinel stays a plain leaf.
             ObjectNode more = entries.get(2);
@@ -929,7 +1005,7 @@ final class EngineTest {
         try (Engine e = Engine.open(buildContainers(dir))) {
             List<ObjectNode> elems = e.children(e.objectTree(600L));
             assertEquals(2, elems.size());
-            assertEquals("[0] = 42", elems.get(0).label());
+            assertEquals("[0] = 42  0x0000002A", elems.get(0).label());
             assertFalse(elems.get(0).expandable());
             assertFalse(elems.get(0).isMapEntry());
             assertEquals("[1] = Bar#100", elems.get(1).label());
@@ -1067,8 +1143,8 @@ final class EngineTest {
             assertEquals("com.ex.Foo", c.ownerClass());
             assertEquals("COUNT", c.fieldName());
             assertTrue(c.isStatic());
-            assertEquals("0", c.before());
-            assertEquals("5", c.after());
+            assertEquals("0  0x00000000", c.before());
+            assertEquals("5  0x00000005", c.after());
             assertEquals("Foo.java", c.fileName());
             assertEquals(11, c.line());
 
@@ -1084,8 +1160,8 @@ final class EngineTest {
             assertEquals("com.ex.Bar", b.ownerClass());
             assertEquals("balance", b.fieldName());
             assertFalse(b.isStatic());
-            assertEquals("1000", b.before());
-            assertEquals("900", b.after());
+            assertEquals("1000  0x000003E8", b.before());
+            assertEquals("900  0x00000384", b.after());
             assertEquals("Foo.java", b.fileName()); // fileName/line come from the write site
             assertEquals(21, b.line());
 
@@ -1194,10 +1270,10 @@ final class EngineTest {
                 assertEquals(100L, h.ownerId());
                 assertFalse(h.isStatic(), "the static write must be excluded from a #100 query");
             }
-            assertEquals("0", a.get(0).before());
-            assertEquals("10", a.get(0).after());
-            assertEquals("10", a.get(1).before());
-            assertEquals("20", a.get(1).after());
+            assertEquals("0  0x00000000", a.get(0).before());
+            assertEquals("10  0x0000000A", a.get(0).after());
+            assertEquals("10  0x0000000A", a.get(1).before());
+            assertEquals("20  0x00000014", a.get(1).after());
 
             // ownerId #200 — its single write.
             List<FieldWriteHit> b = e.fieldWrites("Acct.java", "balance", 200L, 10);

@@ -55,10 +55,21 @@ public sealed interface Value {
 
     /**
      * A reference to a recorded object id. {@code display} is the reader's
-     * {@code renderObjectId} rendering (e.g. {@code Account#123} or {@code Enum.CONSTANT});
-     * the generated accessor satisfies {@link #display()}.
+     * {@code renderObjectId} rendering (e.g. {@code Account#123} or {@code Enum.CONSTANT}),
+     * with the §20.1/§20.2 inline-wrapper suffix {@code   [ <value> ]} appended by the engine
+     * when the id is an always-dump scalar wrapper or an {@code AtomicReference}; the generated
+     * accessor satisfies {@link #display()}. {@code expandable} is whether a tree node built from
+     * this ref may be expanded into children: {@code true} for an ordinary object (the default,
+     * via the two-arg constructor), {@code false} for a scalar wrapper or a null-holding
+     * {@code AtomicReference} whose single value is already shown inline (§20.1/§20.2).
      */
-    record Ref(long objectId, String display) implements Value {}
+    record Ref(long objectId, String display, boolean expandable) implements Value {
+
+        /** An ordinary, expandable reference (the common case): the id resolves into fields/elements. */
+        public Ref(final long objectId, final String display) {
+            this(objectId, display, true);
+        }
+    }
 
     /** A slot known to exist but for which no value was recorded (unwritten local, sentinel). */
     record Absent() implements Value {

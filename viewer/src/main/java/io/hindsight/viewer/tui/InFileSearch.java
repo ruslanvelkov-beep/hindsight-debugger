@@ -157,6 +157,45 @@ public final class InFileSearch {
     }
 
     /**
+     * The §20.7 visible-occurrence spans on one source line: every non-overlapping occurrence of
+     * {@code query} (case-insensitive substring) mapped to VISUAL column ranges
+     * {@code {startCol, endColExclusive}} — 0-based columns in the tab-expanded line, so the caller
+     * can paint the matched cells regardless of tabs and horizontal scroll. An empty/{@code null}
+     * query (or {@code null} line) yields an empty list. Unlike {@link #occurrences} (one hit per
+     * line, for motion), this returns ALL hits on the line, for the in-body match highlight.
+     *
+     * @param line the raw source line (no trailing newline)
+     * @param query the search text
+     * @param tabWidth the tab stop width in columns (4 per §6.1), matching the render's expansion
+     * @return the match spans, ascending, each {@code {startVisualCol, endVisualColExclusive}} 0-based
+     */
+    public static List<int[]> matchColumns(final String line, final String query, final int tabWidth) {
+        if (line == null || query == null || query.isEmpty()) {
+            return List.of();
+        }
+        int n = line.length();
+        // The visual column at which each raw offset starts (visAt[n] = the line's total width).
+        int[] visAt = new int[n + 1];
+        int col = 0;
+        for (int i = 0; i < n; i++) {
+            visAt[i] = col;
+            col = line.charAt(i) == '\t' && tabWidth > 0 ? ((col / tabWidth) + 1) * tabWidth : col + 1;
+        }
+        visAt[n] = col;
+        String hay = line.toLowerCase(Locale.ROOT);
+        String needle = query.toLowerCase(Locale.ROOT);
+        List<int[]> out = new ArrayList<>();
+        int from = 0;
+        int idx;
+        while ((idx = hay.indexOf(needle, from)) >= 0) {
+            int end = idx + needle.length();
+            out.add(new int[] {visAt[idx], visAt[end]});
+            from = end; // non-overlapping: continue past this match
+        }
+        return List.copyOf(out);
+    }
+
+    /**
      * The §19.4 fixed-width field's visible input: the query itself when it fits, else its TAIL —
      * the last {@code inputWidth} characters — so a query longer than the input area scrolls to
      * keep its end (and the caret) in view. {@code null} query or {@code inputWidth <= 0} yields

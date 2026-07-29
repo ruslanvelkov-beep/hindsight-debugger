@@ -137,6 +137,48 @@ final class InFileSearchTest {
         assertNull(armed.armed());
     }
 
+    // ---- §20.7 visible-occurrence match spans ----
+
+    @Test
+    void matchColumnsMapsEveryOccurrenceToVisualColumnRanges() {
+        // "int total = 0;" — one occurrence of "total" at raw index 4 (no tabs → visual col 4).
+        List<int[]> m = InFileSearch.matchColumns("int total = 0;", "total", 4);
+        assertEquals(1, m.size());
+        assertArrayEquals(new int[] {4, 9}, m.get(0)); // [start, endExclusive)
+    }
+
+    @Test
+    void matchColumnsIsCaseInsensitiveAndFindsAllHits() {
+        // case-insensitive: "TOTAL" at raw index 7.
+        assertArrayEquals(
+                new int[] {7, 12}, InFileSearch.matchColumns("return TOTAL_MAX;", "total", 4).get(0));
+        // multiple non-overlapping hits on one line: "abcabc" / "abc" -> {0,3} and {3,6}.
+        List<int[]> two = InFileSearch.matchColumns("abcabc", "abc", 4);
+        assertEquals(2, two.size());
+        assertArrayEquals(new int[] {0, 3}, two.get(0));
+        assertArrayEquals(new int[] {3, 6}, two.get(1));
+        // non-overlapping advance: "aaa" / "aa" -> a single {0,2}.
+        List<int[]> once = InFileSearch.matchColumns("aaa", "aa", 4);
+        assertEquals(1, once.size());
+        assertArrayEquals(new int[] {0, 2}, once.get(0));
+    }
+
+    @Test
+    void matchColumnsAccountsForTabExpansion() {
+        // A leading tab expands to 4 visual columns, so "total" starts at visual col 4 (raw index 1).
+        List<int[]> m = InFileSearch.matchColumns("\ttotal", "total", 4);
+        assertEquals(1, m.size());
+        assertArrayEquals(new int[] {4, 9}, m.get(0));
+    }
+
+    @Test
+    void matchColumnsEmptyForNoMatchOrEmptyInputs() {
+        assertTrue(InFileSearch.matchColumns("int total = 0;", "zzz", 4).isEmpty());
+        assertTrue(InFileSearch.matchColumns("int total = 0;", "", 4).isEmpty());
+        assertTrue(InFileSearch.matchColumns("int total = 0;", null, 4).isEmpty());
+        assertTrue(InFileSearch.matchColumns(null, "x", 4).isEmpty());
+    }
+
     // ---- §19.4 fixed-width field tail scroll ----
 
     @Test

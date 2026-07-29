@@ -68,6 +68,17 @@ public final class Palette {
     /** Foreground of the selected row in a list/tree window. */
     public static final TextColor SELECTION_FG = TextColor.ANSI.BLACK;
 
+    /**
+     * Background of an in-file search match highlighted in the source body (§20.7) — every visible
+     * occurrence of the Alt-F query gets its matched columns painted in this reverse-video style
+     * (black on yellow), on top of the normal cell render, so matches stand out against any of the
+     * current-line backgrounds.
+     */
+    public static final TextColor SEARCH_MATCH_BG = TextColor.ANSI.YELLOW;
+
+    /** Foreground of an in-file search match highlighted in the source body (§20.7). */
+    public static final TextColor SEARCH_MATCH_FG = TextColor.ANSI.BLACK;
+
     /** Background of a modal dialog. */
     public static final TextColor DIALOG_BG = TextColor.ANSI.BLACK;
 

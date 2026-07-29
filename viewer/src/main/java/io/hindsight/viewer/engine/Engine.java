@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -56,12 +57,25 @@ public final class Engine implements AutoCloseable {
     static final String NO_EARLIER_STEP = "no earlier step in this thread";
     static final String NO_NEXT_APPEARANCE = "no next appearance of this line.";
     static final String NO_PREV_APPEARANCE = "no previous appearance of this line.";
+    static final String NO_LINE_RECORDS = "no line records in this thread";
     static final String ALREADY_HERE = "already here";
     static final String ALREADY_AT_FRAME_RETURN = "already at frame return";
     static final String ALREADY_AT_FRAME_ENTRY = "already at frame entry";
     static final String NO_FURTHER_LINE_TRACE = "no further line-trace record in this thread";
     static final String UNSUPPORTED_WATCH =
             "unsupported expression (v1 accepts #id or Class.field.path)";
+
+    /**
+     * The FORMAT §7 / §20.1-§20.2 always-dump inline wrappers, by how their reference renders: a
+     * {@code SCALAR} wrapper ({@code AtomicInteger}/{@code AtomicLong}/{@code AtomicBoolean}/
+     * {@code StringBuilder}/{@code StringBuffer}) shows its single {@code value} inline and is
+     * non-expandable; an {@code ATOMIC_REFERENCE} shows its held reference (or {@code null}) inline
+     * but stays expandable when non-null so the referent can be explored.
+     */
+    private enum WrapperKind {
+        SCALAR,
+        ATOMIC_REFERENCE
+    }
 
     /** One SNAPSHOT or FIELD_WRITE touching an object id, ordered globally by {@code seq}. */
     private record ObjEvent(long seq, int tid, long index, boolean snapshot) {}
@@ -146,6 +160,11 @@ public final class Engine implements AutoCloseable {
     private final Set<String> staticOwners = new HashSet<>();
     private final Map<String, List<String>> ownersBySimpleName = new HashMap<>();
     private final long globalRecordCount;
+
+    // Guards the §20.1/§20.2 inline-wrapper resolution against a pathological AtomicReference cycle
+    // (A holds B holds A): makeRef adds an id while resolving its inline value and renders a
+    // re-entrant id plainly instead of recursing. Single-threaded like the rest of the engine.
+    private final Set<Long> wrapperResolving = new HashSet<>();
 
     private int cursorTid;
     private long cursorIndex;
@@ -477,16 +496,35 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
-     * Move to the next (forward) / previous (backward) LINE record whose site is the same
-     * source {@code (class, line)} as the cursor — hopping between re-hits of the current
-     * line, e.g. loop iterations (Ctrl-R / Alt-R).
+     * Move to the next ({@code forward}, Ctrl-R) / previous ({@code backward}, Ctrl-Q) LINE record
+     * whose site is the same source {@code (class, line)} as the innermost frame's current line —
+     * hopping between re-hits of that line, e.g. loop iterations (§20.10). Thread-preserving.
+     *
+     * <p>§20.10 fix: the cursor may rest on a {@code METHOD_ENTER}/{@code METHOD_EXIT} (§17.1) whose
+     * {@code location()} is a METHOD site, not a LINE site; the old code compared that METHOD site
+     * against LINE sites, never matched, and so always reported "no appearance" from an ENTER/EXIT
+     * cursor. The target LINE site is now resolved from the innermost frame's current source line:
+     * the cursor's own site when it is a LINE, else the nearest LINE the frame executed at/before the
+     * cursor. A frame that has executed no LINE yet (a fresh ENTER) has no current line to run to —
+     * a no-move with the direction message; a thread with no LINE records at all reports
+     * {@link #NO_LINE_RECORDS}.
      */
     public StepResult runToCurrentLine(final boolean forward) {
         ThreadIndex ti = index(cursorTid);
         if (!ti.hasLines()) {
-            return new StepResult(false, "no line records in this thread");
+            return new StepResult(false, NO_LINE_RECORDS);
         }
-        int location = rec(cursorTid, cursorIndex).location();
+        final int location;
+        Rec cursor = rec(cursorTid, cursorIndex);
+        if (cursor.type() == Format.LINE) {
+            location = cursor.location();
+        } else {
+            long frameLine = lastFrameLineAtOrBefore(ti, ownFrameEnter(ti), cursorIndex);
+            if (frameLine < 0) {
+                return new StepResult(false, forward ? NO_NEXT_APPEARANCE : NO_PREV_APPEARANCE);
+            }
+            location = rec(cursorTid, frameLine).location();
+        }
         int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
         if (forward) {
             int start = idx >= 0 ? idx + 1 : -idx - 1;
@@ -974,7 +1012,7 @@ public final class Engine implements AutoCloseable {
         // frameThisId() (§16.7) so the two never diverge.
         if (!frame.isStatic()) {
             long thisId = thisIdOf(frame, ti);
-            Value v = thisId != 0 ? new Value.Ref(thisId, renderObjectId(thisId)) : new Value.Null();
+            Value v = thisId != 0 ? makeRef(thisId) : new Value.Null();
             String desc = frame.classBinary() != null
                     ? "L" + frame.classBinary().replace('.', '/') + ";"
                     : "";
@@ -1065,10 +1103,17 @@ public final class Engine implements AutoCloseable {
 
     // ---- object trees (§2.5) ----
 
-    /** Root node for an object id (label = {@code renderObjectId(id)}), expandable when non-null. */
+    /**
+     * Root node for an object id: label = the ref's display, expandable when the ref is (a non-null
+     * ordinary object or a reference-holding {@code AtomicReference}; a §20.1 scalar wrapper or a
+     * null-holding {@code AtomicReference} shows its value inline and is non-expandable).
+     */
     public ObjectNode objectTree(final long objectId) {
-        Value v = objectId == 0 ? new Value.Null() : new Value.Ref(objectId, renderObjectId(objectId));
-        return new ObjectNode(renderObjectId(objectId), v, objectId != 0);
+        if (objectId == 0) {
+            return new ObjectNode(renderObjectId(0L), new Value.Null(), false);
+        }
+        Value.Ref ref = makeRef(objectId);
+        return new ObjectNode(ref.display(), ref, ref.expandable());
     }
 
     /** Materialise a node's children with no ancestor path (convenience). */
@@ -1136,7 +1181,7 @@ public final class Engine implements AutoCloseable {
         if (v instanceof Value.Ref r && r.objectId() != 0 && path.contains(r.objectId())) {
             return new ObjectNode(prefix + "↺ #" + r.objectId() + " (cycle)", v, false);
         }
-        boolean expandable = v instanceof Value.Ref r2 && r2.objectId() != 0;
+        boolean expandable = v instanceof Value.Ref r2 && r2.objectId() != 0 && r2.expandable();
         return new ObjectNode(prefix + v.display(), v, expandable);
     }
 
@@ -1537,8 +1582,8 @@ public final class Engine implements AutoCloseable {
                     ownerBinary,
                     fieldName,
                     s.isStatic() || r.isStatic(),
-                    renderer.render(r, true),
-                    renderer.render(r, false),
+                    fieldSlotDisplay(r, true),
+                    fieldSlotDisplay(r, false),
                     s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
                     s.line()));
         }
@@ -1590,6 +1635,87 @@ public final class Engine implements AutoCloseable {
             }
         }
         return n;
+    }
+
+    /**
+     * Every {@code FIELD_WRITE} whose field name contains {@code nameSubstring} (case-insensitive;
+     * {@code null}/empty matches all), ascending by global {@code seq}, stopping at {@code cap} hits
+     * — the global variable-change list behind {@code V} (§20.9). Reuses the per-name write index
+     * {@link #fieldWriteRefsByName}, merging the matching names' (already seq-ordered) lists. Owner,
+     * static-ness, file and line are resolved exactly as {@link #fieldWrites}; {@code before}/
+     * {@code after} are rendered via the same {@code ValueRenderer} path (statics and instances mixed,
+     * no owner-file filter — this lists changes across the whole recording).
+     *
+     * @param nameSubstring case-insensitive field-name filter, or {@code null}/empty for all
+     * @param cap the maximum number of hits to return
+     */
+    public List<FieldWriteHit> fieldWriteChanges(final String nameSubstring, final int cap) {
+        ensureInstanceIndex();
+        if (cap <= 0) {
+            return List.of();
+        }
+        List<WriteRef> matched = matchingWriteRefs(nameSubstring);
+        matched.sort(Comparator.comparingLong(WriteRef::seq)
+                .thenComparingInt(WriteRef::tid)
+                .thenComparingLong(WriteRef::index));
+        List<FieldWriteHit> out = new ArrayList<>();
+        for (WriteRef w : matched) {
+            if (out.size() >= cap) {
+                break;
+            }
+            Rec r = rec(w.tid(), w.index());
+            Site s = recording.site(r.location());
+            if (s == null) {
+                continue;
+            }
+            String field = s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
+            out.add(new FieldWriteHit(
+                    r.seq(),
+                    w.tid(),
+                    w.index(),
+                    r.target(),
+                    recording.symbolText(s.classSym()),
+                    field,
+                    s.isStatic() || r.isStatic(),
+                    fieldSlotDisplay(r, true),
+                    fieldSlotDisplay(r, false),
+                    s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
+                    s.line()));
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * The total number of {@code FIELD_WRITE}s {@link #fieldWriteChanges} would match for
+     * {@code nameSubstring} with an unbounded cap — the {@code of N} in the §20.9 {@code showing
+     * first 1000 of N} note. Sums the matching names' index sizes, so it stays cheap against millions
+     * of writes. Every ref in the index has a resolvable site with a member symbol (that is how it
+     * was indexed), so the count matches the pre-cap size of {@link #fieldWriteChanges}.
+     *
+     * @param nameSubstring case-insensitive field-name filter, or {@code null}/empty for all
+     */
+    public long countFieldWriteChanges(final String nameSubstring) {
+        ensureInstanceIndex();
+        String needle = nameSubstring == null ? "" : nameSubstring.toLowerCase(Locale.ROOT);
+        long n = 0;
+        for (Map.Entry<String, List<WriteRef>> e : fieldWriteRefsByName.entrySet()) {
+            if (needle.isEmpty() || e.getKey().toLowerCase(Locale.ROOT).contains(needle)) {
+                n += e.getValue().size();
+            }
+        }
+        return n;
+    }
+
+    /** All {@link WriteRef}s whose field name contains {@code nameSubstring} (case-insensitive; empty = all). */
+    private List<WriteRef> matchingWriteRefs(final String nameSubstring) {
+        String needle = nameSubstring == null ? "" : nameSubstring.toLowerCase(Locale.ROOT);
+        List<WriteRef> matched = new ArrayList<>();
+        for (Map.Entry<String, List<WriteRef>> e : fieldWriteRefsByName.entrySet()) {
+            if (needle.isEmpty() || e.getKey().toLowerCase(Locale.ROOT).contains(needle)) {
+                matched.addAll(e.getValue());
+            }
+        }
+        return matched;
     }
 
     /**
@@ -1663,6 +1789,24 @@ public final class Engine implements AutoCloseable {
 
     // ---- shared value/descriptor helpers ----
 
+    /**
+     * The display string of a {@code FIELD_WRITE}'s before ({@code isBefore}) / after slot with
+     * the §20.4/§20.5 numeric decoration applied to INLINE primitives — so the §16.1/§20.9
+     * variable-change windows render integral transitions with hex/date exactly as the object
+     * trees do; references, strings and nulls stay on the reader's renderer. Per §2.3 the before
+     * slot's runtime tag lives in the aux idx byte for reference-typed fields (else 0, meaning the
+     * declared tag byte applies to both slots).
+     */
+    private String fieldSlotDisplay(final Rec r, final boolean isBefore) {
+        int kind = isBefore ? r.beforeKind() : r.afterKind();
+        if (kind == Format.KIND_INLINE) {
+            int tag = isBefore ? (r.idx() != 0 ? r.idx() : r.tag()) : r.tag();
+            long slot = isBefore ? r.before() : r.after();
+            return toValue(Format.KIND_INLINE, tag, slot, r.tid(), r.isTruncated()).display();
+        }
+        return renderer.render(r, isBefore);
+    }
+
     private Value toValue(final int kind, final int tag, final long slot, final int tid, final boolean truncated) {
         return switch (kind) {
             case Format.KIND_NONE -> switch (tag) {
@@ -1670,10 +1814,9 @@ public final class Engine implements AutoCloseable {
                 case Format.TAG_VOID -> new Value.Primitive("void");
                 default -> new Value.Absent();
             };
-            case Format.KIND_INLINE -> new Value.Primitive(renderer.render(Format.KIND_INLINE, tag, slot, tid, false));
-            case Format.KIND_OBJECT_ID -> slot == 0
-                    ? new Value.Null()
-                    : new Value.Ref(slot, renderObjectId(slot));
+            case Format.KIND_INLINE -> new Value.Primitive(
+                    NumberFormatUtil.decorate(renderer.render(Format.KIND_INLINE, tag, slot, tid, false), tag, slot));
+            case Format.KIND_OBJECT_ID -> slot == 0 ? new Value.Null() : makeRef(slot);
             case Format.KIND_BLOB -> blobValue(slot, tid, truncated);
             default -> new Value.Primitive("<bad kind " + kind + ">");
         };
@@ -1689,6 +1832,90 @@ public final class Engine implements AutoCloseable {
 
     private String renderObjectId(final long id) {
         return renderer.renderObjectId(id);
+    }
+
+    /**
+     * Builds the {@link Value.Ref} for an object id, applying the §20.1/§20.2 inline-wrapper
+     * decoration as-of the current cursor seq. An ordinary object renders as its
+     * {@code renderObjectId} text and stays expandable. An always-dump scalar wrapper
+     * ({@code AtomicInteger}/{@code AtomicLong}/{@code AtomicBoolean}/{@code StringBuilder}/
+     * {@code StringBuffer}) appends {@code   [ <value> ]} — its single {@code value} field's current
+     * snapshot, numeric-decorated like every other primitive — and is non-expandable (the value is
+     * shown). An {@code AtomicReference} appends {@code   [ null ]} (non-expandable) or
+     * {@code   [ <SimpleClass>#<rid> ]} and stays expandable so the referent can be explored.
+     */
+    private Value.Ref makeRef(final long id) {
+        String base = renderObjectId(id);
+        WrapperKind wk = wrapperKindOf(id);
+        if (wk == null) {
+            return new Value.Ref(id, base, true);
+        }
+        if (!wrapperResolving.add(id)) {
+            // Re-entrant on the same id (pathological wrapper cycle): render plain to break it.
+            return new Value.Ref(id, base, wk == WrapperKind.ATOMIC_REFERENCE);
+        }
+        try {
+            Value inner = wrapperValueAsOfCursor(id);
+            String innerText = inner instanceof Value.Ref ir ? renderObjectId(ir.objectId()) : inner.display();
+            boolean expandable =
+                    wk == WrapperKind.ATOMIC_REFERENCE && inner instanceof Value.Ref ir2 && ir2.objectId() != 0;
+            return new Value.Ref(id, base + "  [ " + innerText + " ]", expandable);
+        } finally {
+            wrapperResolving.remove(id);
+        }
+    }
+
+    /** The inline wrapper's single {@code value} field reconstructed as-of the cursor, or absent. */
+    private Value wrapperValueAsOfCursor(final long id) {
+        Value v = fieldsOf(id).get("value");
+        return v != null ? v : new Value.Absent();
+    }
+
+    /** The §20.1/§20.2 wrapper classification of an id's runtime class, or {@code null} if not a wrapper. */
+    private WrapperKind wrapperKindOf(final long id) {
+        String cls = recording.objectClassName(id);
+        if (cls == null) {
+            return null;
+        }
+        return switch (cls) {
+            case "java.util.concurrent.atomic.AtomicInteger",
+                    "java.util.concurrent.atomic.AtomicLong",
+                    "java.util.concurrent.atomic.AtomicBoolean",
+                    "java.lang.StringBuilder",
+                    "java.lang.StringBuffer" ->
+                WrapperKind.SCALAR;
+            case "java.util.concurrent.atomic.AtomicReference" -> WrapperKind.ATOMIC_REFERENCE;
+            default -> null;
+        };
+    }
+
+    /**
+     * Whether {@code id}'s runtime class is an always-dump <em>scalar</em> wrapper (§20.1) — one
+     * whose value is shown inline in its reference and whose tree node is therefore non-expandable
+     * ({@code AtomicInteger}/{@code AtomicLong}/{@code AtomicBoolean}/{@code StringBuilder}/
+     * {@code StringBuffer}). An {@code AtomicReference} is <em>not</em> a scalar wrapper (§20.2 keeps
+     * it expandable when it holds a reference), so this returns {@code false} for it.
+     *
+     * @param id an object id
+     */
+    public boolean isScalarWrapper(final long id) {
+        return wrapperKindOf(id) == WrapperKind.SCALAR;
+    }
+
+    /**
+     * Whether {@code objectId}'s runtime class is a lambda (§20.3): its {@code OBJECT_FIRST_SEEN}
+     * runtime class binary name contains {@code $$Lambda}, or equivalently its rendered form starts
+     * with {@code Lambda/}. The TUI treats a lambda node's {@code Enter} as "jump to definition"
+     * ({@link #firstMentionOf(long)} → the nearest following exec record) rather than expand.
+     *
+     * @param objectId an object id
+     */
+    public boolean isLambda(final long objectId) {
+        String cls = recording.objectClassName(objectId);
+        if (cls != null && cls.contains("$$Lambda")) {
+            return true;
+        }
+        return renderObjectId(objectId).startsWith("Lambda/");
     }
 
     /** Split a JVM method descriptor into its parameter type descriptors, in order. */

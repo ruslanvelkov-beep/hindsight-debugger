@@ -1111,3 +1111,108 @@ swaps `e/E exit-frame` ↔ `j/J jump to line-trace` with the context.
   against the TOP of file, wrapping to the last occurrence. Any query edit or direction
   change clears the pending-boundary state. An empty query clears occurrences/highlight
   but stays in search mode. `Esc` exits and restores the title.
+
+## 20. v2.0 additions & changes
+
+Authoritative over conflicting earlier text (§16.3, §19.2, §19.4). Viewer-only; all
+schema-4 recordings. Numeric/date/hex decoration and wrapper-inlining live in ONE engine
+value-formatting path so locals, object trees, watches, var-history and the new §20.9
+window all render identically.
+
+### 20.1 Inline wrapper scalars
+When a value is a reference to an always-dump wrapper (`AtomicInteger`/`AtomicLong`/
+`AtomicBoolean`/`StringBuilder`/`StringBuffer` — the FORMAT §7 scalar wrappers), its
+display is `<SimpleClass>#<id>  [ <value> ]` — the id, then two spaces, then the wrapper's
+current `value` (as-of the cursor seq, from its snapshot) in `[ … ]` with a space inside
+each bracket — so the scalar is visible WITHOUT expanding. The inner value carries the
+§20.4/§20.5 numeric decoration. Boxed numbers/booleans and strings are already shown
+inline by value (unchanged). Such wrapper nodes are non-expandable.
+
+### 20.2 AtomicReference inline
+An `AtomicReference` renders `AtomicReference#<id>  [ <value> ]` too: `[ null ]` when its
+`value` is null (no expansion needed), `[ <SimpleClass>#<rid> ]` when it holds a
+reference — and in the non-null case it stays EXPANDABLE so the referent can be explored.
+
+### 20.3 Lambda → jump to definition (Enter)
+A value whose runtime class is a lambda (rendered `Lambda/0x…#id`, i.e. class binary
+contains `$$Lambda`) is jumpable: in the Locals tree and in the `.` object-search
+results, `Enter` on a lambda node jumps to the lambda's FIRST MENTION
+(`engine.firstMentionOf` → nearest following exec record, one history entry) — the closest
+recoverable "definition" (the capture/creation point). New engine `boolean
+isLambda(long objectId)`. In Locals this overrides expand for lambda nodes (their captured
+`arg$N` fields are still reachable elsewhere); non-lambda nodes expand as before.
+
+### 20.4 Time values → date
+A numeric value (int/long) is annotated with its UTC date when it falls in one of three
+non-overlapping epoch ranges (years ≈2001–2096): seconds `[1e9,4e9)`, millis `[1e12,4e12)`,
+nanos `[1e18,4e18)`. The suffix is `  (YYYY-MM-DD HH:MM:SS UTC)`. Applies wherever a numeric
+value is rendered (int reaches only the seconds range; long reaches all three).
+
+### 20.5 Integer hex
+Every integral value shows its hex after the decimal: `<decimal>  0x<HEX>`, zero-padded to
+the type width — byte 2, char 4, short 4, int 8, long 16 hex digits (uppercase). Booleans
+get no hex. A long is decorated with BOTH hex and, when applicable, the §20.4 date. Order:
+`<decimal>  0x<HEX>[  (<date> UTC)]`. Chars keep their `'c'` decimal form then `0x00NN`.
+
+### 20.6 Green highlight preserved
+When a §18.3 green (line-less) row is the SELECTED row in Threads or Stack, the selection
+uses `CALLS_ONLY_FG` (green) as the foreground on `SELECTION_BG` instead of `SELECTION_FG`,
+so the row's green identity survives being highlighted.
+
+### 20.7 In-file search field (supersedes §19.4 geometry/colour)
+The `Alt-F` field spans the title row symmetrically: `[` two columns right of the top-left
+corner (`rect.col()+2`), `]` two columns left of the top-right corner (`rect.col()+width-3`)
+— fixed, full-width, `[ Search: <query………> ]`. Foreground is always YELLOW (no red state;
+the §19.4 boundary invert still signals end-of-file). The caret is visible one space after
+`Search: `. Every occurrence of the query VISIBLE in the source body is highlighted
+(matched substring reverse-video / distinct background) in addition to the current-match
+line highlight. Motion/boundary/keys (Enter, Alt/Shift/Ctrl-Enter, ↑/↓) are unchanged from
+§19.4.
+
+### 20.8 Browse mode yields to execution navigation (bug fix)
+Opening a file with `F` enters browse mode; today stepping / frame-select / thread-switch /
+record-jump leave the Source window stuck on the browsed file until `o`. Fix: ANY action
+that moves the execution cursor or changes the shown frame/thread (`doStep`, `afterMove`,
+`selectStackRow`, all jumps) automatically EXITS browse mode and shows the relevant
+execution source. `o` still returns manually; browse mode now only persists across pure
+source scroll / in-file search.
+
+### 20.9 Global variable-change list — `V`
+`V` (global, any focus) opens a window listing FIELD_WRITE transitions across the whole
+recording. A `filter:` line filters by field name (case-insensitive substring; empty = all).
+Rows `seq <N> · t<tid> · <Owner>#<oid>.<field>: <old> → <new>` (statics omit `#oid`),
+ascending seq, capped at 1000 with a `showing first 1000 of N` note. Keys: ↑/↓ select,
+←/→ (and `<`/`>`) hscroll, `g`/`G` ends, `Ctrl-F`/`Ctrl-B` page, `Enter` = jump to that
+record's seq (nearest exec record, one history entry) and close, `Esc` close. New engine
+`List<FieldWriteHit> fieldWriteChanges(String nameSubstring, int cap)` + `long
+countFieldWriteChanges(String nameSubstring)` over the existing per-name write index.
+
+### 20.10 Run-to-line fix + reverse
+`Ctrl-R` = run forward to the current line, `Ctrl-Q` = run backward to it (both
+thread-preserving). BUG FIX: the target line is the INNERMOST frame's current source line
+resolved to its LINE site (v1.7 left the cursor able to rest on ENTER/EXIT records, whose
+`location()` is not a LINE site, so the old code always failed); when the cursor is not on
+a LINE, resolve the frame's current line's site first. When no other record passes through
+that line in the run direction, no move + info-line message `no earlier/later pass through
+this line`. Threads without LINE records report `no line records in this thread`. The old
+`Alt-R` reverse binding is removed.
+
+### 20.11 Help window + trimmed status help
+The bottom help line no longer lists `Ctrl-R`/`Ctrl-Q`/`V`/`Ctrl-X`; it ends with
+`F1 help`. `F1` (and `?`) opens the help WINDOW (the existing overlay, extended) listing
+EVERY command incl. the ones dropped from the status line. `Ctrl-X` is a synonym for `q`
+(quit → the §12.4 confirm box); it is documented only in the help window.
+
+### 20.12 Records window: `c` replaces `j`
+In the Records window the seq-jump dialog moves from `j` to `c` (§16.3), freeing `j` for
+the §19.2 global jump. Because `c` is normally the Source focus letter, the focus switch
+yields to Records: when Records is focused, `c` opens the seq-jump dialog; switch to the
+Source window from Records via `Tab`. (`j`/`J` keep their §19.2 green-context meaning.)
+
+### 20.13 Per-window scroll keys
+Each window scrolls its viewport independently of the selection: `Ctrl-P` up, `Ctrl-N`
+down (one line); `Ctrl-K` left, `Ctrl-L` right (one hstep) as synonyms for the existing
+`←`/`→` and `<`/`>`. NOTE the user-requested `Ctrl-I`/`Ctrl-M`/`Ctrl-J` are the terminal's
+Tab/Enter/LF byte codes and cannot be bound without hijacking those keys, so the
+collision-free `Ctrl-P`/`Ctrl-N`/`Ctrl-K`/`Ctrl-L` are used; `Ctrl-K` matches the
+user's "K = horizontal" intent. Arrow and `<`/`>` mappings are retained.

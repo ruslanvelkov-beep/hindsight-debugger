@@ -52,6 +52,29 @@ final class TreeViewTest {
     }
 
     @Test
+    void inlineWrapperNodeShowsItsValueAndIsNotOpenable() {
+        // §20.1/§20.2: a scalar-wrapper reference comes back non-expandable with its value inlined in
+        // the display; ObjectNode.of honours the flag, so the Locals tree shows the value WITHOUT an
+        // openable node. A non-expandable Ref must never be flattened open or descended into.
+        ObjectNode wrapper = ObjectNode.of(
+                "counter = AtomicInteger#10  [ 42  0x0000002A ]",
+                new Value.Ref(10, "AtomicInteger#10  [ 42  0x0000002A ]", false));
+        assertFalse(wrapper.expandable());
+
+        FakeSource cs = graph();
+        List<TreeView.Row> flat = TreeView.flatten(List.of(wrapper), Set.of("0"), cs);
+        assertEquals(1, flat.size(), "a non-expandable wrapper never expands, even if its key is 'open'");
+        assertFalse(flat.get(0).expandable());
+        assertTrue(flat.get(0).node().label().contains("[ 42  0x0000002A ]"), "value shown inline");
+
+        TreeView tree = new TreeView(cs);
+        tree.setRoots(List.of(wrapper));
+        tree.expandOrDescend(); // Enter / → on the wrapper: a no-op, no children revealed
+        assertEquals(1, tree.rows().size());
+        assertFalse(tree.rows().get(0).expanded());
+    }
+
+    @Test
     void collapsedShowsOnlyRoots() {
         FakeSource cs = graph();
         List<ObjectNode> roots = List.of(ref("a = #100", 100), leaf("b = 42", "42"));

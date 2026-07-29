@@ -53,12 +53,15 @@ public final class ObjectNode {
     }
 
     /**
-     * Creates a node whose expandability is derived from its value: expandable iff the
-     * value is a non-null reference. Callers building top-level local/watch nodes use this
-     * so they need not repeat the reference test.
+     * Creates a node whose expandability is derived from its value: expandable iff the value is a
+     * non-null reference that is itself {@link Value.Ref#expandable()} — the latter is {@code false}
+     * for a §20.1/§20.2 inline scalar wrapper or null-holding {@code AtomicReference}, whose value is
+     * already shown in the label. Callers building top-level local/watch nodes use this so they need
+     * not repeat the reference test (nor know about wrappers).
      */
     public static ObjectNode of(final String label, final Value value) {
-        return new ObjectNode(label, value, value instanceof Value.Ref ref && ref.objectId() != 0);
+        boolean expandable = value instanceof Value.Ref ref && ref.objectId() != 0 && ref.expandable();
+        return new ObjectNode(label, value, expandable);
     }
 
     /** The text the TUI renders for this row (name, {@code =} value, map arrow, etc.). */

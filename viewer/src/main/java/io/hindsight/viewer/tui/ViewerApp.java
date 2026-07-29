@@ -106,6 +106,7 @@ public final class ViewerApp {
     private static final int HSTEP = 4;
     private static final int RESULT_CAP = 200;
     private static final int VAR_HISTORY_CAP = 500;
+    private static final int VAR_CHANGE_CAP = 1000;
     private static final long SEEK_CAP = 5_000_000L;
     private static final String DOT = " · ";
 
@@ -143,6 +144,9 @@ public final class ViewerApp {
         final StringBuilder query = new StringBuilder();
         List<String> rows = List.of();
         List<long[]> targets = List.of();
+        // §20.3: for the `.` (OBJECT) dialog, the object id each result row references (0 = none),
+        // so Enter on a lambda row can jump to its first mention instead of the plain record seek.
+        List<Long> objectIds = List.of();
         List<InstanceBrowse.Row> instanceRows = List.of();
         TreeView instanceTree;
         String note = "";
@@ -213,18 +217,38 @@ public final class ViewerApp {
      * Live state of the §16.4/§19.4 Source Code in-file search: the {@code active} flag (search
      * mode on/off), the incrementally-edited {@code query}, the {@link InFileSearch#occurrences}
      * table ({@code {line, col}} 1-based per matching line), the {@code current} index into it (or
-     * {@code -1}), whether the current query has a match ({@code found}, drives the yellow vs. red
-     * field colour) and the §19.4 pending-boundary direction {@code boundary} ({@code null} =
-     * disarmed; non-{@code null} inverts the whole field colour and arms the two-press wrap). One
-     * instance lives for the app; {@code active} toggles it.
+     * {@code -1}) and the §19.4 pending-boundary direction {@code boundary} ({@code null} =
+     * disarmed; non-{@code null} inverts the whole field colour and arms the two-press wrap — §20.7
+     * dropped the old red no-match state, so the field is always yellow otherwise). One instance
+     * lives for the app; {@code active} toggles it.
      */
     private static final class SourceSearch {
         boolean active;
         final StringBuilder query = new StringBuilder();
         List<int[]> occurrences = List.of();
         int current = -1;
-        boolean found = true;
         InFileSearch.Dir boundary;
+    }
+
+    /**
+     * Live state of the §20.9 global variable-change window ({@code V}): a case-insensitive
+     * field-name {@code filter} (empty = all), the currently-built rows/hits/cap-note (rebuilt on
+     * every filter keystroke via {@link #rebuildVarChanges}, capped at {@link #VAR_CHANGE_CAP}), the
+     * §15.2-style QUERY/LIST {@code focus} (the filter line edits vs. the result list navigates),
+     * the list selection/scroll/hscroll and the visible row count captured at render for paging.
+     * Rows are formatted by the shared {@link VarHistory#row} so they render identically to the v1.6
+     * variable-history window. One instance lives while the window is open ({@code varChanges != null}).
+     */
+    private static final class VarChangeWindow {
+        final StringBuilder filter = new StringBuilder();
+        DialogFocus focus = DialogFocus.QUERY;
+        List<String> rows = List.of();
+        List<FieldWriteHit> hits = List.of();
+        String note = "";
+        int sel;
+        int scroll;
+        int hcol;
+        int listViewH = 1;
     }
 
     private final Screen screen;
@@ -255,6 +279,8 @@ public final class ViewerApp {
     // §17.6: whether the Ctrl-D "Recording" path popup is open.
     private boolean recordingPopup;
     private VarHistoryWindow varHist;
+    // §20.9: the global variable-change window opened by `V` (null when closed).
+    private VarChangeWindow varChanges;
     // §16.3: the Records "jump to record number" modal (null when closed).
     private RecordJump recordJump;
     // §16.4: the Source Code in-file search state (one instance; `active` toggles it).
@@ -406,6 +432,9 @@ public final class ViewerApp {
         if (varHist != null) {
             drawVarHistory(g, cols, rows);
         }
+        if (varChanges != null) {
+            drawVarChanges(g, cols, rows);
+        }
         if (recordJump != null) {
             drawRecordJump(g, cols, rows);
         }
@@ -428,8 +457,8 @@ public final class ViewerApp {
         boolean focused = focus == Win.SOURCE;
         drawBox(g, rect, sourceTitle(), Palette.BG, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
         if (sourceSearch.active) {
-            // §19.4: the compact search field is drawn ON the title row; the §18.1 frame text is
-            // suppressed while searching so the row is not cluttered to the right of the field.
+            // §20.7: the full-width search field is drawn ON the title row (covering any browse
+            // filename); the §18.1 frame text is suppressed while searching.
             renderSourceSearchField(g, rect, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
         } else {
             drawSourceFrameText(g, rect, focused);
@@ -574,7 +603,8 @@ public final class ViewerApp {
         TextColor hlBg = !exec ? Palette.FRAME_LINE_BG
                 : declTreatment ? Palette.EXEC_NOLINE_BG
                 : Palette.EXEC_LINE_BG;
-        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, hlBg, sourceCursorLine());
+        renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, hlBg,
+                sourceCursorLine(), searchQuery());
     }
 
     private void renderBrowse(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -598,7 +628,7 @@ public final class ViewerApp {
                 highlightCache.computeIfAbsent(browseKey, k -> highlighter.highlight(browseLines));
         // Browse marks the requested line with the dim (frame) highlight, never the exec highlight.
         renderCodeLines(g, ix, iy, iw, ih, browseLines, spans, srcTop, srcHcol, line,
-                Palette.FRAME_LINE_BG, sourceCursorLine());
+                Palette.FRAME_LINE_BG, sourceCursorLine(), searchQuery());
     }
 
     /** The §13.4 cursor line to render, or -1 — the cursor shows only while Source is focused. */
@@ -606,34 +636,31 @@ public final class ViewerApp {
         return focus == Win.SOURCE ? srcCursor : -1;
     }
 
-    /** §19.4 fixed input-area width of the compact {@code [ Search: <input> ]} field. */
-    private static final int SEARCH_FIELD_INPUT_W = 28;
+    /** §20.7: the in-file search query to highlight in the source body, or {@code null} when not searching. */
+    private String searchQuery() {
+        return sourceSearch.active ? sourceSearch.query.toString() : null;
+    }
 
-    /** §19.4 fixed field prefix; {@code Search: } is followed by the input area then {@code ]}. */
+    /** §20.7 field prefix; {@code [ Search: } is followed by the input area then {@code ]}. */
     private static final String SEARCH_PREFIX = "[ Search: ";
 
     /**
-     * The §19.4 in-file search field drawn over the Source title row: a COMPACT, LEFT-anchored box
-     * {@code [ Search: <input> ]} starting at {@code rect.col()+2} with a FIXED input width
-     * ({@link #SEARCH_FIELD_INPUT_W}), so the {@code ]} sits at a fixed column and never moves as
-     * the query grows — a query longer than the input area scrolls to show its TAIL
-     * ({@link InFileSearch#visibleInput}). Black background, yellow letters (RED when the non-empty
-     * query has no match); when the §19.4 pending-boundary flag is armed the WHOLE bracketed field
-     * inverts (fg/bg swap). The box is clamped to the inner width so it never overruns the border,
-     * whose corners {@link #drawBox} keeps. The terminal cursor is left visible at the input caret
-     * (§19.4) — one column after {@code Search: }, advanced by the visible query length, clamped
-     * into the input area.
+     * The §20.7 in-file search field drawn over the Source title row: a FULL-WIDTH, symmetric box
+     * {@code [ Search: <query………> ]} whose {@code [} sits at {@code rect.col()+2} and {@code ]} at
+     * {@code rect.col()+width-3} (two columns inside each corner), so it covers the whole title row
+     * — including any browse-mode {@code — <file>} title. Foreground is ALWAYS yellow on black; the
+     * §19.4 pending-boundary flag still inverts the WHOLE field (fg/bg swap) to signal end-of-file.
+     * A query longer than the input area scrolls to show its TAIL ({@link InFileSearch#visibleInput}).
+     * The single border cell between {@code ]} and the corner is restored so no title leaks there.
+     * The terminal cursor stays visible at the input caret — one column after {@code Search: },
+     * advanced by the visible query length, clamped into the input area.
      */
     private void renderSourceSearchField(
             final TextGraphics g, final Layout.Rect rect, final TextColor border, final boolean bold) {
-        int startX = rect.col() + 2;
-        int maxEnd = rect.col() + rect.width() - 3; // ']' may sit at most 2 cols before the corner
+        int startX = rect.col() + 2; // the '[' column
+        int endBracket = rect.col() + rect.width() - 3; // the ']' column: 2 cols inside the corner
         int prefixLen = SEARCH_PREFIX.length();
-        int inputW = SEARCH_FIELD_INPUT_W;
-        // §19.4: clamp the whole box to the inner width — shrink the input area until ']' fits.
-        if (startX + prefixLen + inputW > maxEnd) {
-            inputW = maxEnd - startX - prefixLen;
-        }
+        int inputW = endBracket - startX - prefixLen; // the input area fills the rest of the row
         if (inputW <= 0) {
             return; // too narrow to draw a sensible field
         }
@@ -642,19 +669,15 @@ public final class ViewerApp {
         while (box.length() < prefixLen + inputW) {
             box.append(' ');
         }
-        box.append(']');
-        // Colours: yellow-on-black normally (red-on-black when no match); armed inverts fg/bg.
-        TextColor base = sourceSearch.found ? TextColor.ANSI.YELLOW : Palette.ERROR;
+        box.append(']'); // ends exactly at endBracket
+        // §20.7: always yellow-on-black; the §19.4 armed-boundary state inverts fg/bg.
         boolean invert = sourceSearch.boundary != null;
         put(g, startX, rect.row(), box.toString(),
-                invert ? TextColor.ANSI.BLACK : base,
-                invert ? base : TextColor.ANSI.BLACK, false);
-        // §19.4: restore the border dashes from the ']' to the corner, overwriting any leftover
-        // title text (browse mode's long "— <file>" title extends past the compact field).
-        int after = startX + box.length();
-        if (after <= maxEnd) {
-            put(g, after, rect.row(), "─".repeat(maxEnd - after + 1), border, Palette.BG, bold);
-        }
+                invert ? TextColor.ANSI.BLACK : TextColor.ANSI.YELLOW,
+                invert ? TextColor.ANSI.YELLOW : TextColor.ANSI.BLACK, false);
+        // Restore the ONE border cell between ']' (endBracket) and the corner (endBracket+2) so a
+        // long browse title cannot leak through it — the field itself covers everything up to ']'.
+        put(g, endBracket + 1, rect.row(), "─", border, Palette.BG, bold);
         // §19.4 visible cursor: the caret column, clamped into the input area.
         int caret = startX + prefixLen + Math.min(visible.length(), inputW - 1);
         cursorPos = new TerminalPosition(caret, rect.row());
@@ -681,7 +704,8 @@ public final class ViewerApp {
             final int hcol,
             final int highlightLine,
             final TextColor highlightBg,
-            final int cursorLine) {
+            final int cursorLine,
+            final String searchQuery) {
         int fileLines = lines.size();
         int gutterW = Integer.toString(Math.max(1, fileLines)).length() + 1;
         int numW = Math.max(1, gutterW - 1);
@@ -719,6 +743,20 @@ public final class ViewerApp {
                 }
                 put(g, contentX + sx, y, run.toString(), Palette.syntax(st), lineBg, false);
                 sx += run.length();
+            }
+            // §20.7: overlay the in-file search match highlight on every visible occurrence of the
+            // query on this line — the matched cells are repainted reverse-video ON TOP of the normal
+            // render (and any line highlight), so all matches stand out, not just the current-match line.
+            if (searchQuery != null && !searchQuery.isEmpty()) {
+                for (int[] span : InFileSearch.matchColumns(lines.get(lineNo - 1), searchQuery, TAB_WIDTH)) {
+                    int from = Math.max(span[0], hcol);
+                    int to = Math.min(span[1], hcol + contentW);
+                    for (int vc = from; vc < to; vc++) {
+                        char c = vc < cells.size() ? cells.get(vc).ch() : ' ';
+                        put(g, contentX + (vc - hcol), y, String.valueOf(c),
+                                Palette.SEARCH_MATCH_FG, Palette.SEARCH_MATCH_BG, false);
+                    }
+                }
             }
         }
     }
@@ -814,8 +852,10 @@ public final class ViewerApp {
             TextColor fg = !frames.get(frameIndex).recorded() ? Palette.DIM
                     : engine.frameHasLines(frameIndex) ? Palette.FG
                     : Palette.CALLS_ONLY_FG;
+            // §20.6: a green (line-less) frame keeps CALLS_ONLY_FG when selected; others invert as usual.
+            TextColor selFg = fg == Palette.CALLS_ONLY_FG ? Palette.CALLS_ONLY_FG : Palette.SELECTION_FG;
             put(g, ix, iy + r, HScroll.clip(rows.get(idx), stackHcol, iw),
-                    s ? Palette.SELECTION_FG : fg,
+                    s ? selFg : fg,
                     s ? Palette.SELECTION_BG : Palette.BG, false);
         }
     }
@@ -1001,8 +1041,10 @@ public final class ViewerApp {
         // §19.2/§19.3: the exit-frame/jump slot swaps with the context — the two are mutually
         // exclusive: e/E exit-frame when line-traced, j/J jump-to-line-trace in a green context.
         String exitOrJump = greenContext() ? "j/J jump to line-trace" : "e/E exit-frame";
-        String base = "F7 step  F8 over  ⇧F7/⇧F8 reverse  " + exitOrJump + "  ^R run  o origin  "
-                + "/ calls  . obj  F file  ^D recording  c/s/t/l/r focus  q quit";
+        // §20.11a: the status help drops ^R/^Q/V/^X (they live in the F1 help window) and ends with
+        // "F1 help".
+        String base = "F7 step  F8 over  ⇧F7/⇧F8 reverse  " + exitOrJump + "  o origin  "
+                + "/ calls  . obj  F file  ^D recording  c/s/t/l/r focus  q quit  F1 help";
         String ctx = switch (focus) {
             case SOURCE -> browseMode
                     ? "↑↓ cursor  v var-history  Alt-F search  <> hscroll  o return  g/G/Home/End"
@@ -1010,7 +1052,7 @@ public final class ViewerApp {
             case THREADS -> "↑↓ select  ↵ switch  ←→/<> hscroll";
             case STACK -> "↑↓ select frame  ←→/<> hscroll";
             case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  <> hscroll";
-            case RECORDS -> "↑↓ select  ↵ jump  j record#  ←→/<> hscroll";
+            case RECORDS -> "↑↓ select  ↵ jump  c record#  ←→/<> hscroll"; // §20.12: c (was j)
         };
         put(g, 0, row, clipPad(ctx + "  |  " + base, cols), Palette.DIM, Palette.BG, false);
     }
@@ -1068,8 +1110,11 @@ public final class ViewerApp {
             }
             boolean s = showSel && idx == sel;
             TextColor fg = rowFg != null ? rowFg.get(idx) : Palette.FG;
+            // §20.6: a green (§18.3 line-less) row keeps its CALLS_ONLY_FG even when selected, so its
+            // green identity survives the highlight; every other row uses the usual SELECTION_FG.
+            TextColor selFg = fg == Palette.CALLS_ONLY_FG ? Palette.CALLS_ONLY_FG : Palette.SELECTION_FG;
             put(g, ix, iy + r, HScroll.clip(rows.get(idx), hcol, iw),
-                    s ? Palette.SELECTION_FG : fg, s ? Palette.SELECTION_BG : Palette.BG, false);
+                    s ? selFg : fg, s ? Palette.SELECTION_BG : Palette.BG, false);
         }
     }
 
@@ -1334,32 +1379,88 @@ public final class ViewerApp {
         return cls == null ? "?" : Format.simpleName(cls);
     }
 
+    /**
+     * The §20.9 global variable-change window: a centered modal (75% width, like the §16.1
+     * variable-history window) with a {@code filter:} line (a visible caret in QUERY focus), a DIM
+     * count note ({@code showing first 1000 of N} / {@code N results}), the ascending-seq field-write
+     * rows (shared {@link VarHistory#row} formatting, §13.1 edge-only scrolling, Left/Right {@code hcol}
+     * clip) and a hint row.
+     */
+    private void drawVarChanges(final TextGraphics g, final int cols, final int rows) {
+        VarChangeWindow w = varChanges;
+        int width = VarHistory.width(cols);
+        int h = clamp(rows - 6, 8, 20);
+        int x = Math.max(0, (cols - width) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(width, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, width, h), "Variable changes [V]", Palette.DIALOG_BG, Palette.FOCUS, true);
+        int ix = x + 1;
+        int iy = y + 1;
+        int iw = width - 2;
+        String filterLine = "filter: " + w.filter;
+        put(g, ix, iy, clipPad(filterLine, iw), Palette.FG, Palette.DIALOG_BG, false);
+        if (w.focus == DialogFocus.QUERY) {
+            cursorPos = new TerminalPosition(Math.min(x + width - 2, ix + filterLine.length()), iy);
+        }
+        put(g, ix, iy + 1, clip(w.note, iw), Palette.DIM, Palette.DIALOG_BG, false);
+        int hintRow = y + h - 2;
+        put(g, ix, hintRow, clip("type filter  ↑↓ select  ←→/<> hscroll  ^F/^B pg  g/G ends  ↵ jump  Esc", iw),
+                Palette.DIM, Palette.DIALOG_BG, false);
+        int listTop = iy + 2;
+        int listH = hintRow - listTop;
+        w.listViewH = Math.max(1, listH);
+        int count = w.rows.size();
+        if (count == 0) {
+            put(g, ix, listTop, clip(w.filter.length() == 0 ? "(no field writes)" : "(no matches)", iw),
+                    Palette.DIM, Palette.DIALOG_BG, false);
+            return;
+        }
+        w.sel = clamp(w.sel, 0, count - 1);
+        w.scroll = ScrollMath.adjustScroll(w.scroll, w.sel, listH, count);
+        for (int r = 0; r < listH; r++) {
+            int idx = w.scroll + r;
+            if (idx >= count) {
+                break;
+            }
+            boolean s = idx == w.sel;
+            put(g, ix, listTop + r, HScroll.clip(w.rows.get(idx), w.hcol, iw),
+                    s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+        }
+    }
+
     private void drawHelpOverlay(final TextGraphics g, final int cols, final int rows) {
+        // §20.11b: the help window lists EVERY command, including the ones dropped from the status
+        // line (Ctrl-R/Ctrl-Q run-to-line, V var-changes, Ctrl-X quit) and the §20.12/§20.13 keys.
         String[] lines = {
             "Hindsight Viewer — keys",
             "",
             "F7 / Shift+F7         step into / reverse step",
             "F8 / Shift+F8         step over / reverse step over",
-            "                      (Apple Terminal sends ⇧F7/⇧F8 as F15/F16 — accepted)",
+            "                      (Apple Terminal sends ⇧F7/⇧F8 as F15/F16)",
             "e / E                 exit current frame: forward / backward",
-            "Ctrl+R / Alt+R        run to current line: forward / backward",
-            "o                     origin — return Source to the execution line",
+            "j / J                 jump line-trace next/prev (green context)",
+            "Ctrl+R / Ctrl+Q       run to current line: forward / backward",
+            "o                     origin — return Source to the exec line",
             "Ctrl+D                show the recording directory's full path",
-            "c t s l r             focus Source Code/Threads/Stack/Locals/Records",
+            "c t s l r             focus Source/Threads/Stack/Locals/Records",
+            "c (in Records)        jump to a record by seq  (Tab → Source)",
             "Tab / Shift+Tab       cycle focus forward / backward",
             "Arrows PgUp PgDn      navigate the focused window",
+            "Ctrl+P / Ctrl+N       scroll focused window up / down one line",
+            "Ctrl+K / Ctrl+L       hscroll left / right (= < / > and ←/→)",
             "< / >                 horizontal-scroll the focused window",
-            "^F / ^B  Home End      page / jump to ends     g / G  top / bottom",
-            "v                     variable history for the Source cursor line",
+            "^F / ^B  Home End     page / jump to ends;  g / G  top/bottom",
+            "v                     variable history for the cursor line",
+            "V                     global variable-change list (field filter)",
             "Alt-F                 Source in-file search (↵ next  ⌥↵/↑↓ prev)",
-            "j                     Records: jump to a record by seq",
-            "/  .  F               browse calls/instances / find object / open file",
-            "Tab in /              toggle calls ↔ instances;  ↑↓ enters the result",
-            "                      list, / returns to the query, f = first mention",
-            "F                     source-root file tree (file: = name regex, ↵ opens)",
-            "green                 enter/exit-only (no line records): frame/thread",
-            "?  F1                 toggle this help",
-            "q  Ctrl+C             quit (q asks to confirm)",
+            "/  .  F               browse calls / find object / open file",
+            "Tab in /              toggle calls ↔ instances;  f first mention",
+            "green                 enter/exit-only (no line records)",
+            "?  F1                 toggle this help window",
+            "q  Ctrl+X  Ctrl+C     quit (q / Ctrl+X confirm; Ctrl+C now)",
             "",
             "press ? / F1 / Esc to close",
         };
@@ -1461,8 +1562,8 @@ public final class ViewerApp {
         try {
             TerminalSize sz = screen.getTerminalSize();
             if (sz.getColumns() < MIN_COLS || sz.getRows() < MIN_ROWS) {
-                // No room for the confirm box (§12.4) — quit immediately.
-                if (isCtrlC(k) || isChar(k, 'q')) {
+                // No room for the confirm box (§12.4) — quit immediately (Ctrl-X is a q synonym, §20.11c).
+                if (isCtrlC(k) || (isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
                     running = false;
                 }
                 return;
@@ -1477,9 +1578,9 @@ public final class ViewerApp {
                     helpOverlay = false;
                 } else if (isCtrlC(k)) {
                     running = false;
-                } else if (isChar(k, 'q')) {
+                } else if ((isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
                     helpOverlay = false;
-                    quitConfirm = true;
+                    quitConfirm = true; // §20.11c Ctrl-X is a q synonym
                 }
                 return;
             }
@@ -1500,6 +1601,11 @@ public final class ViewerApp {
                 handleVarHistory(k);
                 return;
             }
+            if (varChanges != null) {
+                // §20.9: the global variable-change window consumes all keys (Ctrl-C still quits).
+                handleVarChanges(k);
+                return;
+            }
             if (recordJump != null) {
                 // §16.3: the modal consumes all keys (Ctrl-C still the emergency quit).
                 handleRecordJump(k);
@@ -1514,7 +1620,9 @@ public final class ViewerApp {
                 running = false;
                 return;
             }
-            if (isChar(k, 'q')) {
+            // §12.4 quit-confirm; §20.11c Ctrl-X is a synonym for q. Ctrl-Q is NOT quit (it is the
+            // §20.10 reverse run-to-line), so the plain-q check must exclude a Ctrl modifier.
+            if ((isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
                 quitConfirm = true;
                 return;
             }
@@ -1576,20 +1684,43 @@ public final class ViewerApp {
                 // fall through to character handling
             }
         }
-        // Run-to-line (Ctrl+R forward, Ctrl+Shift+R or Alt+R backward).
+        // §20.10 run-to-line: Ctrl-R forward, Ctrl-Q backward (both thread-preserving). The old
+        // Alt-R / Ctrl-Shift-R reverse binding is removed. On a non-move doStep shows the engine's
+        // message ("no earlier/later pass through this line" / "no line records in this thread").
+        // (Ctrl-Q is XOFF/flow-control on some terminals; lanterna's raw mode disables IXON so it
+        // arrives as a Ctrl-'q' character here.)
         if (isChar(k, 'r') && k.isCtrlDown()) {
-            doStepFromSelected(() -> engine.runToCurrentLine(!k.isShiftDown()));
+            doStepFromSelected(() -> engine.runToCurrentLine(true));
             return true;
         }
-        if (isChar(k, 'r') && k.isAltDown()) {
+        if (isChar(k, 'q') && k.isCtrlDown()) {
             doStepFromSelected(() -> engine.runToCurrentLine(false));
+            return true;
+        }
+        // §20.13 per-window scroll keys (global; act on the focused window): Ctrl-P/Ctrl-N scroll the
+        // viewport up/down one line (selection unmoved where the window has its own selection; Source
+        // moves srcTop), Ctrl-K/Ctrl-L horizontal-scroll one HSTEP (synonyms for ←/→ and </>).
+        if (isChar(k, 'p') && k.isCtrlDown()) {
+            scrollFocused(-1);
+            return true;
+        }
+        if (isChar(k, 'n') && k.isCtrlDown()) {
+            scrollFocused(1);
+            return true;
+        }
+        if (isChar(k, 'k') && k.isCtrlDown()) {
+            hscrollFocused(-HSTEP);
+            return true;
+        }
+        if (isChar(k, 'l') && k.isCtrlDown()) {
+            hscrollFocused(HSTEP);
             return true;
         }
         // §19.2: in a GREEN context (the innermost frame is line-less) j/J jump between LINE-trace
         // records and REPLACE the e/E exit-frame bindings — checked here in handleGlobal (BEFORE
-        // handleNav) so a green j wins even in Records focus over the §16.3 seq dialog. Outside a
-        // green context e/E work as before and j/J are NOT globally bound, so a Records-focus `j`
-        // still opens the seq dialog on any line-traced record. The two are mutually exclusive.
+        // handleNav). Since §20.12 moved the Records seq dialog from `j` to `c`, `j`/`J` are now the
+        // green jump only (no Records-focus collision); outside a green context e/E work as before
+        // and j/J are NOT globally bound. The two (j/J vs e/E) are mutually exclusive.
         if (greenContext()) {
             // Check J first so a shifted 'j' is not eaten by 'j' (mirrors the e/E order).
             if (isChar(k, 'J') || (isChar(k, 'j') && k.isShiftDown())) {
@@ -1643,12 +1774,25 @@ public final class ViewerApp {
             openFileDialog(); // §17.7: the persistent tree browser
             return true;
         }
+        // §20.9: `V` (or shift-v — mirroring the E/J shifted-letter detection) opens the global
+        // variable-change window from any focus. Plain lowercase `v` (no shift) is NOT matched here,
+        // so it still reaches navSource's Source-focused variable-history binding.
+        if (isChar(k, 'V') || (isChar(k, 'v') && k.isShiftDown())) {
+            openVarChanges();
+            return true;
+        }
         // Focus letters (unmodified only, so Ctrl/Alt+letter reach navigation). §11.3 swaps c/s.
         if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {
             Character ch = k.getCharacter();
             if (ch != null) {
                 switch (ch) {
                     case 'c' -> {
+                        // §20.12: from the Records window, `c` opens the seq-jump dialog (handled in
+                        // navRecords) instead of switching focus — break out so handleNav gets it.
+                        // (Reach Source from Records via Tab.) Every other focus: `c` focuses Source.
+                        if (focus == Win.RECORDS) {
+                            break;
+                        }
                         focus = Win.SOURCE;
                         return true;
                     }
@@ -1797,6 +1941,14 @@ public final class ViewerApp {
         int prevFrame = engine.selectedFrame();
         if (engine.selectFrame(frameIndex)) {
             stackSel = row;
+            // §20.8: selecting a stack frame changes the shown frame, so browse mode yields to the
+            // execution source (re-centred on the frame's line via recenterSource + srcCursorPending).
+            if (browseMode) {
+                browseMode = false;
+                recenterSource = true;
+                srcCursorPending = true;
+                srcHcol = 0;
+            }
             if (frameIndex != prevFrame) {
                 // §16.2: only an ACTUAL frame switch re-follows, resets scroll and collapses
                 // Locals — a no-op re-selection must leave the reader's view untouched.
@@ -1813,6 +1965,11 @@ public final class ViewerApp {
         KeyType t = k.getKeyType();
         Character ch = k.getCharacter();
         int page = Math.max(1, viewH - 1);
+        if (t == KeyType.Enter && jumpTreeLambda(tree)) {
+            // §20.3: Enter on a lambda local jumps to its first mention (definition) instead of
+            // expanding it; the captured arg$N fields stay reachable via ArrowRight / elsewhere.
+            return;
+        }
         if (t == KeyType.ArrowUp) {
             tree.moveUp(1);
         } else if (t == KeyType.ArrowDown) {
@@ -1838,7 +1995,9 @@ public final class ViewerApp {
         Character ch = k.getCharacter();
         int page = Math.max(1, recordsViewH - 1);
         int last = Math.max(0, entries.size() - 1);
-        if (isChar(k, 'j') && !k.isCtrlDown() && !k.isAltDown()) {
+        // §20.12: the seq-jump dialog moved from `j` to `c` (freeing `j` for the §19.2 green jump).
+        // handleGlobal yields `c` to Records rather than switching focus to Source (reach Source via Tab).
+        if (isChar(k, 'c') && !k.isCtrlDown() && !k.isAltDown()) {
             recordJump = new RecordJump(); // §16.3
             return;
         }
@@ -2091,15 +2250,49 @@ public final class ViewerApp {
         if (row == null) {
             return;
         }
-        Instance c = engine.firstMentionOf(row.objectId());
+        jumpToFirstMentionOf(row.objectId(), row.display());
+    }
+
+    /**
+     * The shared first-mention jump (§14.2, extended by §20.3): seek to {@code objectId}'s
+     * {@code OBJECT_FIRST_SEEN}, advance to the nearest following execution record (the §11.7/§17.2
+     * forward-jump pattern) and append exactly ONE history entry. Reused by the {@code /}
+     * instances-dialog {@code f}, the §20.3 lambda {@code Enter} in Locals and the §20.3 lambda
+     * {@code Enter} in the {@code .} object dialog. If the engine has no first-mention record for the
+     * id (defensive), report and stay put.
+     *
+     * @param objectId the object id to jump to the first mention of
+     * @param display a short label for the status message (e.g. {@code Foo#20})
+     */
+    private void jumpToFirstMentionOf(final long objectId, final String display) {
+        Instance c = engine.firstMentionOf(objectId);
         if (c == null) {
-            status = "no first mention recorded for " + row.display();
+            status = "no first mention recorded for " + display;
             return;
         }
         landOnNearestExecAfter(c.tid(), c.index());
         afterMove();
         appendHistory();
-        status = "jumped to first mention of " + row.display() + " (seq " + c.seq() + ")";
+        status = "jumped to first mention of " + display + " (seq " + c.seq() + ")";
+    }
+
+    /**
+     * §20.3 helper: whether the selected {@code tree} row carries a lambda reference and, if so,
+     * performs the first-mention jump and returns {@code true} (so the caller skips its normal
+     * expand/seek). Guards on the node actually holding a non-null {@link Value.Ref} whose id
+     * {@link Engine#isLambda} confirms — every other node returns {@code false} and behaves as today.
+     */
+    private boolean jumpTreeLambda(final TreeView tree) {
+        List<TreeView.Row> rows = tree.rows();
+        if (rows.isEmpty()) {
+            return false;
+        }
+        Value v = rows.get(tree.selection()).node().value();
+        if (v instanceof Value.Ref ref && ref.objectId() != 0 && engine.isLambda(ref.objectId())) {
+            jumpToFirstMentionOf(ref.objectId(), ref.display());
+            return true;
+        }
+        return false;
     }
 
     private void recomputeDialog() {
@@ -2199,10 +2392,12 @@ public final class ViewerApp {
         String q = dialog.query.toString().trim();
         List<String> rows = new ArrayList<>();
         List<long[]> targets = new ArrayList<>();
+        List<Long> objectIds = new ArrayList<>(); // §20.3: the object id each row references (0 = none)
         dialog.note = "";
         if (q.isEmpty()) {
             dialog.rows = rows;
             dialog.targets = targets;
+            dialog.objectIds = objectIds;
             return;
         }
         String idText = q.startsWith("#") ? q.substring(1) : q;
@@ -2229,6 +2424,9 @@ public final class ViewerApp {
                 if (match) {
                     rows.add("seq " + r.seq() + DOT + "t" + tid + DOT + formatSiteText(r));
                     targets.add(new long[] {tid, i, r.seq()});
+                    // §20.3: for an id query every row references that id; for a class query each
+                    // OBJECT_FIRST_SEEN row's object is its target() — either lets Enter detect a lambda.
+                    objectIds.add(id != null ? id : r.target());
                     if (rows.size() >= RESULT_CAP) {
                         dialog.note = "showing first " + RESULT_CAP;
                         break outer;
@@ -2238,6 +2436,7 @@ public final class ViewerApp {
         }
         dialog.rows = rows;
         dialog.targets = targets;
+        dialog.objectIds = objectIds;
     }
 
     private boolean referencesId(final Rec r, final long id) {
@@ -2271,18 +2470,31 @@ public final class ViewerApp {
         int sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
         long[] target = dialog.targets.get(sel);
         DialogKind kind = dialog.kind;
+        // §20.3: the object id the selected `.` row references (0 = none / METHOD dialog), captured
+        // before the dialog is cleared so Enter on a lambda can jump to its first mention.
+        long objId = kind == DialogKind.OBJECT && sel < dialog.objectIds.size() ? dialog.objectIds.get(sel) : 0L;
         dialog = null;
         int tid = (int) target[0];
         long index = target[1];
         long seq = target[2];
         if (kind == DialogKind.METHOD) {
             jumpToCall(tid, index);
+        } else if (objId != 0 && engine.isLambda(objId)) {
+            // §20.3: Enter on a lambda object jumps to its first mention (definition) instead of the
+            // normal record seek — jumpToFirstMentionOf sets its own status, so return here.
+            jumpToFirstMentionOf(objId, lambdaLabel(objId));
+            return;
         } else {
             seekToSeq(tid, seq);
             afterMove();
             appendHistory();
         }
         status = "jumped to seq " + engine.currentSeq() + " (t" + engine.currentTid() + ")";
+    }
+
+    /** A short {@code SimpleClass#id} label for a §20.3 lambda first-mention status message. */
+    private String lambdaLabel(final long objectId) {
+        return simpleClass(recording.objectClassName(objectId)) + "#" + objectId;
     }
 
     /**
@@ -2381,13 +2593,13 @@ public final class ViewerApp {
         w.hcol = 0;
     }
 
-    /** {@code seq N · t<tid> · Owner#oid.field: old → new  (File:line)}; statics omit {@code #oid}. */
+    /**
+     * {@code seq N · t<tid> · Owner#oid.field: old → new  (File:line)}; statics omit {@code #oid}.
+     * Delegates to the shared {@link VarHistory#row} so this window and the §20.9 variable-change
+     * window render field writes identically.
+     */
     private String varHistoryRow(final FieldWriteHit h) {
-        String owner = h.ownerClass() == null ? "?" : Format.simpleName(h.ownerClass());
-        String target = h.isStatic() ? owner : owner + "#" + h.ownerId();
-        String file = h.fileName() != null ? h.fileName() : "?";
-        return "seq " + h.seq() + DOT + "t" + h.tid() + DOT + target + "." + h.fieldName()
-                + ": " + h.before() + " → " + h.after() + "  (" + file + ":" + h.line() + ")";
+        return VarHistory.row(h);
     }
 
     /**
@@ -2481,6 +2693,179 @@ public final class ViewerApp {
         }
     }
 
+    // ---- global variable-change window (§20.9) ----
+
+    /** §20.9: opens the global variable-change window (all field writes; empty filter). */
+    private void openVarChanges() {
+        VarChangeWindow w = new VarChangeWindow();
+        rebuildVarChanges(w);
+        varChanges = w;
+    }
+
+    /**
+     * §20.9: rebuilds the window's rows from {@link Engine#fieldWriteChanges} for the current filter
+     * (capped at {@link #VAR_CHANGE_CAP}, ascending seq), formats them with the shared
+     * {@link VarHistory#row}, sets the DIM count note ({@code showing first 1000 of N} when capped,
+     * else {@code N results}) and resets the selection/scroll/hscroll — called on open and on every
+     * filter keystroke.
+     */
+    private void rebuildVarChanges(final VarChangeWindow w) {
+        String filter = w.filter.toString();
+        List<FieldWriteHit> hits = engine.fieldWriteChanges(filter, VAR_CHANGE_CAP);
+        long total = engine.countFieldWriteChanges(filter);
+        List<String> rows = new ArrayList<>(hits.size());
+        for (FieldWriteHit hit : hits) {
+            rows.add(VarHistory.row(hit));
+        }
+        w.hits = hits;
+        w.rows = rows;
+        w.note = total > rows.size()
+                ? "showing first " + VAR_CHANGE_CAP + " of " + total
+                : rows.size() + " results";
+        w.sel = 0;
+        w.scroll = 0;
+        w.hcol = 0;
+    }
+
+    /**
+     * One key while the §20.9 variable-change window is open (Ctrl-C still quits): Esc closes, Enter
+     * jumps to the selected write's record from either focus, and everything else goes to the
+     * §15.2-style QUERY (filter line) or LIST (result list) handler depending on {@code focus}.
+     */
+    private void handleVarChanges(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (isCtrlC(k)) {
+            running = false;
+            return;
+        }
+        if (t == KeyType.Escape) {
+            varChanges = null;
+            return;
+        }
+        if (t == KeyType.Enter) {
+            jumpToVarChange();
+            return;
+        }
+        if (varChanges.focus == DialogFocus.QUERY) {
+            handleVarChangesQuery(k);
+        } else {
+            handleVarChangesList(k);
+        }
+    }
+
+    /**
+     * §20.9 QUERY focus: printables edit the filter (recompute per keystroke), Backspace deletes,
+     * Ctrl-U/Ctrl-W/Ctrl-Backspace clear it, ←/→ hscroll, and ↑/↓ (and the paging keys) hand focus
+     * to the result LIST — mirroring the §15.2 {@code /} dialog so field names containing {@code g}
+     * or {@code <} can still be typed instead of triggering the list's g/G/</> commands.
+     */
+    private void handleVarChangesQuery(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        VarChangeWindow w = varChanges;
+        if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
+            w.filter.setLength(0);
+            rebuildVarChanges(w);
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (w.filter.length() > 0) {
+                w.filter.deleteCharAt(w.filter.length() - 1);
+                rebuildVarChanges(w);
+            }
+            return;
+        }
+        if (t == KeyType.ArrowLeft) {
+            w.hcol = Math.max(0, w.hcol - HSTEP);
+            return;
+        }
+        if (t == KeyType.ArrowRight) {
+            w.hcol += HSTEP;
+            return;
+        }
+        if (t == KeyType.ArrowUp || t == KeyType.ArrowDown
+                || t == KeyType.PageUp || t == KeyType.PageDown
+                || (ctrl && (isChar(k, 'f') || isChar(k, 'b')))) {
+            if (!w.rows.isEmpty()) {
+                w.focus = DialogFocus.LIST; // §15.2: the first arrow only ENTERS; paging applies now
+                if (t != KeyType.ArrowUp && t != KeyType.ArrowDown) {
+                    handleVarChangesList(k);
+                }
+            }
+            return;
+        }
+        if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= ' ') {
+                w.filter.append(ch.charValue());
+                rebuildVarChanges(w);
+            }
+        }
+    }
+
+    /**
+     * §20.9 LIST focus: ↑/↓ select, ←/→ and </> hscroll, Ctrl-F/Ctrl-B and PgDn/PgUp page, g/G (and
+     * Home/End) jump to the ends; {@code /} or Backspace returns to the filter line (Backspace also
+     * deletes a character so editing resumes naturally).
+     */
+    private void handleVarChangesList(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        VarChangeWindow w = varChanges;
+        int last = Math.max(0, w.rows.size() - 1);
+        int page = Math.max(1, w.listViewH - 1);
+        if (!ctrl && isChar(k, '/')) {
+            w.focus = DialogFocus.QUERY;
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            w.focus = DialogFocus.QUERY;
+            if (w.filter.length() > 0) {
+                w.filter.deleteCharAt(w.filter.length() - 1);
+                rebuildVarChanges(w);
+            }
+            return;
+        }
+        if (t == KeyType.ArrowUp) {
+            w.sel = Math.max(0, w.sel - 1);
+        } else if (t == KeyType.ArrowDown) {
+            w.sel = Math.min(last, w.sel + 1);
+        } else if (t == KeyType.ArrowLeft) {
+            w.hcol = Math.max(0, w.hcol - HSTEP);
+        } else if (t == KeyType.ArrowRight) {
+            w.hcol += HSTEP;
+        } else if (t == KeyType.PageUp || (ctrl && isChar(k, 'b'))) {
+            w.sel = Math.max(0, w.sel - page);
+        } else if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
+            w.sel = Math.min(last, w.sel + page);
+        } else if (t == KeyType.Home || (!ctrl && isChar(k, 'g'))) {
+            w.sel = 0;
+        } else if (t == KeyType.End || (!ctrl && isChar(k, 'G'))) {
+            w.sel = last;
+        } else if (!ctrl && isChar(k, '<')) {
+            w.hcol = Math.max(0, w.hcol - HSTEP);
+        } else if (!ctrl && isChar(k, '>')) {
+            w.hcol += HSTEP;
+        }
+    }
+
+    /**
+     * §20.9 Enter: land on the nearest execution record at/before the selected write's record
+     * (the §17.2 rule, {@link #landOnNearestExecAtOrBefore}), append one history entry and close.
+     * A no-op when the current filter lists nothing.
+     */
+    private void jumpToVarChange() {
+        if (varChanges.hits.isEmpty()) {
+            return;
+        }
+        FieldWriteHit hit = varChanges.hits.get(clamp(varChanges.sel, 0, varChanges.hits.size() - 1));
+        varChanges = null;
+        landOnNearestExecAtOrBefore(hit.tid(), hit.index());
+        afterMove();
+        appendHistory();
+        status = "jumped to seq " + engine.currentSeq() + " (t" + engine.currentTid() + ")";
+    }
+
     // ---- record jump (§16.3) ----
 
     /** One key while the §16.3 record-jump modal is open — it consumes all keys (Ctrl-C still quits). */
@@ -2555,10 +2940,8 @@ public final class ViewerApp {
         sourceSearch.occurrences = InFileSearch.occurrences(shownSourceLines(), sourceSearch.query.toString());
         if (sourceSearch.occurrences.isEmpty()) {
             sourceSearch.current = -1;
-            sourceSearch.found = sourceSearch.query.length() == 0;
             return;
         }
-        sourceSearch.found = true;
         sourceSearch.current = InFileSearch.currentIndex(sourceSearch.occurrences, srcCursor);
         focusOccurrence();
     }
@@ -2978,6 +3361,14 @@ public final class ViewerApp {
     }
 
     private void afterMove() {
+        // §20.8: any action that moves the execution cursor yields browse mode to the execution
+        // source — clear the browsed file and force a re-centre on the new execution line
+        // (srcCursorPending is reset below). Every step and jump routes through here, so this single
+        // spot covers doStep, the Records seek, and the var-history/V/object/first-mention jumps.
+        if (browseMode) {
+            browseMode = false;
+            recenterSource = true;
+        }
         // §16.2: a navigation landing in a DIFFERENT thread collapses the Locals tree, so it opens
         // fresh rather than replaying a stale expansion path against unrelated locals. A plain
         // in-thread step keeps the same tid and does NOT collapse (the reader is following state).
@@ -3024,6 +3415,27 @@ public final class ViewerApp {
         status = "origin: following the execution line";
     }
 
+    /**
+     * §20.13 {@code Ctrl-P}/{@code Ctrl-N} viewport scroll of the focused window by {@code delta}
+     * lines: Source moves {@code srcTop} (the render's {@code clampTop} keeps it in range); the list
+     * windows nudge their scroll offset without moving the selection ({@link ScrollMath#adjustScroll}
+     * / {@link TreeView#ensureVisible} still keep the selection on-screen at render, so the offset
+     * only sticks while the selection stays within the viewport).
+     */
+    private void scrollFocused(final int delta) {
+        switch (focus) {
+            case SOURCE -> {
+                if (srcResolved) {
+                    srcTop = Math.max(1, srcTop + delta);
+                }
+            }
+            case THREADS -> threadScroll = Math.max(0, threadScroll + delta);
+            case STACK -> stackScroll = Math.max(0, stackScroll + delta);
+            case LOCALS -> localsTree.scrollBy(delta);
+            case RECORDS -> recordsScroll = Math.max(0, recordsScroll + delta);
+        }
+    }
+
     private void hscrollFocused(final int delta) {
         switch (focus) {
             case SOURCE -> {
@@ -3051,6 +3463,11 @@ public final class ViewerApp {
     /** Ctrl+C — the immediate (unconfirmed) quit, §12.4. */
     private static boolean isCtrlC(final KeyStroke k) {
         return k.isCtrlDown() && isChar(k, 'c');
+    }
+
+    /** Ctrl+X — the §20.11c synonym for {@code q} (opens the §12.4 quit-confirm; help-window-only). */
+    private static boolean isCtrlX(final KeyStroke k) {
+        return k.isCtrlDown() && isChar(k, 'x');
     }
 
     private static boolean isChar(final KeyStroke k, final char c) {
