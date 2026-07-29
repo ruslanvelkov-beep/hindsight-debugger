@@ -1411,3 +1411,39 @@ sites by `(fileBaseName, line) -> siteIds`; same-thread scans the current thread
 `lineIndices` strictly after/before the cursor for any of those sites; any-thread scans all
 threads by global seq. Keep the §21.7 `(classBinary,...)` overload if still referenced, or
 migrate its callers/tests.
+
+## 23. v2.3 fixes
+
+Bug fixes / refinements to §22. Viewer-only.
+
+### 23.1 Ctrl-Q run-to-line-backward (IXON)
+Ctrl-Q never reached the app because the terminal's XON/XOFF flow control (Ctrl-S/Ctrl-Q =
+XOFF/XON) swallowed it — which is why Ctrl-R/Ctrl-T/Ctrl-W worked but Ctrl-Q did not (the
+engine's backward scan was already correct). Main clears IXON on the controlling tty
+(`stty -ixon </dev/tty`) after lanterna's raw-mode setup; `stopScreen` restores the termios
+lanterna snapshotted BEFORE that, so the user's original IXON is preserved on exit (no explicit
+re-enable, which would wrongly force IXON on for a user who runs with it off). Best-effort; a tty
+that can't do it simply keeps the old behaviour.
+
+### 23.2 `.` (find object usage): uncapped + class-usage + working jump
+- The `RESULT_CAP` (200) trim is removed — the whole usage list is shown; only a high safety
+  cap (100k) guards against a degenerate broad substring matching millions of records (OOM),
+  with a `showing first 100000 of N — narrow the filter` note when hit.
+- A CLASS-name query now lists every record that references an INSTANCE of the class (the
+  record's `target`, or a before/after `OBJECT_ID` slot, resolving to a matching class) —
+  ENTER `this`, ARG values, FIELD_WRITE owners/values, snapshots and first-seen alike — so
+  it is a real usage finder, not just the creation (`OBJECT_FIRST_SEEN`) list it used to be.
+  Matching resolves the class's instance ids once from the engine's class index, then the
+  record scan is O(1) set membership per slot (not a per-record class resolution).
+  An id query (`#N`/`N`) still lists usages of that id.
+- Enter now transitions: it lands on the nearest exec record at/before the selected record
+  (`landOnNearestExecAtOrBefore`, the helper the V/Records/var-history jumps use) — the old
+  `seekToSeq` stepping could leave the cursor unmoved. `seekToSeq` is removed.
+
+### 23.3 Source cursor line full-line tint
+The moved cursor line (↑/↓, the highlighted-number line) now tints its WHOLE line, not just
+the gutter: the gutter keeps its bright selection marker (§13.4) and the code cells get
+`CURSOR_LINE_BG` (xterm-256 indexed 234, `#1c1c1c`) — deliberately DARKER than
+`FRAME_LINE_BG` (236) so an actual record/frame position always outranks it; when the cursor
+sits on the exec/frame line, that highlight wins outright (the tint never overrides a record
+position).

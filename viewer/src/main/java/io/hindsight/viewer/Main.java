@@ -28,6 +28,32 @@ public final class Main {
     private Main() {}
 
     /**
+     * Clears terminal XON/XOFF flow control on the controlling tty via {@code stty -ixon} (§23.1):
+     * with IXON on, the driver eats Ctrl-Q (XON) / Ctrl-S (XOFF), so the viewer's run-to-line
+     * backward key (Ctrl-Q) never reaches lanterna. Called once after {@code startScreen}; not
+     * restored explicitly — {@code stopScreen} puts back the termios lanterna snapshotted before
+     * this, so the user's original IXON is preserved either way. Best-effort — swallows any failure
+     * (no {@code /dev/tty}, non-Unix, missing {@code stty}).
+     *
+     * @param enable {@code false} to clear IXON so Ctrl-Q is delivered ({@code true} unused, kept
+     *     for symmetry)
+     */
+    private static void setFlowControl(final boolean enable) {
+        try {
+            new ProcessBuilder("sh", "-c", "stty " + (enable ? "ixon" : "-ixon") + " < /dev/tty")
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start()
+                    .waitFor();
+        } catch (IOException | InterruptedException ignored) {
+            if (ignored instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            // Best-effort: a terminal that can't do this simply keeps Ctrl-Q on flow control.
+        }
+    }
+
+    /**
      * Program entry point.
      *
      * @param args the raw command-line arguments (see {@link CliArgs#USAGE})
@@ -56,6 +82,11 @@ public final class Main {
                     .setUnixTerminalCtrlCBehaviour(UnixLikeTerminal.CtrlCBehaviour.TRAP)
                     .createScreen();
             screen.startScreen();
+            // Ctrl-Q is XON in the terminal's default flow control (Ctrl-S/Ctrl-Q = XOFF/XON), so
+            // the tty driver swallows it and the run-to-line-backward key never reaches lanterna
+            // (Ctrl-R/T/W have no such meaning and already work). Clear IXON on the controlling tty
+            // AFTER lanterna's own raw-mode stty so it sticks; restore it in the finally. Best-effort.
+            setFlowControl(false);
             new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid()).run();
         } catch (IOException e) {
             code = 1;
@@ -64,6 +95,9 @@ public final class Main {
             if (screen != null) {
                 try {
                     screen.stopScreen();
+                    // stopScreen restores the termios lanterna snapshotted BEFORE our -ixon, so the
+                    // user's original IXON returns — no explicit restore (which would wrongly force
+                    // IXON back on for someone who runs with it disabled in their shell).
                 } catch (IOException ignored) {
                     // Best-effort terminal restore; nothing useful to do if it fails.
                 }

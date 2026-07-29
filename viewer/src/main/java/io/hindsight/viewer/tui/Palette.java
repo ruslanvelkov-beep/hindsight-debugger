@@ -56,6 +56,16 @@ public final class Palette {
     public static final TextColor EXEC_NOLINE_BG = new TextColor.Indexed(22);
 
     /**
+     * Background of the Source window's cursor line (the highlighted-number line moved with ↑/↓,
+     * §22) when it is NOT the current record/frame line — the whole line is tinted so it reads as
+     * "where I am looking" without competing with an actual record position. Indexed 234
+     * ({@code #1c1c1c}) is deliberately DARKER than {@link #FRAME_LINE_BG} (236) so a
+     * merely-selected outer-frame record line always outranks it; the exec/frame highlight wins
+     * outright when the cursor sits on it. The palette's third 256-colour exception.
+     */
+    public static final TextColor CURSOR_LINE_BG = new TextColor.Indexed(234);
+
+    /**
      * Foreground of Stack rows whose recorded frame is line-less and of Threads rows whose
      * thread carries no {@code LINE} records at all (§18.3) — the light-green "calls only"
      * marking; selection inversion still wins.

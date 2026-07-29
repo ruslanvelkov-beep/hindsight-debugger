@@ -16,6 +16,7 @@ import io.hindsight.reader.Site;
 import io.hindsight.viewer.engine.Engine;
 import io.hindsight.viewer.engine.FieldWriteHit;
 import io.hindsight.viewer.engine.Frame;
+import io.hindsight.viewer.engine.ClassSite;
 import io.hindsight.viewer.engine.Instance;
 import io.hindsight.viewer.engine.Local;
 import io.hindsight.viewer.engine.ObjectNode;
@@ -104,9 +105,11 @@ public final class ViewerApp {
     private static final int MIN_ROWS = 24;
     private static final int TAB_WIDTH = 4;
     private static final int HSTEP = 4;
-    private static final int RESULT_CAP = 200;
     private static final int VAR_HISTORY_CAP = 500;
-    private static final long SEEK_CAP = 5_000_000L;
+    // §23.2: the `.` find-object-usage dialog scans ALL records (unlike the site-domain dialogs),
+    // so a degenerate broad substring can match millions — a high safety cap keeps the whole usage
+    // list for any real query while preventing an out-of-memory on a pathological one.
+    private static final int OBJECT_RESULT_CAP = 100_000;
     private static final String DOT = " · ";
 
     /** The five focusable windows, in Tab-cycle order (VIEWER.md §5, §11.3/§11.5, §12.1). */
@@ -757,16 +760,21 @@ public final class ViewerApp {
             int y = iy + row;
             boolean isHl = lineNo == highlightLine;
             boolean isCursor = lineNo == cursorLine;
-            TextColor lineBg = isHl ? highlightBg : Palette.BG;
+            // §22: the code-cell background — an actual record/frame position (isHl) always wins;
+            // otherwise the cursor line gets its own darker-than-frame tint (§13.4 kept the gutter
+            // marker, now the whole line is tinted); else the default.
+            TextColor lineBg = isHl ? highlightBg : (isCursor ? Palette.CURSOR_LINE_BG : Palette.BG);
 
-            // §13.4: the cursor line marks only its gutter cells; the code keeps its own colours.
+            // §13.4: the cursor line's GUTTER keeps the bright selection marker regardless of lineBg.
             put(g, ix, y, String.format("%" + numW + "d ", lineNo),
                     isCursor ? Palette.SELECTION_FG : Palette.DIM,
                     isCursor ? Palette.SELECTION_BG : lineBg, false);
             if (contentW <= 0) {
                 continue;
             }
-            if (isHl) {
+            // Pre-fill the content background for any tinted line (record highlight OR cursor tint)
+            // so the tint covers the whole row, not just the code characters.
+            if (isHl || isCursor) {
                 put(g, contentX, y, " ".repeat(contentW), Palette.FG, lineBg, false);
             }
             List<SourceLayout.Cell> cells = SourceLayout.cells(lines.get(lineNo - 1), spans.get(lineNo - 1), TAB_WIDTH);
@@ -2657,34 +2665,54 @@ public final class ViewerApp {
                 id = null;
             }
         }
+        // §23.2: a class-name query resolves the matching instance ids ONCE from the engine's
+        // class index (cheap: ~thousands of classes), then the record scan is O(1) set membership
+        // per slot — instead of resolving each record's object class 3× (the §22 per-record cost).
         String needle = q.toLowerCase(Locale.ROOT);
-        outer:
+        java.util.Set<Long> classIds = id != null ? null : instanceIdsMatchingClass(needle);
+        // §23.2: no artificial 200-cap — the whole usage list is shown; a high safety cap only
+        // guards against a degenerate broad substring matching millions of records (OOM).
+        long total = 0;
         for (int tid : tids) {
             long n = count(tid);
             for (long i = 0; i < n; i++) {
                 Rec r = rec(tid, i);
-                boolean match;
-                if (id != null) {
-                    match = referencesId(r, id);
-                } else {
-                    match = r.type() == Format.OBJECT_FIRST_SEEN && classMatches(r.target(), needle);
-                }
-                if (match) {
-                    rows.add("seq " + r.seq() + DOT + "t" + tid + DOT + formatSiteText(r));
-                    targets.add(new long[] {tid, i, r.seq()});
-                    // §20.3: for an id query every row references that id; for a class query each
-                    // OBJECT_FIRST_SEEN row's object is its target() — either lets Enter detect a lambda.
-                    objectIds.add(id != null ? id : r.target());
-                    if (rows.size() >= RESULT_CAP) {
-                        dialog.note = "showing first " + RESULT_CAP;
-                        break outer;
+                // An id query lists every record referencing that id (usage); a class query lists
+                // every record referencing an INSTANCE of the class — ENTER this, ARG values,
+                // FIELD_WRITE owners/values, snapshots and first-seen alike, not just creations.
+                long matchedId = id != null ? (referencesId(r, id) ? id : 0L) : firstReferencedIn(r, classIds);
+                if (matchedId != 0) {
+                    total++;
+                    if (rows.size() < OBJECT_RESULT_CAP) {
+                        rows.add("seq " + r.seq() + DOT + "t" + tid + DOT + formatSiteText(r));
+                        targets.add(new long[] {tid, i, r.seq()});
+                        objectIds.add(matchedId); // §20.3: lets Enter detect a lambda
                     }
                 }
             }
         }
+        dialog.note = total == 0 ? ""
+                : total > rows.size() ? "showing first " + OBJECT_RESULT_CAP + " of " + total + " — narrow the filter"
+                : total + " results";
         dialog.rows = rows;
         dialog.targets = targets;
         dialog.objectIds = objectIds;
+    }
+
+    /** The object ids whose runtime class (simple or binary name) contains {@code needle} (§23.2). */
+    private java.util.Set<Long> instanceIdsMatchingClass(final String needle) {
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        for (ClassSite cs : engine.classSites()) {
+            String cb = cs.classBinary();
+            if (cb != null
+                    && (Format.simpleName(cb).toLowerCase(Locale.ROOT).contains(needle)
+                            || cb.toLowerCase(Locale.ROOT).contains(needle))) {
+                for (Instance inst : engine.instancesOf(cb, Integer.MAX_VALUE)) {
+                    ids.add(inst.objectId());
+                }
+            }
+        }
+        return ids;
     }
 
     private boolean referencesId(final Rec r, final long id) {
@@ -2697,13 +2725,22 @@ public final class ViewerApp {
         return r.afterKind() == Format.KIND_OBJECT_ID && r.after() == id;
     }
 
-    private boolean classMatches(final long objectId, final String needle) {
-        String cls = recording.objectClassName(objectId);
-        if (cls == null) {
-            return false;
+    /**
+     * §23.2: the first object id this record references (target, or a before/after {@code OBJECT_ID}
+     * slot) that is in {@code ids}, or {@code 0} if none — the class-usage match via a precomputed
+     * instance-id set, so the hot record scan does O(1) lookups instead of per-record class resolution.
+     */
+    private long firstReferencedIn(final Rec r, final java.util.Set<Long> ids) {
+        if (r.target() != 0 && ids.contains(r.target())) {
+            return r.target();
         }
-        return Format.simpleName(cls).toLowerCase(Locale.ROOT).contains(needle)
-                || cls.toLowerCase(Locale.ROOT).contains(needle);
+        if (r.beforeKind() == Format.KIND_OBJECT_ID && r.before() != 0 && ids.contains(r.before())) {
+            return r.before();
+        }
+        if (r.afterKind() == Format.KIND_OBJECT_ID && r.after() != 0 && ids.contains(r.after())) {
+            return r.after();
+        }
+        return 0L;
     }
 
     private void jumpDialog() {
@@ -2724,7 +2761,6 @@ public final class ViewerApp {
         dialog = null;
         int tid = (int) target[0];
         long index = target[1];
-        long seq = target[2];
         if (kind == DialogKind.METHOD) {
             jumpToCall(tid, index);
         } else if (objId != 0 && engine.isLambda(objId)) {
@@ -2733,7 +2769,10 @@ public final class ViewerApp {
             jumpToFirstMentionOf(objId, lambdaLabel(objId));
             return;
         } else {
-            seekToSeq(tid, seq);
+            // §22 fix: land on the nearest exec record AT/BEFORE the selected record (the same
+            // helper the V/Records/var-history jumps use) so Enter actually transitions the cursor
+            // to the picked record — the old seekToSeq stepping could leave the cursor unmoved.
+            landOnNearestExecAtOrBefore(tid, index);
             afterMove();
             appendHistory();
         }
@@ -3721,36 +3760,6 @@ public final class ViewerApp {
         srcHcol = 0;
         focus = Win.SOURCE;
         status = "browsing " + browseName + " (line " + browseLine + ") — press o to return";
-    }
-
-    /**
-     * Positions the cursor on the nearest execution record (§17.1 set) at/after
-     * {@code targetSeq} in thread {@code tid} by stepping (used by the {@code .} object-usage
-     * jump — §17.2): {@code selectThread} and every step land on exec records, so the final
-     * landing is one by construction. Capped so a huge gap cannot hang the UI.
-     */
-    private void seekToSeq(final int tid, final long targetSeq) {
-        if (engine.currentTid() != tid) {
-            engine.selectThread(tid);
-        }
-        long guard = 0;
-        if (engine.currentSeq() < targetSeq) {
-            while (engine.currentSeq() < targetSeq && guard++ < SEEK_CAP) {
-                if (!engine.stepInto().moved()) {
-                    break;
-                }
-            }
-        } else if (engine.currentSeq() > targetSeq) {
-            while (engine.currentSeq() > targetSeq && guard++ < SEEK_CAP) {
-                if (!engine.reverseStep().moved()) {
-                    break;
-                }
-                if (engine.currentSeq() < targetSeq) {
-                    engine.stepInto();
-                    break;
-                }
-            }
-        }
     }
 
     // ---- navigation glue ----
