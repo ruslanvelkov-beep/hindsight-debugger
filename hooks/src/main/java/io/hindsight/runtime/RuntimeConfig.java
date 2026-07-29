@@ -79,4 +79,12 @@ public final class RuntimeConfig {
      * (SIGKILL — exactly how HAPI-test subprocess nodes die). 0 disables sweeping.
      */
     public int sweepMillis = 500;
+
+    /**
+     * Target project's git HEAD commit hash at record time, echoed to {@code manifest.properties}
+     * as {@code sourceCommit} (FORMAT.md §13, VIEWER.md §21.4) so a viewer can offer to check out
+     * the exact sources a recording was made against. Empty when unknown (the target project has
+     * no {@code .git}); the agent supplies it from its {@code sourceCommit=<hash>} argument.
+     */
+    public String sourceCommit = "";
 }

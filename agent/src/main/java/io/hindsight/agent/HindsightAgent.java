@@ -79,6 +79,7 @@ public final class HindsightAgent {
     private static void install(AgentConfig config, Class<?> hooksAnchor, Instrumentation inst) throws IOException {
         final RuntimeConfig runtimeConfig = new RuntimeConfig();
         runtimeConfig.outDir = Paths.get(config.outDir);
+        runtimeConfig.sourceCommit = config.sourceCommit;
         runtimeConfig.maxString = config.maxString;
         runtimeConfig.snapshotEvery = config.snapshotEvery;
         runtimeConfig.snapshotFirstSeen = config.snapshotFirstSeen;

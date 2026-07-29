@@ -22,7 +22,8 @@ class AgentConfigTest {
                         + "snapshotOpen=com.hedera.hapi.|com.hedera.pbj.,"
                         + "snapshotAlways=com.hedera.pbj.runtime.OneOf,autostart=false,"
                         + "trigger=com.hedera.node.App#main,maxString=64,snapshotEvery=0,snapshotDepth=3,"
-                        + "stackEvery=256,recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true");
+                        + "stackEvery=256,recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true,"
+                        + "sourceCommit=216551e1f8da95d50548c9a1448f367eb00697b2");
         assertEquals("/tmp/hooks.jar", c.hooksJar);
         assertEquals("/tmp/rec", c.outDir);
         assertEquals(List.of("com.hedera.", "com.swirlds.merkle."), c.include);
@@ -41,12 +42,14 @@ class AgentConfigTest {
         assertEquals(4, c.blobBufKB);
         assertEquals(100L, c.maxTotalMB);
         assertTrue(c.debug);
+        assertEquals("216551e1f8da95d50548c9a1448f367eb00697b2", c.sourceCommit);
     }
 
     @Test
     void defaultsMatchSpecTable() {
         final AgentConfig c = AgentConfig.parse("hooks=h.jar,include=com.example.");
         assertEquals(".hindsight", c.outDir);
+        assertEquals("", c.sourceCommit, "§13: sourceCommit defaults to empty when absent");
         assertTrue(c.autostart);
         assertNull(c.triggerClass);
         assertEquals(512, c.maxString);
@@ -61,6 +64,15 @@ class AgentConfigTest {
         assertTrue(c.exclude.isEmpty());
         assertTrue(c.snapshotOpen.isEmpty(), "§10: snapshotOpen defaults to empty");
         assertTrue(c.snapshotAlways.isEmpty(), "§10: snapshotAlways defaults to empty");
+    }
+
+    @Test
+    void sourceCommitAppearsInDescribe() {
+        final String hash = "216551e1f8da95d50548c9a1448f367eb00697b2";
+        final AgentConfig c = AgentConfig.parse("hooks=h.jar,include=a.,sourceCommit=" + hash);
+        assertEquals(hash, c.sourceCommit);
+        assertTrue(c.describe().contains("sourceCommit=" + hash),
+                "§21.4: describe() must echo the captured source commit for agent.log");
     }
 
     @Test

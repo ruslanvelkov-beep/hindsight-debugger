@@ -67,6 +67,14 @@ public final class AgentConfig {
     /** Requested recording directory (§1 may substitute a sibling). */
     public final String outDir;
 
+    /**
+     * Target project's git HEAD commit hash at record time, threaded into
+     * {@code RuntimeConfig.sourceCommit} and echoed to {@code manifest.properties} (FORMAT.md §13,
+     * VIEWER.md §21.4). Optional and free-form; defaults to {@code ""} when the key is absent (the
+     * recording script omits it when the target project has no {@code .git}).
+     */
+    public final String sourceCommit;
+
     /** Binary-name prefixes receiving FULL instrumentation. */
     public final List<String> include;
 
@@ -142,6 +150,7 @@ public final class AgentConfig {
     private AgentConfig(
             String hooksJar,
             String outDir,
+            String sourceCommit,
             List<String> include,
             List<String> callsOnly,
             List<String> exclude,
@@ -164,6 +173,7 @@ public final class AgentConfig {
             boolean debug) {
         this.hooksJar = hooksJar;
         this.outDir = outDir;
+        this.sourceCommit = sourceCommit;
         this.include = include;
         this.callsOnly = callsOnly;
         this.exclude = exclude;
@@ -219,6 +229,10 @@ public final class AgentConfig {
             throw bad("missing required key 'hooks' (path to the hindsight hooks jar)");
         }
         final String outDir = remove(pairs, "outDir", ".hindsight");
+        // §13/§21.4: optional, free-form; empty when the target project has no .git. The recording
+        // script omits the key entirely in that case (the §10 grammar rejects empty values), so an
+        // absent key defaults here to "" — matching the RuntimeConfig default echoed to the manifest.
+        final String sourceCommit = remove(pairs, "sourceCommit", "");
         final List<String> include = parseList(pairs.remove("include"), "include");
         if (include.isEmpty()) {
             throw bad("missing required key 'include' (at least one class-name prefix)");
@@ -264,6 +278,7 @@ public final class AgentConfig {
         return new AgentConfig(
                 hooksJar,
                 outDir,
+                sourceCommit,
                 include,
                 callsOnly,
                 exclude,
@@ -320,6 +335,7 @@ public final class AgentConfig {
     public String describe() {
         return "hooks=" + hooksJar
                 + ", outDir=" + outDir
+                + ", sourceCommit=" + sourceCommit
                 + ", include=" + include
                 + ", callsOnly=" + callsOnly
                 + ", exclude=" + exclude

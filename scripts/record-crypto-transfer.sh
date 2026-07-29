@@ -64,6 +64,17 @@ MAX_TOTAL_MB=$(( FREE_MB - 20480 ))
 (( MAX_TOTAL_MB > 102400 )) && MAX_TOTAL_MB=102400
 (( MAX_TOTAL_MB < 4096 )) && { echo "!! less than ~24 GiB free on disk; refusing to record"; exit 1; }
 
+# Capture the target project's git HEAD so the recording's manifest records exactly which
+# sources it was made against (FORMAT.md §13 / VIEWER.md §21.4). Empty when there is no .git.
+# The §10 agent grammar rejects empty values, so only append the key when non-empty; an absent
+# key defaults sourceCommit to "" in the agent, giving an empty manifest value.
+SOURCE_COMMIT="$(git -C "$CONSENSUS_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$SOURCE_COMMIT" ]]; then
+    echo "==> Target source commit: $SOURCE_COMMIT"
+else
+    echo "==> Target source commit: (unknown — no .git under $CONSENSUS_DIR)"
+fi
+
 # snapshotEvery=256: ~1 refresh per 256 object-id resolutions — frequent enough that
 # container contents are inspectable at checkpoints, still a rounding error in CPU/IO.
 # snapshotDepth=3: objects discovered inside a snapshot (account IDs, states, nested
@@ -71,6 +82,7 @@ MAX_TOTAL_MB=$(( FREE_MB - 20480 ))
 # readable too — Account(L1) -> AccountID(L2) -> OneOf holding the account number (L3)
 # (FORMAT.md §7).
 AGENT_OPTS="hooks=$HOOKS_JAR,outDir=$OUT_DIR,include=$INCLUDE,callsOnly=$CALLS_ONLY,exclude=$EXCLUDE,snapshotOpen=$SNAPSHOT_OPEN,snapshotAlways=$SNAPSHOT_ALWAYS,trigger=$TRIGGER,maxString=512,snapshotEvery=256,snapshotDepth=3,maxTotalMB=$MAX_TOTAL_MB,debug=true"
+[[ -n "$SOURCE_COMMIT" ]] && AGENT_OPTS="$AGENT_OPTS,sourceCommit=$SOURCE_COMMIT"
 
 echo "==> Writing node0 jvmargs seam file"
 mkdir -p "$TEST_CLIENTS_DIR/build/hindsight"

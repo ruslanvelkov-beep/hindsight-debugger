@@ -438,6 +438,9 @@ public final class HindsightRuntime {
                 + ",blobBufKB=" + cfg.blobBufKB
                 + ",maxTotalMB=" + cfg.maxTotalMB
                 + ",autostart=" + cfg.autostart);
+        // §13: the target project's git HEAD at record time (empty when unknown), so a viewer can
+        // offer to check out the exact sources — a distinct key, not part of the echoed args.
+        p.setProperty("sourceCommit", cfg.sourceCommit == null ? "" : cfg.sourceCommit);
         try (OutputStream os = Files.newOutputStream(dir.resolve("manifest.properties"))) {
             p.store(os, "hindsight recording manifest");
         }

@@ -493,7 +493,9 @@ must be skipped: storing an uninitialized `this` is a verify error.)
 ## 13. Versioning
 
 `manifest.properties` keys: `schema=4`, `recorder=<project version>`, `jvm`, `pid`,
-`startEpochMillis`, `args`. Readers refuse unknown major schema; this reader accepts
+`startEpochMillis`, `args`, and (recorder ≥ v2.1) `sourceCommit` = the target project's git
+HEAD commit hash at record time (empty when the project has no `.git`), so a viewer can
+offer to check out the exact sources the recording was made against. Readers refuse unknown major schema; this reader accepts
 1 (no snapshot `form` byte, no display names, no LINE/BRANCH), 2 (adds form byte + display
 names), 3 (adds LINE/BRANCH records and array length in first-seen), and 4 (adds
 STACK_SNAPSHOT records, the STACK blob kind and the METHODNAME/FILENAME rt-symbol kinds).
