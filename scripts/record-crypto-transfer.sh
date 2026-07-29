@@ -54,7 +54,7 @@ SNAPSHOT_OPEN='com.hedera.hapi.|com.hedera.pbj.|com.swirlds.|java.time.'
 # StringBuilder/StringBuffer are always-dumped unconditionally (FORMAT.md §7).
 # java.time values and swirlds state objects appear arbitrarily deep and are exactly
 # what recordings get inspected for — dump them regardless of snapshotDepth.
-SNAPSHOT_ALWAYS='com.hedera.pbj.runtime.OneOf|java.time.|com.swirlds.state.'
+SNAPSHOT_ALWAYS='com.hedera.pbj.runtime.OneOf|java.time.|com.swirlds.state.|com.hedera.hapi.node.base.Timestamp'
 TRIGGER='com.hedera.node.app.workflows.ingest.IngestWorkflowImpl#submitTransaction'
 
 # Size the recording cap from actual free disk (leave 20 GiB headroom, cap at 100 GiB):
