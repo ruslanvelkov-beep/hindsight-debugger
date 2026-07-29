@@ -8,20 +8,31 @@ import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 
 /**
- * Pure numeric decoration for INLINE primitive values (VIEWER.md §20.4/§20.5): the single place
- * that turns a reader-rendered integral/char value into the viewer's decorated form
- * {@code <decimal>  0x<HEX>[  (<date> UTC)]}. {@link Engine}'s value-formatting path ({@code toValue})
- * applies it when it builds a {@link Value.Primitive}, so locals, object trees, watches and the
- * map/element/field values reconstructed from snapshots all render identically.
+ * Pure numeric decoration for INLINE primitive values (VIEWER.md §20.5 hex, §20.4/§21.1 date).
+ * The decoration is split in two so hex stays context-free while the date is <em>name-gated</em>:
+ *
+ * <ul>
+ *   <li>{@link #decorate(String, int, long)} — the context-free part {@link Engine}'s
+ *       {@code toValue} always applies: the §20.5 hex on every integral value. This is the single
+ *       place turning a reader-rendered integral/char into {@code <decimal>  0x<HEX>}, so locals,
+ *       object trees, watches and the map/element/field values reconstructed from snapshots all get
+ *       the hex identically.</li>
+ *   <li>{@link #dateSuffix(int, long)} / {@link #decorateNamed(String, String, int, long)} — the
+ *       §21.1 name-gated date, applied ONLY at the render sites that carry a variable name (locals,
+ *       snapshot fields, watches). Nameless contexts (container elements, map keys/values) get no
+ *       date.</li>
+ * </ul>
  *
  * <p><b>Hex (§20.5).</b> Every integral value shows its two's-complement hex after the decimal,
  * zero-padded uppercase to the type width — byte 2, char 4, short 4, int 8, long 16 hex digits.
  * Booleans, floats and doubles get none. A char keeps its {@code 'c'} form then its {@code 0x00NN}.
  *
- * <p><b>Date (§20.4).</b> An int/long whose value lands in one of three non-overlapping epoch
- * ranges — seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)} — is
- * suffixed with its UTC wall-clock {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text). An int
- * only reaches the seconds range; a long reaches all three. The date follows the hex.
+ * <p><b>Date (§20.4/§21.1).</b> An int/long whose value lands in one of three non-overlapping epoch
+ * ranges — seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)} — has a
+ * UTC wall-clock suffix {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text) available via
+ * {@link #dateSuffix}. Per §21.1 the suffix is only appended when the value's variable name contains
+ * {@code time}, {@code date} or {@code instant} (case-insensitive); {@link #decorateNamed} applies
+ * that gate. An int only reaches the seconds range; a long reaches all three. The date follows the hex.
  */
 final class NumberFormatUtil {
 
@@ -39,9 +50,10 @@ final class NumberFormatUtil {
     private NumberFormatUtil() {}
 
     /**
-     * Decorates a reader-rendered INLINE value with §20.5 hex and §20.4 date as the tag warrants,
-     * returning {@code base} unchanged for non-integral tags (boolean/float/double/null/void and
-     * any unknown tag).
+     * Decorates a reader-rendered INLINE value with the context-free §20.5 hex as the tag warrants,
+     * returning {@code base} unchanged for non-integral tags (boolean/float/double/null/void and any
+     * unknown tag). The §20.4/§21.1 date is <em>not</em> applied here — it is name-gated and added by
+     * {@link #decorateNamed} at the name-bearing render sites.
      *
      * @param base the reader's already-rendered text (decimal for integrals, {@code 'c'} for char)
      * @param tag the FORMAT.md §2.3 value tag
@@ -52,10 +64,47 @@ final class NumberFormatUtil {
             case Format.TAG_BYTE -> base + hex(slot, 2);
             case Format.TAG_SHORT -> base + hex(slot, 4);
             case Format.TAG_CHAR -> base + hex(slot, 4);
-            case Format.TAG_INT -> base + hex(slot, 8) + date(slot);
-            case Format.TAG_LONG -> base + hex(slot, 16) + date(slot);
+            case Format.TAG_INT -> base + hex(slot, 8);
+            case Format.TAG_LONG -> base + hex(slot, 16);
             default -> base;
         };
+    }
+
+    /**
+     * The §20.4 UTC date suffix {@code   (YYYY-MM-DD HH:MM:SS UTC)} for an int/long value that lands
+     * in an epoch range (seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)});
+     * {@code ""} for any other tag or an out-of-range value. This is the raw, ungated suffix — callers
+     * apply the §21.1 name gate via {@link #decorateNamed}.
+     *
+     * @param tag the FORMAT.md §2.3 value tag (only {@code TAG_INT}/{@code TAG_LONG} can produce a date)
+     * @param slot the raw value slot
+     */
+    static String dateSuffix(final int tag, final long slot) {
+        return (tag == Format.TAG_INT || tag == Format.TAG_LONG) ? date(slot) : "";
+    }
+
+    /**
+     * Appends the §21.1 name-gated date to an already-hex-decorated value: the {@link #dateSuffix}
+     * is added only when {@code varName} (case-insensitive) contains {@code time}, {@code date} or
+     * {@code instant} AND the value is an in-range int/long. Nameless / non-time-named values are
+     * returned unchanged, so container elements and non-temporal fields keep hex only (§21.1).
+     *
+     * @param hexDecorated the value already carrying its §20.5 hex (the output of {@link #decorate})
+     * @param varName the value's variable/field/watch name, or {@code null} when nameless
+     * @param tag the FORMAT.md §2.3 value tag
+     * @param slot the raw value slot
+     */
+    static String decorateNamed(final String hexDecorated, final String varName, final int tag, final long slot) {
+        return nameSuggestsTime(varName) ? hexDecorated + dateSuffix(tag, slot) : hexDecorated;
+    }
+
+    /** Whether a variable name (case-insensitive) contains {@code time}, {@code date} or {@code instant} (§21.1). */
+    private static boolean nameSuggestsTime(final String varName) {
+        if (varName == null) {
+            return false;
+        }
+        String n = varName.toLowerCase(Locale.ROOT);
+        return n.contains("time") || n.contains("date") || n.contains("instant");
     }
 
     /** {@code   0x<HEX>}: {@code slot} masked to {@code digits} nibbles, zero-padded uppercase. */

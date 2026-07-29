@@ -11,6 +11,7 @@ import io.hindsight.viewer.engine.Instance;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.function.Function;
 import java.util.regex.PatternSyntaxException;
 import org.junit.jupiter.api.Test;
@@ -249,6 +250,46 @@ final class InstanceBrowseTest {
                 InstanceBrowse.filter(V15_SITES, v15Instances(), "com.bytes", InstanceBrowse.CAP);
         assertEquals(1, decoy.rows().size());
         assertEquals(DECOY.classBinary(), decoy.rows().get(0).classBinary());
+    }
+
+    // ---- §21.6 thread filter ----
+
+    @Test
+    void threadFilterKeepsOnlyThatThreadsInstances() {
+        // "com.foo" spans Alpha (t1: #11@10, #12@30) and Alpha$Inner (t2: #13@20).
+        InstanceBrowse.Result t1 = InstanceBrowse.filter(
+                SITES, instances(), "com.foo", InstanceBrowse.CAP, OptionalInt.of(1));
+        assertEquals(List.of("Alpha#11", "Alpha#12"),
+                t1.rows().stream().map(InstanceBrowse.Row::display).toList());
+        assertEquals(2, t1.totalMatches(), "count reflects the thread-filtered rows");
+        assertFalse(t1.truncated());
+        InstanceBrowse.Result t2 = InstanceBrowse.filter(
+                SITES, instances(), "com.foo", InstanceBrowse.CAP, OptionalInt.of(2));
+        assertEquals(List.of("Inner#13"), t2.rows().stream().map(InstanceBrowse.Row::display).toList());
+        assertEquals(1, t2.totalMatches());
+        // A thread with no matching instances → empty.
+        assertTrue(InstanceBrowse.filter(SITES, instances(), "com.foo", InstanceBrowse.CAP, OptionalInt.of(99))
+                .rows().isEmpty());
+    }
+
+    @Test
+    void emptyThreadFilterMatchesTheFourArgOverload() {
+        InstanceBrowse.Result a = InstanceBrowse.filter(SITES, instances(), "com.foo", InstanceBrowse.CAP);
+        InstanceBrowse.Result b = InstanceBrowse.filter(
+                SITES, instances(), "com.foo", InstanceBrowse.CAP, OptionalInt.empty());
+        assertEquals(a.rows().size(), b.rows().size());
+        assertEquals(a.totalMatches(), b.totalMatches());
+        assertEquals(a.rows().stream().map(InstanceBrowse.Row::display).toList(),
+                b.rows().stream().map(InstanceBrowse.Row::display).toList());
+    }
+
+    @Test
+    void threadFilterComposesWithIdQuery() {
+        // #12 lives in Alpha on t1; filtering to t1 keeps it, t2 drops it.
+        assertEquals(1, InstanceBrowse.filter(
+                SITES, instances(), "alpha#12", InstanceBrowse.CAP, OptionalInt.of(1)).rows().size());
+        assertTrue(InstanceBrowse.filter(
+                SITES, instances(), "alpha#12", InstanceBrowse.CAP, OptionalInt.of(2)).rows().isEmpty());
     }
 
     @Test

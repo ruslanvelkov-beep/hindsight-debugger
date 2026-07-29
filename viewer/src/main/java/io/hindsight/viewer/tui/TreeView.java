@@ -100,7 +100,7 @@ public final class TreeView {
 
     /**
      * Nudges the vertical scroll offset by {@code delta} rows (floored at 0) without moving the
-     * selection — the §20.13 {@code Ctrl-P}/{@code Ctrl-N} viewport scroll for the Locals window.
+     * selection — the §20.13/§21.9 {@code Ctrl-U}/{@code Ctrl-N} viewport scroll for the Locals window.
      * {@link #ensureVisible} still runs at render, so the scroll is bounded by keeping the selection
      * on-screen (the offset only sticks while the selection stays within the viewport).
      */

@@ -225,4 +225,75 @@ final class FileTreeTest {
             assertEquals(expected, r.depth(), r.name());
         }
     }
+
+    // ---- §21.3 FLAT filter mode + suffix view ----
+
+    private static List<String> flatRels(final FileTree tree) {
+        return tree.flatRows().stream().map(FileTree.FlatRow::rel).toList();
+    }
+
+    @Test
+    void flatRowsAreEmptyInBrowseMode(@TempDir final Path dir) throws IOException {
+        Path root = sampleRoot(dir);
+        FileTree tree = FileTree.build(List.of(root));
+        // Empty filter → BROWSE mode: rows() drives the tree; flatRows() is empty.
+        assertTrue(tree.flatRows().isEmpty());
+        assertFalse(tree.rows().isEmpty());
+    }
+
+    @Test
+    void flatRowsListMatchingFilesWithRootRelativePaths(@TempDir final Path dir) throws IOException {
+        Path root = sampleRoot(dir);
+        FileTree tree = FileTree.build(List.of(root));
+        tree.setFilter("ba"); // matches Bar.java and Baz.java (case-insensitive, file name)
+        assertEquals(List.of("com/foo/Bar.java", "com/foo/Baz.java"), flatRels(tree));
+        // The row carries the absolute file path (the open target); no directory rows appear.
+        assertEquals(root.resolve("com/foo/Bar.java").toAbsolutePath().normalize(),
+                tree.flatRows().get(0).path());
+    }
+
+    @Test
+    void flatRowsIgnoreExpansionAndSpanTheWholeTree(@TempDir final Path dir) throws IOException {
+        Path root = sampleRoot(dir);
+        FileTree tree = FileTree.build(List.of(root));
+        tree.collapse(root); // flat mode does not care about expand/collapse state
+        tree.setFilter("java");
+        assertEquals(List.of("com/foo/Bar.java", "com/foo/Baz.java", "util/Helper.java", "Top.java"),
+                flatRels(tree));
+    }
+
+    @Test
+    void flatRowsEmptyForInvalidRegexOrNoMatch(@TempDir final Path dir) throws IOException {
+        Path root = sampleRoot(dir);
+        FileTree tree = FileTree.build(List.of(root));
+        tree.setFilter("[");
+        assertTrue(tree.flatRows().isEmpty(), "invalid regex → no flat rows");
+        tree.setFilter("zzz");
+        assertTrue(tree.flatRows().isEmpty(), "no match → no flat rows");
+    }
+
+    @Test
+    void relativeTextJoinsNameElementsWithForwardSlashes(@TempDir final Path dir) throws IOException {
+        Path root = dir.resolve("root");
+        Files.createDirectories(root.resolve("a/b"));
+        assertEquals("a/b/C.java", FileTree.relativeText(root, root.resolve("a/b/C.java")));
+        assertEquals("Top.java", FileTree.relativeText(root, root.resolve("Top.java")));
+    }
+
+    @Test
+    void suffixViewShowsTheFileNameThenRevealsThePrefix() {
+        String full = "com/foo/bar/Baz.java"; // length 20
+        // Fits within the width: returned whole.
+        assertEquals(full, FileTree.suffixView(full, 40, 0));
+        assertEquals(full, FileTree.suffixView(full, 20, 0));
+        // Narrower: hcol 0 shows the TAIL, so the file name stays visible (leading dirs clip).
+        assertEquals("bar/Baz.java", FileTree.suffixView(full, 12, 0));
+        // Scrolling right reveals the prefix one column at a time.
+        assertEquals("foo/bar/Baz.", FileTree.suffixView(full, 12, 4));
+        // Clamp: a huge hcol stops at the start (the full prefix).
+        assertEquals("com/foo/bar/", FileTree.suffixView(full, 12, 999));
+        // Degenerate inputs.
+        assertEquals("", FileTree.suffixView(null, 12, 0));
+        assertEquals("", FileTree.suffixView(full, 0, 0));
+    }
 }

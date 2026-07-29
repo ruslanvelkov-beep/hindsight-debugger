@@ -54,6 +54,15 @@ public final class FileTree {
      */
     public record Row(Path path, String name, boolean directory, int depth, boolean expanded) {}
 
+    /**
+     * One row of the §21.3 FLAT filter list (non-empty filter): a matching {@code .java} file
+     * with its absolute {@code path} (the open target and the info-line's full path) and
+     * {@code rel} — the path relative to its owning root, the horizontally-scrollable text the
+     * row shows so the file name is always visible while leading directories clip (see
+     * {@link #suffixView}). Folder structure is ignored in this mode (no expand/collapse).
+     */
+    public record FlatRow(Path path, String rel) {}
+
     /** One immutable indexed entry: a directory (with children) or a {@code .java} file. */
     private record Node(Path path, String name, boolean dir, List<Node> children) {}
 
@@ -246,5 +255,87 @@ public final class FileTree {
     /** Whether the directory at {@code dir} is currently expanded. */
     public boolean isExpanded(final Path dir) {
         return expandedDirs.contains(dir);
+    }
+
+    /**
+     * The §21.3 FLAT filter result: every indexed {@code .java} file whose name matches the
+     * current {@link #setFilter} regex, as a flat list (folder structure ignored — no
+     * expand/collapse), depth-first in the same directories-then-files order the tree walks,
+     * each carrying its root-relative path text. Empty when NO filter is set (browse mode uses
+     * {@link #rows()} instead), when the filter is invalid, or when nothing matches. Reuses the
+     * same matching set {@link #setFilter} computed for {@link #rows()}, so the two views stay
+     * consistent.
+     *
+     * @return the matching files as a flat list, or empty in browse/invalid/no-match cases
+     */
+    public List<FlatRow> flatRows() {
+        if (!filterValid || matching == null) {
+            return List.of();
+        }
+        List<FlatRow> out = new ArrayList<>();
+        for (Node r : roots) {
+            collectMatchingFiles(r, r.path(), out);
+        }
+        return List.copyOf(out);
+    }
+
+    private void collectMatchingFiles(final Node n, final Path root, final List<FlatRow> out) {
+        if (!n.dir()) {
+            if (matching.contains(n.path())) {
+                out.add(new FlatRow(n.path(), relativeText(root, n.path())));
+            }
+            return;
+        }
+        for (Node c : n.children()) {
+            collectMatchingFiles(c, root, out);
+        }
+    }
+
+    /**
+     * The {@code root}-relative path text a §21.3 flat-filter row shows, always forward-slash
+     * separated (so the display is stable across platforms). {@code /a/b/root} + {@code
+     * /a/b/root/com/foo/Bar.java} → {@code com/foo/Bar.java}.
+     *
+     * @param root the owning source root
+     * @param file the matching file
+     * @return the root-relative path, {@code /}-joined
+     */
+    static String relativeText(final Path root, final Path file) {
+        Path rel = root.relativize(file);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < rel.getNameCount(); i++) {
+            if (i > 0) {
+                sb.append('/');
+            }
+            sb.append(rel.getName(i));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The §21.3 right-anchored, horizontally-scrollable view of a flat-filter row's path
+     * {@code full} into {@code width} columns: at {@code hcol == 0} the TAIL — the last
+     * {@code width} characters, so the file name is always visible and leading directories clip;
+     * increasing {@code hcol} slides the window left one column at a time to reveal the prefix,
+     * clamped so it never scrolls past the start. When the whole path already fits in
+     * {@code width}, it is returned unchanged.
+     *
+     * @param full the row's full (root-relative) path text
+     * @param width the visible column count
+     * @param hcol the horizontal scroll offset (0 shows the suffix; larger reveals the prefix)
+     * @return the visible substring, never longer than {@code width}
+     */
+    public static String suffixView(final String full, final int width, final int hcol) {
+        if (full == null || width <= 0) {
+            return "";
+        }
+        int len = full.length();
+        if (len <= width) {
+            return full;
+        }
+        int maxHcol = len - width;
+        int h = Math.max(0, Math.min(hcol, maxHcol));
+        int start = maxHcol - h;
+        return full.substring(start, start + width);
     }
 }

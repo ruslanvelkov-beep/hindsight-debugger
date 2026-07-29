@@ -58,6 +58,9 @@ public final class Engine implements AutoCloseable {
     static final String NO_NEXT_APPEARANCE = "no next appearance of this line.";
     static final String NO_PREV_APPEARANCE = "no previous appearance of this line.";
     static final String NO_LINE_RECORDS = "no line records in this thread";
+    static final String NO_LATER_PASS = "no later pass through this line";
+    static final String NO_EARLIER_PASS = "no earlier pass through this line";
+    static final String NO_LINE_RECORD_FOR_LINE = "no line record for the selected line";
     static final String ALREADY_HERE = "already here";
     static final String ALREADY_AT_FRAME_RETURN = "already at frame return";
     static final String ALREADY_AT_FRAME_ENTRY = "already at frame entry";
@@ -82,6 +85,9 @@ public final class Engine implements AutoCloseable {
 
     /** One static FIELD_WRITE, ordered by {@code seq}, for watch resolution. */
     private record WriteRef(long seq, int tid, long index) {}
+
+    /** A {@code (classBinary, line)} source location, the key of the §21.7 LINE-site index. */
+    private record ClassLine(String classBinary, int line) {}
 
     /** A stack frame plus the record index whose state its locals reflect (§2.4). */
     private record FrameCtx(Frame frame, long asOfIndex) {}
@@ -186,6 +192,11 @@ public final class Engine implements AutoCloseable {
     private Map<String, List<Instance>> instancesByClass;
     private Map<Long, Instance> firstMentionById;
     private Map<String, List<WriteRef>> fieldWriteRefsByName;
+
+    // Lazily built once on first runToLine() call (§21.7): every distinct LINE site that actually
+    // appears in the recording, keyed by its (classBinary, line) source location → the site id(s) at
+    // that location. A source line can compile to more than one LINE site, so the value is an array.
+    private Map<ClassLine, int[]> lineSitesByLocation;
 
     private Engine(final Recording recording) throws IOException {
         this.recording = recording;
@@ -542,6 +553,192 @@ public final class Engine implements AutoCloseable {
             }
         }
         return new StepResult(false, NO_PREV_APPEARANCE);
+    }
+
+    /**
+     * Run to the next ({@code forward}) / previous LINE record passing through a chosen source line
+     * {@code (classBinary, line)} — the SELECTED source line in the shown frame's file, not the
+     * cursor record's own line (§21.7, supersedes §20.10's "current line"). The line is resolved to
+     * its LINE site id(s) via {@link #lineSitesByLocation}; a source line can compile to more than
+     * one LINE site, so a record matches when its {@code location()} is any of them.
+     *
+     * <ul>
+     *   <li>{@code sameThread == true} ({@code Ctrl-R}/{@code Ctrl-Q}) — searches only the current
+     *       thread's {@link ThreadIndex#lineIndices} strictly after / before the cursor index, so it
+     *       stays on this thread (loop re-hits, etc.).</li>
+     *   <li>{@code sameThread == false} ({@code Ctrl-T}/{@code Ctrl-W}) — searches ALL threads by
+     *       global {@code seq}, landing on the record with the nearest {@code seq} strictly greater /
+     *       less than the cursor's {@code seq}; it may move to another thread.</li>
+     * </ul>
+     *
+     * <p>No move with {@link #NO_LATER_PASS}/{@link #NO_EARLIER_PASS} when no such record exists in
+     * the run direction, or {@link #NO_LINE_RECORD_FOR_LINE} when {@code (classBinary, line)} never
+     * appears as a LINE record (an unresolvable line, e.g. a blank/comment line the TUI resolved to
+     * nothing). On a move the selected frame resets to innermost through {@link #moveTo}, exactly
+     * like every other navigation.
+     *
+     * @param classBinary the binary class name of the selected source line's owner
+     * @param line the selected source line number
+     * @param forward {@code true} to run to the next pass, {@code false} to the previous one
+     * @param sameThread {@code true} to stay in the current thread, {@code false} to search all threads
+     */
+    public StepResult runToLine(
+            final String classBinary, final int line, final boolean forward, final boolean sameThread) {
+        int[] siteIds = lineSiteIdsFor(classBinary, line);
+        if (siteIds.length == 0) {
+            return new StepResult(false, NO_LINE_RECORD_FOR_LINE);
+        }
+        return sameThread ? runToLineSameThread(siteIds, forward) : runToLineAnyThread(siteIds, forward);
+    }
+
+    /** §21.7 thread-preserving run-to-line: the current thread's LINEs after/before the cursor. */
+    private StepResult runToLineSameThread(final int[] siteIds, final boolean forward) {
+        ThreadIndex ti = index(cursorTid);
+        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+        if (forward) {
+            for (int t = idx >= 0 ? idx + 1 : -idx - 1; t < ti.lineIndices.length; t++) {
+                if (matchesAny(siteIds, rec(cursorTid, ti.lineIndices[t]).location())) {
+                    return moveTo(cursorTid, ti.lineIndices[t]);
+                }
+            }
+            return new StepResult(false, NO_LATER_PASS);
+        }
+        for (int t = idx >= 0 ? idx - 1 : -idx - 2; t >= 0; t--) {
+            if (matchesAny(siteIds, rec(cursorTid, ti.lineIndices[t]).location())) {
+                return moveTo(cursorTid, ti.lineIndices[t]);
+            }
+        }
+        return new StepResult(false, NO_EARLIER_PASS);
+    }
+
+    /**
+     * §21.7 cross-thread run-to-line: the LINE record (in any thread) whose {@code seq} is nearest
+     * strictly after / before the cursor's {@code seq}. Each thread's {@code lineIndices} is
+     * index-ascending, hence {@code seq}-ascending, so a binary search on {@code seq} finds the
+     * boundary and the first match walking outward is that thread's nearest; the global best across
+     * threads wins, with a running-best {@code seq} prune bounding the walk.
+     */
+    private StepResult runToLineAnyThread(final int[] siteIds, final boolean forward) {
+        long cursorSeq = currentSeq();
+        int bestTid = -1;
+        long bestIndex = -1;
+        long bestSeq = forward ? Long.MAX_VALUE : Long.MIN_VALUE;
+        for (int tid : recording.threadIds()) {
+            long[] lines = index(tid).lineIndices;
+            int boundary = firstLineAtOrAfterSeq(tid, lines, cursorSeq);
+            if (forward) {
+                for (int t = boundary; t < lines.length; t++) {
+                    long seq = rec(tid, lines[t]).seq();
+                    if (seq <= cursorSeq) {
+                        continue; // the boundary record can equal cursorSeq (same thread); skip it
+                    }
+                    if (seq >= bestSeq) {
+                        break; // seq-ascending: nothing later in this thread can beat the best
+                    }
+                    if (matchesAny(siteIds, rec(tid, lines[t]).location())) {
+                        bestSeq = seq;
+                        bestTid = tid;
+                        bestIndex = lines[t];
+                        break;
+                    }
+                }
+            } else {
+                for (int t = boundary - 1; t >= 0; t--) {
+                    long seq = rec(tid, lines[t]).seq();
+                    if (seq >= cursorSeq) {
+                        continue;
+                    }
+                    if (seq <= bestSeq) {
+                        break;
+                    }
+                    if (matchesAny(siteIds, rec(tid, lines[t]).location())) {
+                        bestSeq = seq;
+                        bestTid = tid;
+                        bestIndex = lines[t];
+                        break;
+                    }
+                }
+            }
+        }
+        if (bestTid < 0) {
+            return new StepResult(false, forward ? NO_LATER_PASS : NO_EARLIER_PASS);
+        }
+        return moveTo(bestTid, bestIndex);
+    }
+
+    /** Index into {@code lines} of the first LINE record with {@code seq ≥ cursorSeq} (binary search). */
+    private int firstLineAtOrAfterSeq(final int tid, final long[] lines, final long cursorSeq) {
+        int lo = 0;
+        int hi = lines.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (rec(tid, lines[mid]).seq() >= cursorSeq) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return lo;
+    }
+
+    /** Whether {@code siteId} is one of the (small) resolved LINE site ids for the target line. */
+    private static boolean matchesAny(final int[] siteIds, final int siteId) {
+        for (int s : siteIds) {
+            if (s == siteId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The LINE site id(s) at source location {@code (classBinary, line)}, or an empty array (§21.7). */
+    private int[] lineSiteIdsFor(final String classBinary, final int line) {
+        ensureLineSiteIndex();
+        int[] ids = lineSitesByLocation.get(new ClassLine(classBinary, line));
+        return ids != null ? ids : EMPTY_SITE_IDS;
+    }
+
+    private static final int[] EMPTY_SITE_IDS = new int[0];
+
+    /**
+     * Builds {@link #lineSitesByLocation} on first {@link #runToLine} use: the distinct LINE site ids
+     * that appear as {@code LINE} record locations across all threads, grouped by their
+     * {@code (classBinary, line)}. Only lines that actually executed are indexed — a line with no
+     * record cannot be run to anyway — mirroring the lazy full-pass caches
+     * ({@link #ensureMethodSites}/{@link #ensureInstanceIndex}). Distinct site ids are collected
+     * first so each site's symbols resolve once regardless of how many times its line ran.
+     */
+    private void ensureLineSiteIndex() {
+        if (lineSitesByLocation != null) {
+            return;
+        }
+        Set<Integer> siteIds = new HashSet<>();
+        for (int tid : recording.threadIds()) {
+            for (long li : index(tid).lineIndices) {
+                siteIds.add(rec(tid, li).location());
+            }
+        }
+        Map<ClassLine, List<Integer>> byLocation = new HashMap<>();
+        for (int siteId : siteIds) {
+            Site s = recording.site(siteId);
+            if (s == null) {
+                continue;
+            }
+            String cls = recording.symbolText(s.classSym());
+            if (cls == null) {
+                continue;
+            }
+            byLocation.computeIfAbsent(new ClassLine(cls, s.line()), k -> new ArrayList<>()).add(siteId);
+        }
+        Map<ClassLine, int[]> out = new HashMap<>();
+        for (Map.Entry<ClassLine, List<Integer>> e : byLocation.entrySet()) {
+            int[] arr = new int[e.getValue().size()];
+            for (int i = 0; i < arr.length; i++) {
+                arr[i] = e.getValue().get(i);
+            }
+            out.put(e.getKey(), arr);
+        }
+        this.lineSitesByLocation = out;
     }
 
     /**
@@ -1040,8 +1237,8 @@ public final class Engine implements AutoCloseable {
             int argIdx = r.idx();
             int slot = argIdx < argSlot.length ? argSlot[argIdx] : base + argIdx;
             String d = argIdx < params.size() ? params.get(argIdx) : "";
-            Value v = toValue(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated());
             String name = paramNames.getOrDefault(slot, "arg" + argIdx);
+            Value v = toValueNamed(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated(), name);
             bySlot.put(slot, new Local(slot, name, d, v));
         }
 
@@ -1055,8 +1252,9 @@ public final class Engine implements AutoCloseable {
             Site s = recording.site(r.location());
             String name = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
             String desc = s != null ? s.desc() : "";
-            Value v = toValue(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated());
-            bySlot.put(slot, new Local(slot, name != null ? name : "slot" + slot, desc, v));
+            String localName = name != null ? name : "slot" + slot;
+            Value v = toValueNamed(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated(), localName);
+            bySlot.put(slot, new Local(slot, localName, desc, v));
         }
 
         return List.copyOf(bySlot.values());
@@ -1189,14 +1387,27 @@ public final class Engine implements AutoCloseable {
         return new ObjectNode("…+" + n + " more", new Value.Absent(), false);
     }
 
-    private Reconstructed reconstruct(final long id, final long asOfSeq) {
-        List<ObjEvent> events = objEvents.getOrDefault(id, List.of());
+    /**
+     * The latest {@code SNAPSHOT} event for {@code id} with {@code seq ≤ asOfSeq}, or {@code null}
+     * when none exists at/before the cursor. {@link #objEvents} is seq-ordered, so the last match
+     * on the walk is the newest. Shared by {@link #reconstruct} (which unfolds the snapshot into
+     * children) and {@link #containerSizeSuffix} (which reads only its form/{@code totalSize}), so a
+     * container ref's {@code , size=N} label and its expanded children are always the SAME snapshot
+     * (§21.5) — the label can never claim a size the children do not reflect.
+     */
+    private ObjEvent latestSnapshotAsOf(final long id, final long asOfSeq) {
         ObjEvent snap = null;
-        for (ObjEvent ev : events) {
+        for (ObjEvent ev : objEvents.getOrDefault(id, List.of())) {
             if (ev.snapshot() && ev.seq() <= asOfSeq) {
                 snap = ev; // list is seq-ordered, so the last match is the latest snapshot
             }
         }
+        return snap;
+    }
+
+    private Reconstructed reconstruct(final long id, final long asOfSeq) {
+        List<ObjEvent> events = objEvents.getOrDefault(id, List.of());
+        ObjEvent snap = latestSnapshotAsOf(id, asOfSeq);
         long snapSeq = snap != null ? snap.seq() : Long.MIN_VALUE;
         List<ObjEvent> writes = new ArrayList<>();
         for (ObjEvent ev : events) {
@@ -1220,17 +1431,17 @@ public final class Engine implements AutoCloseable {
             LinkedHashMap<String, Value> fields = new LinkedHashMap<>();
             if (parsed != null) {
                 for (Recording.SnapField f : parsed.fields()) {
-                    String name = recording.symbolText(f.nameSym());
-                    fields.put(name != null ? name : "?sym" + f.nameSym(),
-                            toValue(f.kind(), f.tag(), f.value(), snapTid, false));
+                    String sym = recording.symbolText(f.nameSym());
+                    String name = sym != null ? sym : "?sym" + f.nameSym();
+                    fields.put(name, toValueNamed(f.kind(), f.tag(), f.value(), snapTid, false, name));
                 }
             }
             for (ObjEvent w : writes) {
                 Rec wr = rec(w.tid(), w.index());
                 Site s = recording.site(wr.location());
-                String name = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
-                fields.put(name != null ? name : "?field",
-                        toValue(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated()));
+                String sym = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
+                String name = sym != null ? sym : "?field";
+                fields.put(name, toValueNamed(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated(), name));
             }
             return Reconstructed.fields(fields);
         }
@@ -1293,7 +1504,8 @@ public final class Engine implements AutoCloseable {
                 continue;
             }
             Rec wr = rec(w.tid(), w.index());
-            Value val = toValue(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated());
+            // §21.1: the root expression's field name gates the date on an in-range static value.
+            Value val = toValueNamed(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated(), field);
             return walkPath(expression, val, Arrays.copyOfRange(tokens, splitLen + 1, tokens.length));
         }
         return new WatchResult(expression, null, UNSUPPORTED_WATCH);
@@ -1582,8 +1794,8 @@ public final class Engine implements AutoCloseable {
                     ownerBinary,
                     fieldName,
                     s.isStatic() || r.isStatic(),
-                    fieldSlotDisplay(r, true),
-                    fieldSlotDisplay(r, false),
+                    fieldSlotDisplay(r, true, fieldName),
+                    fieldSlotDisplay(r, false, fieldName),
                     s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
                     s.line()));
         }
@@ -1677,8 +1889,8 @@ public final class Engine implements AutoCloseable {
                     recording.symbolText(s.classSym()),
                     field,
                     s.isStatic() || r.isStatic(),
-                    fieldSlotDisplay(r, true),
-                    fieldSlotDisplay(r, false),
+                    fieldSlotDisplay(r, true, field),
+                    fieldSlotDisplay(r, false, field),
                     s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
                     s.line()));
         }
@@ -1797,12 +2009,14 @@ public final class Engine implements AutoCloseable {
      * slot's runtime tag lives in the aux idx byte for reference-typed fields (else 0, meaning the
      * declared tag byte applies to both slots).
      */
-    private String fieldSlotDisplay(final Rec r, final boolean isBefore) {
+    private String fieldSlotDisplay(final Rec r, final boolean isBefore, final String fieldName) {
         int kind = isBefore ? r.beforeKind() : r.afterKind();
         if (kind == Format.KIND_INLINE) {
             int tag = isBefore ? (r.idx() != 0 ? r.idx() : r.tag()) : r.tag();
             long slot = isBefore ? r.before() : r.after();
-            return toValue(Format.KIND_INLINE, tag, slot, r.tid(), r.isTruncated()).display();
+            // §21.1: the field name is known here, so a time/date/instant-named field's
+            // in-range transition is dated in the §16.1/§20.9 windows too (hex regardless).
+            return toValueNamed(Format.KIND_INLINE, tag, slot, r.tid(), r.isTruncated(), fieldName).display();
         }
         return renderer.render(r, isBefore);
     }
@@ -1822,6 +2036,25 @@ public final class Engine implements AutoCloseable {
         };
     }
 
+    /**
+     * {@link #toValue} plus the §21.1 name-gated UTC date: for an INLINE integral whose {@code name}
+     * (case-insensitive) contains {@code time}/{@code date}/{@code instant} and whose value lands in an
+     * epoch range, the {@code   (…UTC)} suffix is appended after the §20.5 hex. Every other value is
+     * returned exactly as {@link #toValue} produced it, so this is the name-bearing render path
+     * (locals, snapshot fields, watches) while nameless contexts stay on plain {@link #toValue}.
+     */
+    private Value toValueNamed(
+            final int kind, final int tag, final long slot, final int tid, final boolean truncated, final String name) {
+        Value v = toValue(kind, tag, slot, tid, truncated);
+        if (kind == Format.KIND_INLINE && v instanceof Value.Primitive p) {
+            String dated = NumberFormatUtil.decorateNamed(p.rendered(), name, tag, slot);
+            if (!dated.equals(p.rendered())) {
+                return new Value.Primitive(dated);
+            }
+        }
+        return v;
+    }
+
     private Value blobValue(final long offset, final int tid, final boolean truncated) {
         try {
             return new Value.Str(recording.utf8At(tid, offset), truncated);
@@ -1835,20 +2068,44 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
+     * The §21.5 container-size suffix for an object id: {@code , size=<totalSize>} when the id's
+     * latest snapshot at/before the cursor is a container form (MAP/SET/LIST/ARRAY), else {@code ""}.
+     * {@code totalSize} is the container's true size at snapshot time (not the ≤64 captured-entry
+     * count). Reads only the snapshot header — no element values are built — so it is safe to call
+     * from {@link #makeRef} without recursing on a self-referential container. Uses the SAME
+     * {@link #latestSnapshotAsOf} selection as {@link #reconstruct}, so a ref labelled {@code size=N}
+     * always expands into that snapshot's contents.
+     */
+    private String containerSizeSuffix(final long id) {
+        ObjEvent snap = latestSnapshotAsOf(id, currentSeq());
+        if (snap == null) {
+            return "";
+        }
+        Recording.Snapshot parsed = snapshotAt(snap.tid(), rec(snap.tid(), snap.index()).after());
+        if (parsed == null || parsed.form() == Format.FORM_FIELDS) {
+            return "";
+        }
+        return ", size=" + parsed.totalSize();
+    }
+
+    /**
      * Builds the {@link Value.Ref} for an object id, applying the §20.1/§20.2 inline-wrapper
-     * decoration as-of the current cursor seq. An ordinary object renders as its
-     * {@code renderObjectId} text and stays expandable. An always-dump scalar wrapper
-     * ({@code AtomicInteger}/{@code AtomicLong}/{@code AtomicBoolean}/{@code StringBuilder}/
-     * {@code StringBuffer}) appends {@code   [ <value> ]} — its single {@code value} field's current
-     * snapshot, numeric-decorated like every other primitive — and is non-expandable (the value is
-     * shown). An {@code AtomicReference} appends {@code   [ null ]} (non-expandable) or
-     * {@code   [ <SimpleClass>#<rid> ]} and stays expandable so the referent can be explored.
+     * decoration and the §21.5 container-size label as-of the current cursor seq. An ordinary object
+     * renders as its {@code renderObjectId} text and stays expandable; a container (map/set/list/
+     * array) with a container-form snapshot at/before the cursor additionally gets
+     * {@code , size=<totalSize>} after the {@code SimpleClass#id} and stays expandable so it still
+     * unfolds. An always-dump scalar wrapper ({@code AtomicInteger}/{@code AtomicLong}/
+     * {@code AtomicBoolean}/{@code StringBuilder}/{@code StringBuffer}) appends {@code   [ <value> ]}
+     * — its single {@code value} field's current snapshot, numeric-decorated like every other
+     * primitive — and is non-expandable (the value is shown). An {@code AtomicReference} appends
+     * {@code   [ null ]} (non-expandable) or {@code   [ <SimpleClass>#<rid> ]} and stays expandable
+     * so the referent can be explored.
      */
     private Value.Ref makeRef(final long id) {
         String base = renderObjectId(id);
         WrapperKind wk = wrapperKindOf(id);
         if (wk == null) {
-            return new Value.Ref(id, base, true);
+            return new Value.Ref(id, base + containerSizeSuffix(id), true);
         }
         if (!wrapperResolving.add(id)) {
             // Re-entrant on the same id (pathological wrapper cycle): render plain to break it.

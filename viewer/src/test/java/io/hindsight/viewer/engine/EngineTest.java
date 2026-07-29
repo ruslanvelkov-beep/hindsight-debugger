@@ -986,7 +986,8 @@ final class EngineTest {
         try (Engine e = Engine.open(buildContainers(dir))) {
             List<ObjectNode> entries = e.children(e.objectTree(500L));
             ObjectNode second = entries.get(1);
-            assertEquals("\"k2\" -> HashMap#500", second.label());
+            // §21.5: the nested container-ref value carries its size (HashMap#500 has totalSize 3).
+            assertEquals("\"k2\" -> HashMap#500, size=3", second.label());
             assertTrue(second.isMapEntry());
 
             // Expanded as the TUI would, with the map itself on the ancestor path: the

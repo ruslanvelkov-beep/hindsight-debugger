@@ -19,10 +19,38 @@ public final class InFileSearch {
     /** {@link #nextFrom} sentinel: no occurrence exists in the requested direction (§19.4). */
     public static final int BOUNDARY = -1;
 
+    /** The 0-based offset of the direction arrow within {@link #searchPrefix} (after {@code "[ Search"}). */
+    public static final int ARROW_OFFSET = "[ Search".length();
+
     /** Search motion direction (§19.4): forward (down the file) or reverse (up). */
     public enum Dir {
         FORWARD,
         REVERSE
+    }
+
+    /**
+     * The §21.2 search-direction arrow drawn inside the field label: {@code '↓'} when the field
+     * searches FORWARD (down the file, the default) or {@code '↑'} when REVERSE (up). {@code Tab}
+     * flips the direction and hence this arrow; the field owns the direction (the old ↑/↓ and
+     * Alt/Shift/Ctrl-Enter motion keys are gone).
+     *
+     * @param reverse whether the field is in the reverse (up) direction
+     * @return the arrow glyph for the current direction
+     */
+    public static char directionArrow(final boolean reverse) {
+        return reverse ? '↑' : '↓';
+    }
+
+    /**
+     * The §21.2 in-file search field prefix — everything up to (and including) the space before
+     * the query input area: {@code "[ Search↓: "} forward, {@code "[ Search↑: "} reverse. The
+     * direction arrow sits at {@link #ARROW_OFFSET}.
+     *
+     * @param reverse whether the field is in the reverse (up) direction
+     * @return the field prefix ending in {@code ": "}
+     */
+    public static String searchPrefix(final boolean reverse) {
+        return "[ Search" + directionArrow(reverse) + ": ";
     }
 
     /**

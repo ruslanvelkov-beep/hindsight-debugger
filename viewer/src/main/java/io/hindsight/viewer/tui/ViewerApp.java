@@ -120,9 +120,13 @@ public final class ViewerApp {
         METHOD, OBJECT
     }
 
-    /** Which part of the {@code /} dialog receives keys (§15.2): the query line or the result list. */
+    /**
+     * Which part of a dialog receives keys (§15.2): the query line or the result list — plus
+     * {@code THREAD} for the §21.6 {@code thread:} field of the {@code /} browser (the other
+     * dialogs never enter it).
+     */
     private enum DialogFocus {
-        QUERY, LIST
+        QUERY, THREAD, LIST
     }
 
     /**
@@ -142,6 +146,9 @@ public final class ViewerApp {
     private static final class SearchDialog {
         final DialogKind kind;
         final StringBuilder query = new StringBuilder();
+        // §21.6: the `/` browser's second field — a thread id (digits) that filters results to that
+        // thread (blank = all threads). Edited in THREAD focus; persists across reopen like `query`.
+        final StringBuilder threadQuery = new StringBuilder();
         List<String> rows = List.of();
         List<long[]> targets = List.of();
         // §20.3: for the `.` (OBJECT) dialog, the object id each result row references (0 = none),
@@ -163,13 +170,16 @@ public final class ViewerApp {
     }
 
     /**
-     * Live state of the §17.7 open-file browser: the once-built {@link FileTree} (index +
-     * expansion memory + filter), the incrementally-edited query, the §15.2 QUERY/LIST focus,
-     * and the list selection/scroll. The one instance is persistent like the {@code /} dialog
-     * (§15.5): {@code ViewerApp.fileDialog} survives Esc, so reopening with {@code F} restores
-     * filter, selection, scroll and expansion exactly; {@code fileDialogOpen} is the only
-     * open/closed switch. {@code listViewH} is the visible row count captured at render so
-     * paging knows the page size.
+     * Live state of the §17.7/§21.3 open-file browser: the once-built {@link FileTree} (index +
+     * expansion memory + filter), the incrementally-edited query, the §15.2 QUERY/LIST focus, and
+     * the list selection/scroll. §21.3 gives it two modes driven by whether {@code query} is empty:
+     * BROWSE (the directory tree, {@link FileTree#rows()}) when empty, FLAT FILTER (the recursive
+     * flat matching-file list, {@link FileTree#flatRows()}) when not; {@code hcol} is the
+     * flat-list's horizontal scroll (revealing a clipped row's path prefix, §21.3). The one instance
+     * is persistent like the {@code /} dialog (§15.5): {@code ViewerApp.fileDialog} survives Esc, so
+     * reopening with {@code F} restores filter, selection, scroll and expansion exactly;
+     * {@code fileDialogOpen} is the only open/closed switch. {@code listViewH} is the visible row
+     * count captured at render so paging knows the page size.
      */
     private static final class FileDialog {
         final FileTree tree;
@@ -177,10 +187,16 @@ public final class ViewerApp {
         DialogFocus focus = DialogFocus.QUERY;
         int sel;
         int scroll;
+        int hcol; // §21.3: flat-filter row horizontal scroll (reveals the clipped path prefix)
         int listViewH = 1;
 
         FileDialog(final FileTree tree) {
             this.tree = tree;
+        }
+
+        /** §21.3: FLAT-filter mode when a filter is set, BROWSE (tree) mode when the query is empty. */
+        boolean flatMode() {
+            return query.length() > 0;
         }
     }
 
@@ -214,13 +230,18 @@ public final class ViewerApp {
     }
 
     /**
-     * Live state of the §16.4/§19.4 Source Code in-file search: the {@code active} flag (search
-     * mode on/off), the incrementally-edited {@code query}, the {@link InFileSearch#occurrences}
+     * Live state of the §16.4/§19.4/§21.2 Source Code in-file search: the {@code active} flag
+     * (search mode on/off), the incrementally-edited {@code query}, the {@link InFileSearch#occurrences}
      * table ({@code {line, col}} 1-based per matching line), the {@code current} index into it (or
      * {@code -1}) and the §19.4 pending-boundary direction {@code boundary} ({@code null} =
      * disarmed; non-{@code null} inverts the whole field colour and arms the two-press wrap — §20.7
-     * dropped the old red no-match state, so the field is always yellow otherwise). One instance
-     * lives for the app; {@code active} toggles it.
+     * dropped the old red no-match state, so the field is always yellow otherwise).
+     *
+     * <p>§21.2 gives the field an explicit direction: {@code reverse} ({@code false} = forward/↓,
+     * the default) that {@code Tab} flips and every {@code Enter} searches in (the old ↑/↓ and
+     * Alt/Shift/Ctrl-Enter motion keys are gone). {@code justFlipped} is set by {@code Tab} to draw
+     * the arrow INVERTED as a transient cue and cleared as soon as the user types or presses Enter.
+     * One instance lives for the app; {@code active} toggles it.
      */
     private static final class SourceSearch {
         boolean active;
@@ -228,6 +249,8 @@ public final class ViewerApp {
         List<int[]> occurrences = List.of();
         int current = -1;
         InFileSearch.Dir boundary;
+        boolean reverse; // §21.2: false = forward (↓, default), true = reverse (↑)
+        boolean justFlipped; // §21.2: transient arrow-invert cue, cleared on type/Enter
     }
 
     /**
@@ -641,40 +664,46 @@ public final class ViewerApp {
         return sourceSearch.active ? sourceSearch.query.toString() : null;
     }
 
-    /** §20.7 field prefix; {@code [ Search: } is followed by the input area then {@code ]}. */
-    private static final String SEARCH_PREFIX = "[ Search: ";
-
     /**
-     * The §20.7 in-file search field drawn over the Source title row: a FULL-WIDTH, symmetric box
-     * {@code [ Search: <query………> ]} whose {@code [} sits at {@code rect.col()+2} and {@code ]} at
-     * {@code rect.col()+width-3} (two columns inside each corner), so it covers the whole title row
-     * — including any browse-mode {@code — <file>} title. Foreground is ALWAYS yellow on black; the
-     * §19.4 pending-boundary flag still inverts the WHOLE field (fg/bg swap) to signal end-of-file.
-     * A query longer than the input area scrolls to show its TAIL ({@link InFileSearch#visibleInput}).
-     * The single border cell between {@code ]} and the corner is restored so no title leaks there.
-     * The terminal cursor stays visible at the input caret — one column after {@code Search: },
-     * advanced by the visible query length, clamped into the input area.
+     * The §20.7/§21.2 in-file search field drawn over the Source title row: a FULL-WIDTH, symmetric
+     * box {@code [ Search↓: <query………> ]} whose {@code [} sits at {@code rect.col()+2} and {@code ]}
+     * at {@code rect.col()+width-3} (two columns inside each corner), so it covers the whole title
+     * row — including any browse-mode {@code — <file>} title. Foreground is ALWAYS yellow on black;
+     * the §19.4 pending-boundary flag still inverts the WHOLE field (fg/bg swap) to signal
+     * end-of-file. §21.2: the label carries a direction arrow ({@code ↓} forward / {@code ↑}
+     * reverse, {@link InFileSearch#searchPrefix}); right after a {@code Tab} flip ({@code justFlipped})
+     * that ONE arrow cell is drawn inverted (black on the yellow field) as a transient cue. A query
+     * longer than the input area scrolls to show its TAIL ({@link InFileSearch#visibleInput}). The
+     * single border cell between {@code ]} and the corner is restored so no title leaks there. The
+     * terminal cursor stays visible at the input caret — one column after the prefix, clamped in.
      */
     private void renderSourceSearchField(
             final TextGraphics g, final Layout.Rect rect, final TextColor border, final boolean bold) {
         int startX = rect.col() + 2; // the '[' column
         int endBracket = rect.col() + rect.width() - 3; // the ']' column: 2 cols inside the corner
-        int prefixLen = SEARCH_PREFIX.length();
+        String prefix = InFileSearch.searchPrefix(sourceSearch.reverse);
+        int prefixLen = prefix.length();
         int inputW = endBracket - startX - prefixLen; // the input area fills the rest of the row
         if (inputW <= 0) {
             return; // too narrow to draw a sensible field
         }
         String visible = InFileSearch.visibleInput(sourceSearch.query.toString(), inputW);
-        StringBuilder box = new StringBuilder(SEARCH_PREFIX).append(visible);
+        StringBuilder box = new StringBuilder(prefix).append(visible);
         while (box.length() < prefixLen + inputW) {
             box.append(' ');
         }
         box.append(']'); // ends exactly at endBracket
-        // §20.7: always yellow-on-black; the §19.4 armed-boundary state inverts fg/bg.
+        // §20.7: always yellow-on-black; the §19.4 armed-boundary state inverts the whole field fg/bg.
         boolean invert = sourceSearch.boundary != null;
-        put(g, startX, rect.row(), box.toString(),
-                invert ? TextColor.ANSI.BLACK : TextColor.ANSI.YELLOW,
-                invert ? TextColor.ANSI.YELLOW : TextColor.ANSI.BLACK, false);
+        TextColor fieldFg = invert ? TextColor.ANSI.BLACK : TextColor.ANSI.YELLOW;
+        TextColor fieldBg = invert ? TextColor.ANSI.YELLOW : TextColor.ANSI.BLACK;
+        put(g, startX, rect.row(), box.toString(), fieldFg, fieldBg, false);
+        // §21.2: on a fresh Tab flip, repaint the ONE arrow cell inverted relative to the field as a
+        // transient cue (cleared as soon as the user types or presses Enter — see handleSourceSearch).
+        if (sourceSearch.justFlipped) {
+            put(g, startX + InFileSearch.ARROW_OFFSET, rect.row(),
+                    String.valueOf(InFileSearch.directionArrow(sourceSearch.reverse)), fieldBg, fieldFg, false);
+        }
         // Restore the ONE border cell between ']' (endBracket) and the corner (endBracket+2) so a
         // long browse title cannot leak through it — the field itself covers everything up to ']'.
         put(g, endBracket + 1, rect.row(), "─", border, Palette.BG, bold);
@@ -1041,8 +1070,8 @@ public final class ViewerApp {
         // §19.2/§19.3: the exit-frame/jump slot swaps with the context — the two are mutually
         // exclusive: e/E exit-frame when line-traced, j/J jump-to-line-trace in a green context.
         String exitOrJump = greenContext() ? "j/J jump to line-trace" : "e/E exit-frame";
-        // §20.11a: the status help drops ^R/^Q/V/^X (they live in the F1 help window) and ends with
-        // "F1 help".
+        // §20.11a/§21.10: the status help omits the run-to-line family (^R/^Q/^T/^W), V, ^X and the
+        // ^U/^N/^K/^L scroll keys — all live only in the F1 help window — and ends with "F1 help".
         String base = "F7 step  F8 over  ⇧F7/⇧F8 reverse  " + exitOrJump + "  o origin  "
                 + "/ calls  . obj  F file  ^D recording  c/s/t/l/r focus  q quit  F1 help";
         String ctx = switch (focus) {
@@ -1212,10 +1241,28 @@ public final class ViewerApp {
             case METHOD -> "regex: ";
             case OBJECT -> "query: ";
         };
-        put(g, ix, iy, clipPad(prompt + dialog.query, iw), Palette.FG, Palette.DIALOG_BG, false);
-        if (dialog.kind != DialogKind.METHOD || dialog.focus == DialogFocus.QUERY) {
-            // §15.2: the terminal cursor sits on the query line only in QUERY focus; it stays
-            // hidden (cursorPos == null) while the `/` dialog's LIST has the focus.
+        if (dialog.kind == DialogKind.METHOD) {
+            // §21.6: two fields share the query row — the regex (left) and a `thread:` filter
+            // (right, fixed width). Tab still toggles calls ↔ instances; → moves QUERY → THREAD and
+            // ← moves back (see handleSearchQueryKey/handleSearchThreadKey).
+            String threadPrompt = "thread: ";
+            int threadFieldW = Math.min(threadPrompt.length() + 9, Math.max(0, iw / 2));
+            int regexW = Math.max(1, iw - threadFieldW - 1); // one-column gap between the fields
+            int threadX = ix + iw - threadFieldW;
+            put(g, ix, iy, clipPad(prompt + dialog.query, regexW), Palette.FG, Palette.DIALOG_BG, false);
+            put(g, threadX, iy, clipPad(threadPrompt + dialog.threadQuery, threadFieldW),
+                    Palette.FG, Palette.DIALOG_BG, false);
+            if (dialog.focus == DialogFocus.QUERY) {
+                cursorPos = new TerminalPosition(
+                        Math.min(ix + regexW - 1, ix + prompt.length() + dialog.query.length()), iy);
+            } else if (dialog.focus == DialogFocus.THREAD) {
+                cursorPos = new TerminalPosition(
+                        Math.min(threadX + threadFieldW - 1,
+                                threadX + threadPrompt.length() + dialog.threadQuery.length()), iy);
+            }
+            // §15.2: the cursor stays hidden (cursorPos == null) while the LIST has the focus.
+        } else {
+            put(g, ix, iy, clipPad(prompt + dialog.query, iw), Palette.FG, Palette.DIALOG_BG, false);
             cursorPos = new TerminalPosition(Math.min(x + w - 2, ix + prompt.length() + dialog.query.length()), iy);
         }
 
@@ -1270,12 +1317,15 @@ public final class ViewerApp {
         }
     }
 
-    /** The `/` dialog's hint line, reflecting the active §15.2 focus and the mode. */
+    /** The `/` dialog's hint line, reflecting the active §15.2/§21.6 focus and the mode. */
     private String searchHint() {
         if (dialog.focus == DialogFocus.QUERY) {
             return dialog.instancesMode
-                    ? "type to filter  ↑↓ results  ⇥ calls  ^U clear  Esc close"
-                    : "type to filter  ↑↓ results  ⇥ instances  ^U clear  Esc close";
+                    ? "type filter  → thread  ↑↓ results  ⇥ calls  ^U clear  Esc"
+                    : "type filter  → thread  ↑↓ results  ⇥ instances  ^U clear  Esc";
+        }
+        if (dialog.focus == DialogFocus.THREAD) {
+            return "digits: filter by thread id  ← regex  ↓ results  ^U clear  Esc";
         }
         return dialog.instancesMode
                 ? "↑↓ move  →/↵ expand  ← collapse  f first-mention  / query  Esc close"
@@ -1432,8 +1482,10 @@ public final class ViewerApp {
     }
 
     private void drawHelpOverlay(final TextGraphics g, final int cols, final int rows) {
-        // §20.11b: the help window lists EVERY command, including the ones dropped from the status
-        // line (Ctrl-R/Ctrl-Q run-to-line, V var-changes, Ctrl-X quit) and the §20.12/§20.13 keys.
+        // §20.11b/§21.10: the help WINDOW lists EVERY command, including the ones kept off the
+        // trimmed status line — the run-to-line family (^R/^Q this thread, ^T/^W any thread), V,
+        // Ctrl-X quit and the ^U/^N/^K/^L scroll keys. The immediate Ctrl-C quit is gone (§21.8) and
+        // viewport scroll-up is now Ctrl-U (§21.9), so neither old key appears below.
         String[] lines = {
             "Hindsight Viewer — keys",
             "",
@@ -1442,25 +1494,26 @@ public final class ViewerApp {
             "                      (Apple Terminal sends ⇧F7/⇧F8 as F15/F16)",
             "e / E                 exit current frame: forward / backward",
             "j / J                 jump line-trace next/prev (green context)",
-            "Ctrl+R / Ctrl+Q       run to current line: forward / backward",
+            "Ctrl+R / Ctrl+Q       run to selected line fwd/back (this thread)",
+            "Ctrl+T / Ctrl+W       run to selected line fwd/back (any thread)",
             "o                     origin — return Source to the exec line",
             "Ctrl+D                show the recording directory's full path",
             "c t s l r             focus Source/Threads/Stack/Locals/Records",
             "c (in Records)        jump to a record by seq  (Tab → Source)",
             "Tab / Shift+Tab       cycle focus forward / backward",
             "Arrows PgUp PgDn      navigate the focused window",
-            "Ctrl+P / Ctrl+N       scroll focused window up / down one line",
+            "Ctrl+U / Ctrl+N       scroll focused window up / down one line",
             "Ctrl+K / Ctrl+L       hscroll left / right (= < / > and ←/→)",
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End     page / jump to ends;  g / G  top/bottom",
             "v                     variable history for the cursor line",
             "V                     global variable-change list (field filter)",
-            "Alt-F                 Source in-file search (↵ next  ⌥↵/↑↓ prev)",
+            "Alt-F                 Source in-file search (Tab flips ↓/↑; ↵ search)",
             "/  .  F               browse calls / find object / open file",
-            "Tab in /              toggle calls ↔ instances;  f first mention",
+            "Tab in /              calls ↔ instances;  → thread;  f first-mention",
             "green                 enter/exit-only (no line records)",
             "?  F1                 toggle this help window",
-            "q  Ctrl+X  Ctrl+C     quit (q / Ctrl+X confirm; Ctrl+C now)",
+            "q  Ctrl+X             quit (open the confirm box)",
             "",
             "press ? / F1 / Esc to close",
         };
@@ -1507,7 +1560,10 @@ public final class ViewerApp {
      * bottom border row — so a terminal selection of a long path grabs clean text.
      */
     private void drawRecordingPopup(final TextGraphics g, final int cols, final int rows) {
-        List<String> lines = RecordingName.wrap(recordingPath, cols);
+        List<String> lines = new ArrayList<>(RecordingName.wrap(recordingPath, cols));
+        // §21.4: the source commit the recording was made against (empty when the target had no .git).
+        String commit = recording.manifest().getProperty("sourceCommit", "");
+        lines.add(commit.isEmpty() ? "(working tree — no .git commit recorded)" : "commit " + commit);
         int h = Math.min(rows, lines.size() + 2);
         int y = Math.max(0, (rows - h) / 2);
         put(g, 0, y, "┌" + "─".repeat(Math.max(0, cols - 2)) + "┐", Palette.FOCUS, Palette.DIALOG_BG, true);
@@ -1520,13 +1576,9 @@ public final class ViewerApp {
 
     /**
      * One key while the §17.6 {@code Recording} popup is open — it consumes every key: only Esc
-     * closes it (Ctrl-C stays the emergency quit).
+     * closes it (§21.8: Ctrl-C no longer quits anywhere).
      */
     private void handleRecordingPopup(final KeyStroke k) {
-        if (isCtrlC(k)) {
-            running = false;
-            return;
-        }
         if (k.getKeyType() == KeyType.Escape) {
             recordingPopup = false;
         }
@@ -1562,8 +1614,9 @@ public final class ViewerApp {
         try {
             TerminalSize sz = screen.getTerminalSize();
             if (sz.getColumns() < MIN_COLS || sz.getRows() < MIN_ROWS) {
-                // No room for the confirm box (§12.4) — quit immediately (Ctrl-X is a q synonym, §20.11c).
-                if (isCtrlC(k) || (isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
+                // No room for the confirm box (§12.4) — q / Ctrl-X quit immediately (§20.11c;
+                // §21.8 removed the Ctrl-C fallback).
+                if ((isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
                     running = false;
                 }
                 return;
@@ -1576,8 +1629,6 @@ public final class ViewerApp {
                 KeyType t = k.getKeyType();
                 if (t == KeyType.F1 || t == KeyType.Escape || isChar(k, '?')) {
                     helpOverlay = false;
-                } else if (isCtrlC(k)) {
-                    running = false;
                 } else if ((isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
                     helpOverlay = false;
                     quitConfirm = true; // §20.11c Ctrl-X is a q synonym
@@ -1585,7 +1636,7 @@ public final class ViewerApp {
                 return;
             }
             if (recordingPopup) {
-                // §17.6: the popup consumes all keys; Esc closes (Ctrl-C still quits).
+                // §17.6: the popup consumes all keys; Esc closes (§21.8: Ctrl-C no longer quits).
                 handleRecordingPopup(k);
                 return;
             }
@@ -1602,12 +1653,12 @@ public final class ViewerApp {
                 return;
             }
             if (varChanges != null) {
-                // §20.9: the global variable-change window consumes all keys (Ctrl-C still quits).
+                // §20.9: the global variable-change window consumes all keys.
                 handleVarChanges(k);
                 return;
             }
             if (recordJump != null) {
-                // §16.3: the modal consumes all keys (Ctrl-C still the emergency quit).
+                // §16.3: the modal consumes all keys.
                 handleRecordJump(k);
                 return;
             }
@@ -1616,12 +1667,8 @@ public final class ViewerApp {
                 handleSourceSearch(k);
                 return;
             }
-            if (isCtrlC(k)) {
-                running = false;
-                return;
-            }
-            // §12.4 quit-confirm; §20.11c Ctrl-X is a synonym for q. Ctrl-Q is NOT quit (it is the
-            // §20.10 reverse run-to-line), so the plain-q check must exclude a Ctrl modifier.
+            // §12.4/§21.8 quit: only q / Ctrl-X open the confirm box (Ctrl-C no longer quits). Ctrl-Q
+            // is NOT quit (it is the §21.7 backward run-to-line), so plain-q must exclude a Ctrl mod.
             if ((isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
                 quitConfirm = true;
                 return;
@@ -1684,23 +1731,34 @@ public final class ViewerApp {
                 // fall through to character handling
             }
         }
-        // §20.10 run-to-line: Ctrl-R forward, Ctrl-Q backward (both thread-preserving). The old
-        // Alt-R / Ctrl-Shift-R reverse binding is removed. On a non-move doStep shows the engine's
-        // message ("no earlier/later pass through this line" / "no line records in this thread").
-        // (Ctrl-Q is XOFF/flow-control on some terminals; lanterna's raw mode disables IXON so it
-        // arrives as a Ctrl-'q' character here.)
+        // §21.7 run-to-line to the SELECTED source line (srcCursor) in the shown frame's file:
+        // Ctrl-R forward / Ctrl-Q backward in the CURRENT thread; Ctrl-T forward / Ctrl-W backward
+        // in ANY thread (by global seq). Supersedes §20.10's runToCurrentLine binding. (Ctrl-Q is
+        // XOFF/flow-control on some terminals; lanterna's raw mode disables IXON so it arrives as a
+        // Ctrl-'q' character here.) Routed through doStep so a move appends one history entry and a
+        // non-move shows the engine's message; browse mode / no frame is reported by the helper.
         if (isChar(k, 'r') && k.isCtrlDown()) {
-            doStepFromSelected(() -> engine.runToCurrentLine(true));
+            runToSelectedLine(true, true);
             return true;
         }
         if (isChar(k, 'q') && k.isCtrlDown()) {
-            doStepFromSelected(() -> engine.runToCurrentLine(false));
+            runToSelectedLine(false, true);
             return true;
         }
-        // §20.13 per-window scroll keys (global; act on the focused window): Ctrl-P/Ctrl-N scroll the
-        // viewport up/down one line (selection unmoved where the window has its own selection; Source
-        // moves srcTop), Ctrl-K/Ctrl-L horizontal-scroll one HSTEP (synonyms for ←/→ and </>).
-        if (isChar(k, 'p') && k.isCtrlDown()) {
+        if (isChar(k, 't') && k.isCtrlDown()) {
+            runToSelectedLine(true, false);
+            return true;
+        }
+        if (isChar(k, 'w') && k.isCtrlDown()) {
+            runToSelectedLine(false, false);
+            return true;
+        }
+        // §20.13/§21.9 per-window scroll keys (global; act on the focused window): Ctrl-U scrolls the
+        // viewport up, Ctrl-N down one line (selection unmoved where the window has its own selection;
+        // Source moves srcTop), Ctrl-K/Ctrl-L horizontal-scroll one HSTEP (synonyms for ←/→ and </>).
+        // §21.9 moved scroll-up from Ctrl-P to Ctrl-U; the input modes (dialogs, the Alt-F field)
+        // consume Ctrl-U as clear-query BEFORE this, since handleKey dispatches them first.
+        if (isChar(k, 'u') && k.isCtrlDown()) {
             scrollFocused(-1);
             return true;
         }
@@ -2106,6 +2164,8 @@ public final class ViewerApp {
         }
         if (dialog.focus == DialogFocus.QUERY) {
             handleSearchQueryKey(k);
+        } else if (dialog.focus == DialogFocus.THREAD) {
+            handleSearchThreadKey(k);
         } else {
             handleSearchListKey(k);
         }
@@ -2118,7 +2178,8 @@ public final class ViewerApp {
      * encodings Ctrl-Backspace reaches lanterna as a plain {@code KeyType.Backspace}
      * (indistinguishable from an unmodified one; only kitty-/win32-style terminals report
      * the Ctrl modifier on Backspace). ↑/↓ hand the focus to the result list, performing
-     * the first move — only when there are results to move over.
+     * the first move — only when there are results to move over; § 21.6: → moves to the
+     * {@code thread:} field.
      */
     private void handleSearchQueryKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -2139,6 +2200,10 @@ public final class ViewerApp {
             }
             return;
         }
+        if (t == KeyType.ArrowRight) {
+            dialog.focus = DialogFocus.THREAD; // §21.6: move to the thread: field on the right
+            return;
+        }
         if (t == KeyType.ArrowUp || t == KeyType.ArrowDown) {
             if (!dialog.rows.isEmpty()) {
                 // §15.2: the first arrow only ENTERS the list — the already-highlighted
@@ -2156,6 +2221,60 @@ public final class ViewerApp {
                 recomputeDialog();
             }
         }
+    }
+
+    /**
+     * §21.6 THREAD-focus keys of the {@code /} browser's {@code thread:} field: DIGITS edit the
+     * thread id (capped at 9 digits so it always parses as an {@code int}), Backspace deletes,
+     * Ctrl-U/Ctrl-W/Ctrl-Backspace clear it, {@code ←} returns to the regex field, {@code ↓} enters
+     * the result list; every edit recomputes with the new thread filter (blank = all threads).
+     */
+    private void handleSearchThreadKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        boolean ctrl = k.isCtrlDown();
+        if ((t == KeyType.Backspace && ctrl) || (ctrl && (isChar(k, 'u') || isChar(k, 'w')))) {
+            if (dialog.threadQuery.length() > 0) {
+                dialog.threadQuery.setLength(0);
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            }
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (dialog.threadQuery.length() > 0) {
+                dialog.threadQuery.deleteCharAt(dialog.threadQuery.length() - 1);
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            }
+            return;
+        }
+        if (t == KeyType.ArrowLeft) {
+            dialog.focus = DialogFocus.QUERY;
+            return;
+        }
+        if (t == KeyType.ArrowDown) {
+            if (!dialog.rows.isEmpty()) {
+                dialog.focus = DialogFocus.LIST;
+            }
+            return;
+        }
+        if (t == KeyType.Character && !ctrl && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= '0' && ch <= '9' && dialog.threadQuery.length() < 9) {
+                dialog.threadQuery.append(ch.charValue());
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            }
+        }
+    }
+
+    /** §21.6: the {@code /} dialog's thread filter — the parsed {@code thread:} id, or empty for all. */
+    private OptionalInt threadFilter() {
+        String s = dialog.threadQuery.toString();
+        return s.isEmpty() ? OptionalInt.empty() : OptionalInt.of(Integer.parseInt(s));
     }
 
     /**
@@ -2303,8 +2422,10 @@ public final class ViewerApp {
                 } else {
                     recomputeMethodResults();
                 }
-                // §15.2: an empty result list cannot hold LIST focus — editing resumes.
-                if (dialog.rows.isEmpty()) {
+                // §15.2: an empty result list cannot hold LIST focus — editing resumes. THREAD
+                // focus (§21.6) is left alone so a thread filter that matches nothing keeps the
+                // caret in the thread field instead of bouncing back to the regex.
+                if (dialog.rows.isEmpty() && dialog.focus == DialogFocus.LIST) {
                     dialog.focus = DialogFocus.QUERY;
                 }
             }
@@ -2321,8 +2442,15 @@ public final class ViewerApp {
             return;
         }
         try {
+            // §21.6: uncapped (Integer.MAX_VALUE — no 500 trim, no "showing first 500 of N" note)
+            // and filtered to the thread: field's id when set (blank = all threads).
+            OptionalInt tid = threadFilter();
             MethodBrowse.Result res = MethodBrowse.filter(
-                    engine.methodSites(), sid -> engine.callsOf(sid, MethodBrowse.CAP), q, MethodBrowse.CAP);
+                    engine.methodSites(),
+                    sid -> engine.callsOf(sid, Integer.MAX_VALUE),
+                    q,
+                    Integer.MAX_VALUE,
+                    tid);
             List<String> rows = new ArrayList<>(res.rows().size());
             List<long[]> targets = new ArrayList<>(res.rows().size());
             for (MethodBrowse.Row r : res.rows()) {
@@ -2360,12 +2488,16 @@ public final class ViewerApp {
             return;
         }
         try {
-            // §14.1: an id query must see EVERY instance of a matching class, not the first CAP —
-            // the one demanded id may be arbitrarily late in the class's instance list.
-            int perClassCap =
-                    InstanceBrowse.parseQuery(q).objectId() != null ? Integer.MAX_VALUE : InstanceBrowse.CAP;
+            // §21.6: uncapped (Integer.MAX_VALUE — no 500 trim, no "showing first 500 of N" note; a
+            // §14.1 id query already needed the full per-class list) and filtered to the thread:
+            // field's id when set (blank = all threads).
+            OptionalInt tid = threadFilter();
             InstanceBrowse.Result res = InstanceBrowse.filter(
-                    engine.classSites(), cls -> engine.instancesOf(cls, perClassCap), q, InstanceBrowse.CAP);
+                    engine.classSites(),
+                    cls -> engine.instancesOf(cls, Integer.MAX_VALUE),
+                    q,
+                    Integer.MAX_VALUE,
+                    tid);
             List<String> rows = new ArrayList<>(res.rows().size());
             List<ObjectNode> roots = new ArrayList<>(res.rows().size());
             for (InstanceBrowse.Row r : res.rows()) {
@@ -2614,10 +2746,6 @@ public final class ViewerApp {
             varHist = null;
             return;
         }
-        if (isCtrlC(k)) {
-            running = false;
-            return;
-        }
         int last = Math.max(0, varHist.rows.size() - 1);
         int page = Math.max(1, varHist.listViewH - 1);
         if (t == KeyType.Tab) {
@@ -2728,16 +2856,12 @@ public final class ViewerApp {
     }
 
     /**
-     * One key while the §20.9 variable-change window is open (Ctrl-C still quits): Esc closes, Enter
-     * jumps to the selected write's record from either focus, and everything else goes to the
-     * §15.2-style QUERY (filter line) or LIST (result list) handler depending on {@code focus}.
+     * One key while the §20.9 variable-change window is open: Esc closes, Enter jumps to the
+     * selected write's record from either focus, and everything else goes to the §15.2-style QUERY
+     * (filter line) or LIST (result list) handler depending on {@code focus}.
      */
     private void handleVarChanges(final KeyStroke k) {
         KeyType t = k.getKeyType();
-        if (isCtrlC(k)) {
-            running = false;
-            return;
-        }
         if (t == KeyType.Escape) {
             varChanges = null;
             return;
@@ -2868,13 +2992,9 @@ public final class ViewerApp {
 
     // ---- record jump (§16.3) ----
 
-    /** One key while the §16.3 record-jump modal is open — it consumes all keys (Ctrl-C still quits). */
+    /** One key while the §16.3 record-jump modal is open — it consumes all keys; Esc closes. */
     private void handleRecordJump(final KeyStroke k) {
         KeyType t = k.getKeyType();
-        if (isCtrlC(k)) {
-            running = false;
-            return;
-        }
         if (t == KeyType.Escape) {
             recordJump = null;
             return;
@@ -2925,6 +3045,8 @@ public final class ViewerApp {
     private void enterSourceSearch() {
         sourceSearch.active = true;
         sourceSearch.query.setLength(0);
+        sourceSearch.reverse = false; // §21.2: forward (↓) by default
+        sourceSearch.justFlipped = false;
         recomputeSourceSearch();
     }
 
@@ -2979,20 +3101,36 @@ public final class ViewerApp {
     }
 
     /**
-     * One key while §16.4/§19.4 in-file search is active — consumes all keys (Ctrl-C still quits):
-     * Esc exits (restoring the title; cursor stays on the last occurrence), Backspace edits, Enter
-     * = forward from the current line, Shift-Enter/Ctrl-Enter = reverse, ↓ = forward / ↑ = reverse
-     * (universal fallback), printables extend the query. §19.4 motion is non-cyclic with a
-     * two-press boundary-invert-then-wrap ({@link #moveSearch}); a query edit clears that state.
+     * One key while §16.4/§19.4/§21.2 in-file search is active — consumes all keys (§21.8: Ctrl-C
+     * no longer quits): {@code Tab} flips the search direction (arrow ↓⇄↑, drawn inverted until the
+     * next key — {@code justFlipped}); {@code Enter} searches in the arrow's current direction;
+     * {@code Esc} exits (restoring the title; cursor stays on the last occurrence); {@code Ctrl-U}
+     * clears the query (§21.9 — input modes consume Ctrl-U before the global scroll); Backspace
+     * edits; printables extend the query. §19.4 motion is non-cyclic with a two-press
+     * boundary-invert-then-wrap ({@link #moveSearch}); a query edit clears that state. The old ↑/↓
+     * and Alt/Shift/Ctrl-Enter motion keys are removed (§21.2 — the arrow owns the direction).
      */
     private void handleSourceSearch(final KeyStroke k) {
         KeyType t = k.getKeyType();
-        if (isCtrlC(k)) {
-            running = false;
+        if (t == KeyType.Tab) {
+            // §21.2: flip the direction; a direction change also clears the §19.4 pending boundary.
+            sourceSearch.reverse = !sourceSearch.reverse;
+            sourceSearch.justFlipped = true;
+            sourceSearch.boundary = null;
             return;
         }
+        // §21.2: any key other than Tab returns the arrow to its normal (non-inverted) rendering.
+        sourceSearch.justFlipped = false;
         if (t == KeyType.Escape) {
             sourceSearch.active = false;
+            return;
+        }
+        if (k.isCtrlDown() && (isChar(k, 'u') || isChar(k, 'w'))) {
+            // §21.2/§21.9: Ctrl-U clears the query (Ctrl-W kept as the portable synonym).
+            if (sourceSearch.query.length() > 0) {
+                sourceSearch.query.setLength(0);
+                recomputeSourceSearch();
+            }
             return;
         }
         if (t == KeyType.Backspace) {
@@ -3003,20 +3141,8 @@ public final class ViewerApp {
             return;
         }
         if (t == KeyType.Enter) {
-            // §19.4: Enter = forward; Alt-Enter / Shift-Enter / Ctrl-Enter = reverse. Alt-Enter
-            // arrives as Enter+isAltDown (the terminal sends ESC+CR, which lanterna pairs like
-            // Alt-F/Alt-R) and is the reliable reverse key on terminals where Shift/Ctrl-Enter
-            // are indistinguishable from Enter (Apple Terminal).
-            boolean reverse = k.isAltDown() || k.isShiftDown() || k.isCtrlDown();
-            moveSearch(reverse ? InFileSearch.Dir.REVERSE : InFileSearch.Dir.FORWARD);
-            return;
-        }
-        if (t == KeyType.ArrowDown) {
-            moveSearch(InFileSearch.Dir.FORWARD); // §19.4 universal forward fallback
-            return;
-        }
-        if (t == KeyType.ArrowUp) {
-            moveSearch(InFileSearch.Dir.REVERSE); // §19.4 universal reverse fallback
+            // §21.2: Enter searches in the field's current arrow direction (Tab flips it).
+            moveSearch(sourceSearch.reverse ? InFileSearch.Dir.REVERSE : InFileSearch.Dir.FORWARD);
             return;
         }
         if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {
@@ -3046,14 +3172,10 @@ public final class ViewerApp {
     }
 
     /**
-     * One key while the {@code F} browser is open — it consumes all keys (Ctrl-C still the
-     * emergency quit); Esc closes from either §15.2 focus, keeping the state for reopen.
+     * One key while the §21.3 {@code F} browser is open — it consumes all keys (§21.8: Ctrl-C no
+     * longer quits); Esc closes from either §15.2 focus, keeping the state for reopen (§15.5).
      */
     private void handleFileDialog(final KeyStroke k) {
-        if (isCtrlC(k)) {
-            running = false;
-            return;
-        }
         if (k.getKeyType() == KeyType.Escape) {
             fileDialogOpen = false; // §17.7: state persists across close/reopen
             return;
@@ -3065,10 +3187,18 @@ public final class ViewerApp {
         }
     }
 
+    /** The current mode's row count (§21.3): flat matching files when filtering, else tree rows. */
+    private int fileRowCount() {
+        return fileDialog.flatMode()
+                ? fileDialog.tree.flatRows().size()
+                : fileDialog.tree.rows().size();
+    }
+
     /**
-     * QUERY-focus keys of the {@code F} browser — the §15.2 model exactly: printables edit the
-     * regex filter (recomputed per keystroke), Backspace deletes, Ctrl-Backspace/Ctrl-U/Ctrl-W
-     * clear, and ↑/↓ hand the focus to the tree list (when it has rows).
+     * QUERY-focus keys of the {@code F} browser (§15.2/§21.3): printables edit the filter
+     * (recomputed per keystroke — a non-empty filter switches BROWSE → FLAT), Backspace deletes,
+     * Ctrl-Backspace/Ctrl-U/Ctrl-W clear (FLAT → BROWSE), and ↓ hands the focus to the result list
+     * (when it has rows). ↑ stays in the query (nothing sits above it).
      */
     private void handleFileQueryKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -3087,9 +3217,9 @@ public final class ViewerApp {
             }
             return;
         }
-        if (t == KeyType.ArrowUp || t == KeyType.ArrowDown) {
-            if (!fileDialog.tree.rows().isEmpty()) {
-                // §15.2: the first arrow only ENTERS the list; the selection stays put.
+        if (t == KeyType.ArrowDown) {
+            if (fileRowCount() > 0) {
+                // §15.2/§21.3: ↓ enters the list at the top row; the selection stays put.
                 fileDialog.focus = DialogFocus.LIST;
             }
             return;
@@ -3104,34 +3234,44 @@ public final class ViewerApp {
     }
 
     /**
-     * Applies the edited {@code file:} regex to the tree (per keystroke, §17.7) and resets
-     * selection/scroll (§13.1). Expansion state is deliberately untouched — it is remembered
-     * across filter changes.
+     * Applies the edited filter to the tree (per keystroke) and resets selection/scroll/hscroll
+     * (§13.1/§21.3). Expansion state is deliberately untouched — it is remembered across filter
+     * changes and used again when the filter is cleared back to BROWSE mode.
      */
     private void applyFileFilter() {
         fileDialog.tree.setFilter(fileDialog.query.toString());
         fileDialog.sel = 0;
         fileDialog.scroll = 0;
+        fileDialog.hcol = 0;
     }
 
     /**
-     * LIST-focus keys of the {@code F} browser (§15.2/§17.7): ↑/↓ move, Ctrl-F/Ctrl-B and
-     * PgDn/PgUp page, {@code g}/{@code G} jump to the ends, →/↵ expand a directory (↵ on a
-     * FILE opens it in browse mode and closes the dialog), ← collapses (or moves to the
-     * parent row), {@code /} returns to the query line; other printables are ignored.
+     * LIST-focus keys of the {@code F} browser (§15.2/§21.3): ↑/↓ move (↑ at the TOP row returns
+     * focus to the filter field, clearing the highlight), Ctrl-F/Ctrl-B and PgDn/PgUp page,
+     * {@code g}/{@code G} jump to the ends, {@code /} returns to the filter line. In BROWSE mode
+     * →/↵ expand a directory (↵ on a FILE opens it), ← collapses (or moves to the parent). In FLAT
+     * mode expand/collapse is hidden: ↵ opens the selected file and ←/→ (and {@code <}/{@code >})
+     * horizontally scroll the selected row to reveal its clipped path prefix.
      */
     private void handleFileListKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
         boolean ctrl = k.isCtrlDown();
-        List<FileTree.Row> rows = fileDialog.tree.rows();
-        int last = Math.max(0, rows.size() - 1);
+        boolean flat = fileDialog.flatMode();
+        int count = fileRowCount();
+        int last = Math.max(0, count - 1);
         int page = Math.max(1, fileDialog.listViewH - 1);
         if (!ctrl && isChar(k, '/')) {
             fileDialog.focus = DialogFocus.QUERY;
             return;
         }
         if (t == KeyType.ArrowUp) {
-            fileDialog.sel = Math.max(0, fileDialog.sel - 1);
+            if (fileDialog.sel <= 0) {
+                // §21.3: ↑ at the top returns focus to the filter field (clears the list highlight).
+                fileDialog.sel = 0;
+                fileDialog.focus = DialogFocus.QUERY;
+            } else {
+                fileDialog.sel--;
+            }
             return;
         }
         if (t == KeyType.ArrowDown) {
@@ -3154,17 +3294,29 @@ public final class ViewerApp {
             fileDialog.sel = last;
             return;
         }
-        if (rows.isEmpty()) {
+        if (count == 0) {
             return;
         }
-        FileTree.Row row = rows.get(clamp(fileDialog.sel, 0, last));
+        int sel = clamp(fileDialog.sel, 0, last);
+        if (flat) {
+            if (t == KeyType.Enter) {
+                openBrowseFile(fileDialog.tree.flatRows().get(sel).path());
+            } else if (t == KeyType.ArrowLeft || isChar(k, '<')) {
+                fileDialog.hcol = Math.max(0, fileDialog.hcol - HSTEP);
+            } else if (t == KeyType.ArrowRight || isChar(k, '>')) {
+                fileDialog.hcol += HSTEP;
+            }
+            return;
+        }
+        List<FileTree.Row> rows = fileDialog.tree.rows();
+        FileTree.Row row = rows.get(sel);
         if (t == KeyType.ArrowRight) {
             expandOrDescendFileRow(row, rows);
         } else if (t == KeyType.Enter) {
             if (row.directory()) {
                 expandOrDescendFileRow(row, rows);
             } else {
-                openFileRow(row);
+                openBrowseFile(row.path());
             }
         } else if (t == KeyType.ArrowLeft) {
             collapseOrParentFileRow(row, rows);
@@ -3197,25 +3349,38 @@ public final class ViewerApp {
         }
     }
 
-    /** ↵ on a file row: open it in browse mode (§11.8 path) and close the dialog (§17.7). */
-    private void openFileRow(final FileTree.Row row) {
-        Optional<List<String>> lines = sourcePath.linesOfFile(row.path());
+    /** ↵ on a file row (BROWSE or FLAT): open it in browse mode (§11.8 path) and close the dialog. */
+    private void openBrowseFile(final Path path) {
+        Optional<List<String>> lines = sourcePath.linesOfFile(path);
         if (lines.isEmpty()) {
-            status = "cannot read: " + row.path();
+            status = "cannot read: " + path;
             return;
         }
         fileDialogOpen = false;
-        enterBrowse(row.path(), lines.get(), -1);
+        enterBrowse(path, lines.get(), -1);
+    }
+
+    /** The §21.3 info-line path: the selected row's absolute path (folder in BROWSE, file in FLAT). */
+    private String selectedFilePath() {
+        if (fileDialog.flatMode()) {
+            List<FileTree.FlatRow> rows = fileDialog.tree.flatRows();
+            return rows.isEmpty() ? "" : rows.get(clamp(fileDialog.sel, 0, rows.size() - 1)).path().toString();
+        }
+        List<FileTree.Row> rows = fileDialog.tree.rows();
+        return rows.isEmpty() ? "" : rows.get(clamp(fileDialog.sel, 0, rows.size() - 1)).path().toString();
     }
 
     /**
-     * Draws the §17.7 {@code Open file [F]} browser: the {@code file:} regex line (terminal
-     * cursor on it in QUERY focus), an {@code invalid regex} note when the filter does not
-     * compile, the flattened directory tree (▸/▾ directories, {@code .java} leaves, §13.1
-     * edge-only scrolling) and a focus-sensitive hint row.
+     * Draws the §21.3 {@code Open file [F]} browser (window width 2/3 of the terminal): the
+     * {@code file:} filter line (terminal cursor on it in QUERY focus), an info line showing the
+     * selected row's full path (or {@code invalid regex}), then either the BROWSE directory tree
+     * (▸/▾ directories, {@code .java} leaves) when the filter is empty or the FLAT matching-file
+     * list (each row the horizontally-scrollable path suffix, {@link FileTree#suffixView}) when it
+     * is not, with §13.1 edge-only scrolling and a mode/focus-sensitive hint. The list highlight is
+     * drawn only in LIST focus (QUERY focus clears it).
      */
     private void drawFileDialog(final TextGraphics g, final int cols, final int rows) {
-        int w = clamp(cols - 6, 24, 74);
+        int w = clamp(cols * 2 / 3, 30, cols - 2); // §21.3: 2/3 of the terminal width
         int h = clamp(rows - 6, 8, 20);
         int x = Math.max(0, (cols - w) / 2);
         int y = Math.max(0, (rows - h) / 2);
@@ -3228,47 +3393,63 @@ public final class ViewerApp {
         int ix = x + 1;
         int iy = y + 1;
         int iw = w - 2;
+        boolean flat = fileDialog.flatMode();
         String prompt = "file: ";
         put(g, ix, iy, clipPad(prompt + fileDialog.query, iw), Palette.FG, Palette.DIALOG_BG, false);
         if (fileDialog.focus == DialogFocus.QUERY) {
             cursorPos = new TerminalPosition(
                     Math.min(x + w - 2, ix + prompt.length() + fileDialog.query.length()), iy);
         }
-        if (!fileDialog.tree.filterValid()) {
-            put(g, ix, iy + 1, clip("invalid regex", iw), Palette.DIM, Palette.DIALOG_BG, false);
-        }
+        // §21.3 info line: the selected row's full path (current folder path in BROWSE, selected
+        // file's full path in FLAT), or the invalid-regex note.
+        String info = fileDialog.tree.filterValid() ? selectedFilePath() : "invalid regex";
+        put(g, ix, iy + 1, clip(info, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
         int hintRow = y + h - 2;
-        String hint = fileDialog.focus == DialogFocus.QUERY
-                ? "type to filter file names (regex)  ↑↓ tree  ^U clear  Esc close"
-                : "↑↓ move  →/↵ expand  ↵ open file  ← collapse  ^F/^B pg  g/G  / query  Esc";
+        String hint;
+        if (fileDialog.focus == DialogFocus.QUERY) {
+            hint = "type to filter (regex)  ↓ list  ^U clear  Esc close";
+        } else if (flat) {
+            hint = "↑↓ move  ↵ open  ←→/<> scroll path  ^F/^B pg  g/G  / filter  Esc";
+        } else {
+            hint = "↑↓ move  →/↵ open/expand  ← collapse  ^F/^B pg  g/G  / filter  Esc";
+        }
         put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
         int listTop = iy + 2;
         int listH = hintRow - listTop;
         fileDialog.listViewH = Math.max(1, listH);
-        List<FileTree.Row> rows2 = fileDialog.tree.rows();
-        if (rows2.isEmpty()) {
-            String empty = !fileDialog.tree.filterValid() || fileDialog.query.length() > 0
-                    ? "(no matches)"
+        int count = fileRowCount();
+        if (count == 0) {
+            String empty = !fileDialog.tree.filterValid() ? "(invalid regex)"
+                    : flat ? "(no matching files)"
                     : "(no .java files under the source roots)";
             put(g, ix, listTop, clip(empty, iw), Palette.DIM, Palette.DIALOG_BG, false);
             return;
         }
-        fileDialog.sel = clamp(fileDialog.sel, 0, rows2.size() - 1);
-        fileDialog.scroll = ScrollMath.adjustScroll(fileDialog.scroll, fileDialog.sel, listH, rows2.size());
+        fileDialog.sel = clamp(fileDialog.sel, 0, count - 1);
+        fileDialog.scroll = ScrollMath.adjustScroll(fileDialog.scroll, fileDialog.sel, listH, count);
+        boolean listFocus = fileDialog.focus == DialogFocus.LIST;
+        List<FileTree.Row> browseRows = flat ? List.of() : fileDialog.tree.rows();
+        List<FileTree.FlatRow> flatRows = flat ? fileDialog.tree.flatRows() : List.of();
         for (int r = 0; r < listH; r++) {
             int idx = fileDialog.scroll + r;
-            if (idx >= rows2.size()) {
+            if (idx >= count) {
                 break;
             }
-            FileTree.Row row = rows2.get(idx);
-            String glyph = row.directory() ? (row.expanded() ? "▾ " : "▸ ") : "  ";
-            String text = "  ".repeat(row.depth()) + glyph + row.name();
-            boolean s = idx == fileDialog.sel;
+            String text = flat
+                    ? FileTree.suffixView(flatRows.get(idx).rel(), iw, fileDialog.hcol)
+                    : browseRowText(browseRows.get(idx));
+            boolean s = listFocus && idx == fileDialog.sel; // §21.3: highlight only in LIST focus
             put(g, ix, listTop + r, clipPad(text, iw),
                     s ? Palette.SELECTION_FG : Palette.FG, s ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
         }
+    }
+
+    /** The BROWSE-mode tree row's rendered text: indentation + a ▸/▾ (dir) or blank (file) glyph. */
+    private static String browseRowText(final FileTree.Row row) {
+        String glyph = row.directory() ? (row.expanded() ? "▾ " : "▸ ") : "  ";
+        return "  ".repeat(row.depth()) + glyph + row.name();
     }
 
     private void enterBrowse(final Path file, final List<String> lines, final int line) {
@@ -3323,6 +3504,33 @@ public final class ViewerApp {
             afterMove();
             appendHistory();
         }
+    }
+
+    /**
+     * §21.7 run-to-line: run to the next ({@code forward}) / previous record passing through the
+     * SELECTED source line — the highlighted-number line {@code srcCursor} in the shown frame's
+     * file, resolved by the engine to that {@code (classBinary, line)}'s LINE site — in the current
+     * thread ({@code sameThread}) or any thread. {@code cls} is the selected frame's binary class.
+     * Browse mode or no resolvable frame yields an info-line message and no move; the engine's own
+     * {@link StepResult} (a move, or "no earlier/later pass"/"no LINE record for this line") flows
+     * through {@link #doStep} so a move appends exactly one history entry and a non-move just shows
+     * the message.
+     *
+     * @param forward {@code true} to run to the next pass, {@code false} to the previous one
+     * @param sameThread {@code true} to stay in the current thread ({@code Ctrl-R}/{@code Ctrl-Q}),
+     *     {@code false} to search all threads ({@code Ctrl-T}/{@code Ctrl-W})
+     */
+    private void runToSelectedLine(final boolean forward, final boolean sameThread) {
+        if (browseMode) {
+            status = "run-to-line: not available in browse mode (o to return to execution)";
+            return;
+        }
+        Frame f = selectedFrameOrNull();
+        if (f == null || f.classBinary() == null) {
+            status = "run-to-line: no frame to resolve the selected line";
+            return;
+        }
+        doStep(engine.runToLine(f.classBinary(), srcCursor, forward, sameThread));
     }
 
     /**
@@ -3416,7 +3624,7 @@ public final class ViewerApp {
     }
 
     /**
-     * §20.13 {@code Ctrl-P}/{@code Ctrl-N} viewport scroll of the focused window by {@code delta}
+     * §20.13/§21.9 {@code Ctrl-U}/{@code Ctrl-N} viewport scroll of the focused window by {@code delta}
      * lines: Source moves {@code srcTop} (the render's {@code clampTop} keeps it in range); the list
      * windows nudge their scroll offset without moving the selection ({@link ScrollMath#adjustScroll}
      * / {@link TreeView#ensureVisible} still keep the selection on-screen at render, so the offset
@@ -3459,11 +3667,6 @@ public final class ViewerApp {
     }
 
     // ---- small helpers ----
-
-    /** Ctrl+C — the immediate (unconfirmed) quit, §12.4. */
-    private static boolean isCtrlC(final KeyStroke k) {
-        return k.isCtrlDown() && isChar(k, 'c');
-    }
 
     /** Ctrl+X — the §20.11c synonym for {@code q} (opens the §12.4 quit-confirm; help-window-only). */
     private static boolean isCtrlX(final KeyStroke k) {

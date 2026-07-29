@@ -7,6 +7,7 @@ import io.hindsight.viewer.engine.Instance;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.OptionalInt;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -154,16 +155,43 @@ public final class InstanceBrowse {
             final Function<String, List<Instance>> instancesProvider,
             final String query,
             final int cap) {
+        return filter(sites, instancesProvider, query, cap, OptionalInt.empty());
+    }
+
+    /**
+     * As {@link #filter(List, Function, String, int)} but with the §21.6 thread filter: when
+     * {@code tidFilter} is present, only instances whose {@code tid} equals it are listed and
+     * {@code totalMatches} counts exactly those (so the §15.3 count line stays accurate); an empty
+     * {@code tidFilter} means all threads and reproduces the four-argument behaviour exactly. The
+     * §21.6 dialog passes {@code cap == Integer.MAX_VALUE} (uncapped) so no truncation occurs; the
+     * thread filter composes with the {@code #<id>} form the same way the class regex does.
+     *
+     * @param sites the distinct first-seen runtime classes (typically {@code Engine.classSites()})
+     * @param instancesProvider maps a class binary name to its instances, ascending by seq
+     * @param query the user's query: a case-insensitive regex, optionally suffixed {@code #<id>}
+     * @param cap the maximum rows to return (a non-positive cap yields no rows)
+     * @param tidFilter the thread id to restrict rows to, or empty for all threads (§21.6)
+     * @return the filter result
+     * @throws PatternSyntaxException if the query's regex part is not a valid regular expression
+     */
+    public static Result filter(
+            final List<ClassSite> sites,
+            final Function<String, List<Instance>> instancesProvider,
+            final String query,
+            final int cap,
+            final OptionalInt tidFilter) {
         Query q = parseQuery(query);
         boolean qualified = isQualified(q.regex());
         Pattern pattern = Pattern.compile(q.regex(), Pattern.CASE_INSENSITIVE);
+        boolean byThread = tidFilter.isPresent();
+        int wantTid = tidFilter.orElse(0);
         long total = 0;
         List<Row> all = new ArrayList<>();
         for (ClassSite site : sites) {
             if (!pattern.matcher(matchTarget(site, qualified)).find()) {
                 continue;
             }
-            if (q.objectId() == null) {
+            if (q.objectId() == null && !byThread) {
                 total += site.instanceCount();
             }
             List<Instance> instances = instancesProvider.apply(site.classBinary());
@@ -172,11 +200,14 @@ public final class InstanceBrowse {
                     if (q.objectId() != null && i.objectId() != q.objectId()) {
                         continue;
                     }
+                    if (byThread && i.tid() != wantTid) {
+                        continue;
+                    }
                     all.add(new Row(i.seq(), i.tid(), i.index(), i.objectId(), site.classBinary(), display(site, i)));
                 }
             }
         }
-        if (q.objectId() != null) {
+        if (q.objectId() != null || byThread) {
             total = all.size();
         }
         all.sort(Comparator.comparingLong(Row::seq)

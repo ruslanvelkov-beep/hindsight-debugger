@@ -7,10 +7,12 @@ import io.hindsight.reader.Format;
 import org.junit.jupiter.api.Test;
 
 /**
- * Unit tests for the pure §20.4/§20.5 numeric decoration helper: hex width per type, two's-complement
- * hex for negatives, the boolean/float/double skips, char, and the three epoch date ranges at their
- * inclusive-low / exclusive-high boundaries (plus a value in no range). Date literals are the UTC
- * wall-clock of the epoch value; all three range-lows land on the same 2001-09-09 01:46:40 instant.
+ * Unit tests for the pure §20.5/§21.1 numeric decoration helper. {@code decorate} is the context-free
+ * §20.5 hex (width per type, two's-complement for negatives, boolean/float/double skipped, char) —
+ * and, per §21.1, NEVER the date. The date lives in {@code dateSuffix} (the three epoch ranges at
+ * their inclusive-low / exclusive-high boundaries) and is applied only through {@code decorateNamed}'s
+ * name gate ({@code time}/{@code date}/{@code instant}). Date literals are the UTC wall-clock of the
+ * epoch value; all three range-lows land on the same 2001-09-09 01:46:40 instant.
  */
 final class NumberFormatUtilTest {
 
@@ -46,46 +48,66 @@ final class NumberFormatUtilTest {
     }
 
     @Test
-    void secondsRangeBoundaries() {
-        // Inclusive low: 1e9 seconds = 2001-09-09 01:46:40 UTC (an int reaches this range).
-        assertEquals("1000000000  0x3B9ACA00  (2001-09-09 01:46:40 UTC)",
+    void decorateIsHexOnlyEvenForInRangeValues() {
+        // §21.1: decorate is now context-free hex ONLY — an in-range value gets NO date here
+        // (the date is name-gated and lives in dateSuffix/decorateNamed).
+        assertEquals("1000000000  0x3B9ACA00",
                 NumberFormatUtil.decorate("1000000000", Format.TAG_INT, 1_000_000_000L));
-        // Just below the low: no date.
-        assertEquals("999999999  0x3B9AC9FF",
-                NumberFormatUtil.decorate("999999999", Format.TAG_INT, 999_999_999L));
-        // Exclusive high (a long, since it exceeds int range): no date, hex only.
-        assertEquals("4000000000  0x00000000EE6B2800",
-                NumberFormatUtil.decorate("4000000000", Format.TAG_LONG, 4_000_000_000L));
-        // Just below the high: date present.
-        assertEquals("3999999999  0x00000000EE6B27FF  (2096-10-02 07:06:39 UTC)",
-                NumberFormatUtil.decorate("3999999999", Format.TAG_LONG, 3_999_999_999L));
-    }
-
-    @Test
-    void millisRangeBoundaries() {
-        assertEquals("1000000000000  0x000000E8D4A51000  (2001-09-09 01:46:40 UTC)",
+        assertEquals("1000000000000  0x000000E8D4A51000",
                 NumberFormatUtil.decorate("1000000000000", Format.TAG_LONG, 1_000_000_000_000L));
-        // Exclusive high: no date.
-        assertEquals("4000000000000  0x000003A352944000",
-                NumberFormatUtil.decorate("4000000000000", Format.TAG_LONG, 4_000_000_000_000L));
-    }
-
-    @Test
-    void nanosRangeBoundaries() {
-        assertEquals("1000000000000000000  0x0DE0B6B3A7640000  (2001-09-09 01:46:40 UTC)",
+        assertEquals("1000000000000000000  0x0DE0B6B3A7640000",
                 NumberFormatUtil.decorate("1000000000000000000", Format.TAG_LONG, 1_000_000_000_000_000_000L));
-        // Exclusive high: no date.
-        assertEquals("4000000000000000000  0x3782DACE9D900000",
-                NumberFormatUtil.decorate("4000000000000000000", Format.TAG_LONG, 4_000_000_000_000_000_000L));
-    }
-
-    @Test
-    void valueInNoRangeGetsHexButNoDate() {
-        // Between the seconds and millis ranges — hex only, no date.
+        // A between-ranges value and a tiny/negative long: hex only, exactly as before.
         assertEquals("5000000000  0x000000012A05F200",
                 NumberFormatUtil.decorate("5000000000", Format.TAG_LONG, 5_000_000_000L));
-        // A tiny value and a negative long: hex only.
         assertEquals("7  0x0000000000000007", NumberFormatUtil.decorate("7", Format.TAG_LONG, 7));
         assertEquals("-5  0xFFFFFFFFFFFFFFFB", NumberFormatUtil.decorate("-5", Format.TAG_LONG, -5));
+    }
+
+    @Test
+    void dateSuffixSecondsRangeBoundaries() {
+        // Inclusive low: 1e9 seconds = 2001-09-09 01:46:40 UTC (an int reaches this range).
+        assertEquals("  (2001-09-09 01:46:40 UTC)", NumberFormatUtil.dateSuffix(Format.TAG_INT, 1_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_INT, 999_999_999L)); // just below
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_LONG, 4_000_000_000L)); // exclusive high
+        assertEquals("  (2096-10-02 07:06:39 UTC)", NumberFormatUtil.dateSuffix(Format.TAG_LONG, 3_999_999_999L));
+    }
+
+    @Test
+    void dateSuffixMillisAndNanosRangeBoundaries() {
+        assertEquals("  (2001-09-09 01:46:40 UTC)",
+                NumberFormatUtil.dateSuffix(Format.TAG_LONG, 1_000_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_LONG, 4_000_000_000_000L)); // exclusive high
+        assertEquals("  (2001-09-09 01:46:40 UTC)",
+                NumberFormatUtil.dateSuffix(Format.TAG_LONG, 1_000_000_000_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_LONG, 4_000_000_000_000_000_000L));
+        // A between-ranges value: no date.
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_LONG, 5_000_000_000L));
+    }
+
+    @Test
+    void dateSuffixOnlyForIntAndLongTags() {
+        // Only int/long can be a date; byte/short/char/boolean/double never date even in-range.
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_SHORT, 1_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_BYTE, 1_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_CHAR, 1_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_BOOLEAN, 1_000_000_000L));
+        assertEquals("", NumberFormatUtil.dateSuffix(Format.TAG_DOUBLE, 1_000_000_000L));
+    }
+
+    @Test
+    void decorateNamedGatesDateOnTimeLikeNames() {
+        String hex = NumberFormatUtil.decorate("1000000000000", Format.TAG_LONG, 1_000_000_000_000L);
+        String dated = hex + "  (2001-09-09 01:46:40 UTC)";
+        // time / date / instant (any case) → date appended after the hex.
+        assertEquals(dated, NumberFormatUtil.decorateNamed(hex, "lastUpdateTime", Format.TAG_LONG, 1_000_000_000_000L));
+        assertEquals(dated, NumberFormatUtil.decorateNamed(hex, "createdDate", Format.TAG_LONG, 1_000_000_000_000L));
+        assertEquals(dated, NumberFormatUtil.decorateNamed(hex, "myINSTANT", Format.TAG_LONG, 1_000_000_000_000L));
+        // A non-time name, and a null name (nameless context), keep hex only.
+        assertEquals(hex, NumberFormatUtil.decorateNamed(hex, "count", Format.TAG_LONG, 1_000_000_000_000L));
+        assertEquals(hex, NumberFormatUtil.decorateNamed(hex, null, Format.TAG_LONG, 1_000_000_000_000L));
+        // A time name but an out-of-range value: the gate opens but dateSuffix is empty → hex only.
+        String hexSmall = NumberFormatUtil.decorate("42", Format.TAG_LONG, 42L);
+        assertEquals(hexSmall, NumberFormatUtil.decorateNamed(hexSmall, "timestamp", Format.TAG_LONG, 42L));
     }
 }

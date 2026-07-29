@@ -1216,3 +1216,97 @@ down (one line); `Ctrl-K` left, `Ctrl-L` right (one hstep) as synonyms for the e
 Tab/Enter/LF byte codes and cannot be bound without hijacking those keys, so the
 collision-free `Ctrl-P`/`Ctrl-N`/`Ctrl-K`/`Ctrl-L` are used; `Ctrl-K` matches the
 user's "K = horizontal" intent. Arrow and `<`/`>` mappings are retained.
+
+## 21. v2.1 additions & changes
+
+Authoritative over conflicting earlier text (§20.4, §11.7/§15/§17.7, §19.4, §20.9/§20.10/
+§20.13, §12.4). Viewer-only except §21.4 (recorder/format). All schema-4 recordings.
+
+### 21.1 Date view is name-gated
+The §20.4 UTC date suffix now applies ONLY to a value whose VARIABLE NAME contains
+`time`, `date` or `instant` (case-insensitive) AND whose int/long value is in a
+seconds/millis/nanos range. The v2.0 blanket "any in-range number is dated" is REMOVED
+(it dated unrelated large ints). Hex (§20.5) is unchanged — still on every integral value.
+Names come from the local/field/watch label; nameless contexts (list/array elements, map
+keys/values) get no date. Implementation: the date part moves out of the context-free
+`toValue` into the name-bearing render sites (locals, snapshot fields, watches), which pass
+the name to the number formatter; hex stays in `toValue`.
+
+### 21.2 In-file search direction indicator (supersedes §19.4/§20.7 reverse keys)
+The `Alt-F` field prompt shows the search direction as an arrow inside the label:
+`[ Search↓: <query> ]` (down = forward, the default) or `[ Search↑: <query> ]` (up =
+reverse). `Tab` flips the arrow. On a flip the arrow is drawn INVERTED (black arrow on the
+amber/yellow field background) as a transient cue; it returns to normal (yellow arrow on
+black) as soon as the user types or presses Enter. `Enter` searches in the arrow's current
+direction (no more Option/Alt-Enter, Shift/Ctrl-Enter — those are removed; ↑/↓ are also
+removed as search-motion keys since the field owns the arrow). `Ctrl-U` clears the query.
+`Esc` exits. The §19.4 boundary-invert-then-wrap still applies in the active direction.
+
+### 21.3 File-open browser rework (supersedes §17.7)
+Window width 2/3 of the terminal. Two modes:
+- **Browse (empty filter)**: the directory tree as in §17.7 (expand/collapse folders,
+  Enter on a file opens it). Entering a folder appends to the current path; the STATUS
+  line shows that current path.
+- **Filter (non-empty query)**: the query filters ALL files under the project root(s)
+  (recursive, case-insensitive substring/regex); folder expand/collapse is HIDDEN and the
+  result is a FLAT file list. Each row shows the path's SUFFIX so the file name is always
+  visible (leading directories may be clipped); the row is horizontally scrollable to
+  reveal the prefix. The STATUS line shows the SELECTED file's full path (or as much as
+  fits).
+Focus: typing edits the filter; when the selection is at the TOP of the list, `↑` (and
+`/`, kept) returns focus to the filter field and clears the list highlight — matching the
+§15.2 model. `Enter` on a file opens it (browse mode); `Esc` closes; state persists across
+reopen (§15.5).
+
+### 21.4 Record the source commit (recorder/format)
+The recording script captures the target project's `git rev-parse HEAD` (empty when there
+is no `.git`) and passes it to the agent (`sourceCommit=<hash>`); the runtime echoes it to
+`manifest.properties` as `sourceCommit` (FORMAT.md §13). The viewer surfaces it in the
+`Ctrl-D` recording popup (a `commit <hash>` line; `(working tree — no .git)` when empty).
+Config: new `AgentConfig.sourceCommit` / `RuntimeConfig.sourceCommit`. Schema unchanged.
+
+### 21.5 Containers: size label + always populated (extends §7 always-dump)
+Every unfolded container (map/set/list/collection AND array) renders its type with the
+size appended: `<SimpleClass>#<id>, size=<totalSize>` (the true size at snapshot time, not
+the ≤64 shown-entry count). This applies at ALL depths and regardless of the shown-entry
+cap (the existing `…+N more` leaf stays). Containers must be POPULATED whenever a snapshot
+exists at/before the cursor — investigate and fix any case where a container that has a
+container-form snapshot still shows empty (e.g. a field whose value is a container but the
+node was built non-expandable, or a snapshot chosen incorrectly as-of seq). If genuinely no
+snapshot exists at/before the cursor, `<No info available>` remains correct.
+
+### 21.6 Uncapped instance/method browse + thread filter
+The `/` browser (both calls and instances modes) no longer trims to 500 — it uses ALL
+matching records (`Engine.instancesOf`/`callsOf` called with an unbounded cap; the
+`showing first N of M` note disappears when all are shown). A SECOND input field sits to
+the right of the regex field with prompt `thread: `; a non-empty value filters results to
+that thread id (blank = all threads). Rows unchanged. (List rendering is already
+scroll-virtualised, so an all-records list is fine.)
+
+### 21.7 Run-to-line = selected line, + cross-thread variants (supersedes §20.10)
+"Current line" means the SELECTED (highlighted-number) source line `srcCursor` in the
+shown frame's file, resolved to that `(classBinary, line)`'s LINE site — NOT the cursor
+record's own line. Commands:
+- `Ctrl-R` forward / `Ctrl-Q` backward — next/previous record PASSING THROUGH that line in
+  the CURRENT thread (thread-preserving).
+- `Ctrl-T` forward / `Ctrl-W` backward — same, but ANY thread (by global seq), not
+  thread-preserving.
+When no such record exists in the direction, an info-line message; browse mode / no
+resolvable line ⇒ a message. New engine `runToLine(String classBinary, int line, boolean
+forward, boolean sameThread) -> StepResult`.
+
+### 21.8 Remove the Ctrl-C immediate exit
+`Ctrl-C` no longer quits the viewer (the abrupt, unconfirmed exit is removed everywhere it
+was a fallback). Quit is only `q` / `Ctrl-X` → the §12.4 confirm box. EOF/stream-close
+still ends the loop.
+
+### 21.9 Scroll-up key `Ctrl-P` → `Ctrl-U`
+Per-window viewport scroll-up moves from `Ctrl-P` to `Ctrl-U` (§20.13); `Ctrl-N` (down),
+`Ctrl-K`/`Ctrl-L` (left/right) unchanged. In the `Alt-F` search field and dialog inputs,
+`Ctrl-U` keeps its §21.2/§15.2 clear-the-query meaning (input modes consume it first);
+globally it scrolls the focused window up.
+
+### 21.10 Help-window-only commands
+`Ctrl-R`/`Ctrl-Q`/`Ctrl-T`/`Ctrl-W` (run-to-line family), `V`, `Ctrl-X` and the scroll keys
+appear in the `F1` help WINDOW but NOT on the trimmed status line, which keeps ending
+`F1 help`.

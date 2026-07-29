@@ -7,6 +7,7 @@ import io.hindsight.viewer.engine.MethodSite;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.OptionalInt;
 import java.util.function.IntFunction;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -78,21 +79,55 @@ public final class MethodBrowse {
             final IntFunction<List<Call>> callsProvider,
             final String regex,
             final int cap) {
+        return filter(sites, callsProvider, regex, cap, OptionalInt.empty());
+    }
+
+    /**
+     * As {@link #filter(List, IntFunction, String, int)} but with the §21.6 thread filter: when
+     * {@code tidFilter} is present, only invocations whose {@code tid} equals it are kept and
+     * {@code totalMatches} counts exactly those (so the §15.3 count line stays accurate); an empty
+     * {@code tidFilter} means all threads and reproduces the four-argument behaviour exactly. The
+     * §21.6 dialog passes {@code cap == Integer.MAX_VALUE} (uncapped) so no truncation occurs.
+     *
+     * @param sites the distinct entered method sites (typically {@code Engine.methodSites()})
+     * @param callsProvider maps a site id to that site's invocations, ascending by seq
+     * @param regex the user's query, interpreted case-insensitively; matched with {@code find()}
+     * @param cap the maximum rows to return (a non-positive cap yields no rows)
+     * @param tidFilter the thread id to restrict rows to, or empty for all threads (§21.6)
+     * @return the filter result
+     * @throws PatternSyntaxException if {@code regex} is not a valid regular expression
+     */
+    public static Result filter(
+            final List<MethodSite> sites,
+            final IntFunction<List<Call>> callsProvider,
+            final String regex,
+            final int cap,
+            final OptionalInt tidFilter) {
         Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
+        boolean byThread = tidFilter.isPresent();
+        int wantTid = tidFilter.orElse(0);
         long total = 0;
         List<Row> all = new ArrayList<>();
         for (MethodSite site : sites) {
             if (!pattern.matcher(matchString(site)).find()) {
                 continue;
             }
-            total += site.invocationCount();
+            if (!byThread) {
+                total += site.invocationCount();
+            }
             String label = display(site);
             List<Call> calls = callsProvider.apply(site.siteId());
             if (calls != null) {
                 for (Call c : calls) {
+                    if (byThread && c.tid() != wantTid) {
+                        continue;
+                    }
                     all.add(new Row(c.seq(), c.tid(), c.index(), label));
                 }
             }
+        }
+        if (byThread) {
+            total = all.size();
         }
         all.sort(Comparator.comparingLong(Row::seq)
                 .thenComparingInt(Row::tid)

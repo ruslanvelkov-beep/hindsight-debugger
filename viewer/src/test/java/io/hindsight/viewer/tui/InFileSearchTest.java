@@ -194,4 +194,17 @@ final class InFileSearchTest {
         assertEquals("", InFileSearch.visibleInput("abc", 0));
         assertEquals("", InFileSearch.visibleInput(null, 5));
     }
+
+    // ---- §21.2 search-direction arrow / field prefix ----
+
+    @Test
+    void directionArrowAndPrefixReflectTheDirection() {
+        assertEquals('↓', InFileSearch.directionArrow(false), "forward is down");
+        assertEquals('↑', InFileSearch.directionArrow(true), "reverse is up");
+        assertEquals("[ Search↓: ", InFileSearch.searchPrefix(false));
+        assertEquals("[ Search↑: ", InFileSearch.searchPrefix(true));
+        // ARROW_OFFSET indexes the arrow within the prefix, in either direction.
+        assertEquals('↓', InFileSearch.searchPrefix(false).charAt(InFileSearch.ARROW_OFFSET));
+        assertEquals('↑', InFileSearch.searchPrefix(true).charAt(InFileSearch.ARROW_OFFSET));
+    }
 }
