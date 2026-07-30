@@ -8,6 +8,7 @@ import io.hindsight.viewer.engine.Engine;
 import io.hindsight.viewer.source.SourcePath;
 import io.hindsight.viewer.tui.CliArgs;
 import io.hindsight.viewer.tui.ViewerApp;
+import io.hindsight.reader.LineIndex;
 import io.hindsight.reader.Recording;
 import java.io.IOException;
 
@@ -77,6 +78,14 @@ public final class Main {
         int code = 0;
         try {
             recording = Recording.open(parsed.dir());
+            // §24.5: the FORMAT.md §12.1 visited-line index — read back when present, computed
+            // (one full record scan, a few seconds at most on large recordings) and persisted
+            // best-effort on the recording's first use (a read-only dir just rescans next time).
+            // Done BEFORE the alternate screen so the note stays visible.
+            if (!LineIndex.present(recording)) {
+                System.out.println("building line index (first use of this recording)...");
+            }
+            LineIndex lineIndex = LineIndex.openOrBuild(recording);
             engine = Engine.open(parsed.dir());
             screen = new DefaultTerminalFactory()
                     .setUnixTerminalCtrlCBehaviour(UnixLikeTerminal.CtrlCBehaviour.TRAP)
@@ -87,7 +96,7 @@ public final class Main {
             // (Ctrl-R/T/W have no such meaning and already work). Clear IXON on the controlling tty
             // AFTER lanterna's own raw-mode stty so it sticks; restore it in the finally. Best-effort.
             setFlowControl(false);
-            new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid()).run();
+            new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid(), lineIndex).run();
         } catch (IOException e) {
             code = 1;
             System.err.println("viewer: " + e.getMessage());

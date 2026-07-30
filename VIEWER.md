@@ -1447,3 +1447,81 @@ the gutter: the gutter keeps its bright selection marker (§13.4) and the code c
 `FRAME_LINE_BG` (236) so an actual record/frame position always outranks it; when the cursor
 sits on the exec/frame line, that highlight wins outright (the tint never overrides a record
 position).
+
+## 24. v2.4 additions & changes
+
+### 24.1 `.` (find object usage) — full dialog parity
+The `.` dialog behaves like the other list windows/dialogs. It is 2/3 of the terminal
+width × 3/4 of its height (§22.10), and adopts the `/` browser's §15.2/§21.6 model wholesale:
+- The query row holds TWO fields — `query:` (left) and `thread:` (right, digits only,
+  blank = all threads; every edit re-filters the scan to that thread id). `→` at the
+  query's right edge crosses into `thread:`, `←` at its left edge crosses back; carets,
+  insertion and Ctrl-U/Ctrl-W/Ctrl-Backspace clearing as in §22.4.
+- The §15.3 count line (`N results`, or the §23.2 cap note) sits DIM directly under the
+  query; the list runs down to the hint row.
+- Focus: QUERY ↔ THREAD ↔ LIST. `↓` enters the list, `↑` on the first row returns to the
+  query, `/` returns from anywhere in the list; the selection highlight shows only in
+  LIST focus (§22.3). Enter (LIST) jumps and closes; Esc closes. The dialog stays
+  transient (fresh per open).
+- LIST keys match every other window: ↑/↓ move; Ctrl-F/Ctrl-B and PgDn/PgUp page;
+  g/G first/last; Ctrl-U/Ctrl-N scroll the viewport one line (selection dragged along
+  only at the view's edge); `<`/`>`, `←`/`→` and Ctrl-K/Ctrl-L horizontally scroll the
+  rows (whole row participates; the same keys work in the `/` calls list).
+
+### 24.2 `.` rows — object-resolved metadata records + match highlight
+- A row whose record is `OBJECT_FIRST_SEEN` or `SNAPSHOT` resolves to the OBJECT itself:
+  `seq N · tT · Class#id first seen` / `… snapshot` (their `location` is no source site,
+  so the old site text degraded to a bare record-type name).
+- Every occurrence of the typed filter inside a row's visible text repaints reverse-video
+  (yellow, the §22.2 file-browser style), case-insensitively, on selected and unselected
+  rows alike.
+
+### 24.3 `.` rows — ' -> ' containment chain to an accessible object
+Each visible row answers: is the row's object directly usable in the context of that
+record — i.e. is it the value of a local variable, a method argument or `this` in the
+record's own (top) frame, reconstructed as-of that record? If YES the row is unadorned.
+If NOT, the row continues with the object's containment chain, walked upward until an
+object that IS directly accessible: ` -> Parent#id -> … -> name=Class#id` (the final,
+accessible object is annotated with the variable name that reaches it). ` -> ?` marks an
+object not reachable from the frame's roots within the search limits (depth ≤ 5 from the
+roots, ≤ 200 objects expanded per row) — or a row with no frame context at all.
+
+Implementation contract: chains are computed lazily for exactly the visible rows and
+cached per result list (invalidated on every recompute). Resolution seeks the engine to
+the row's record, gathers the top frame's locals/args/`this` as roots, BFS-descends the
+object graph as-of that record (map entries pass through one structural level, §17.3;
+cycles guarded), and restores the engine position afterwards — the cursor never moves.
+
+### 24.4 Source cursor line — lighter tint
+`CURSOR_LINE_BG` is xterm-256 indexed 235 (`#262626`) — one step lighter than §23.3's
+234 so the tint reads clearly, still strictly darker than `FRAME_LINE_BG` (236) so an
+actual record/frame position always outranks it (precedence unchanged from §23.3).
+
+### 24.5 Recorded-line gutter (visited-line index)
+The viewer consumes the FORMAT.md §12.1 visited-line index (`lines.tsv`, built by one
+full record scan after recording — `reader lines` — or lazily on the recording's first
+use; `Main` pre-builds it before the alternate screen with a
+`building line index (first use of this recording)...` note so both the CLI and the
+viewer then read it back for free):
+- In the Source window, a line the recording touched at least once shows a WHITE line
+  number; unvisited lines keep the dim grey. The §13.4 cursor-line inversion still wins.
+- Works identically in exec mode (the frame's class+file resolve to the §12.1 key) and
+  browse mode (the browsed file's path relative to its owning source root IS the key).
+
+### 24.6 `F` (Open file) — project-root trees, coverage colours, full scrolling
+- Trees start at the PROJECT roots: every source root under a `--repo` dir is shown from
+  that dir — one top-level tree per repo (named by its absolute path), with every
+  directory between the repo root and the package roots visible as ordinary expandable
+  levels, source roots sharing a prefix merged (`hedera-node/…/src/main/java/com/…`).
+  A source root under no repo keeps its own top-level tree (old shape). FLAT-filter rows
+  show the path relative to the top-level tree, so the whole project-relative path is
+  visible (and horizontally scrollable).
+- Coverage colours: a FILE the recording touched (its source-root-relative path is a
+  §12.1 key) renders WHITE; other files use the Source gutter's dim grey. In BROWSE mode
+  a DIRECTORY renders white iff at least one covered file lies beneath it. Selection
+  inversion still wins; the §22.2 match highlight still paints on top in FLAT mode.
+- Scrolling in all four directions, like every other window: Ctrl-U/Ctrl-N viewport
+  line scroll (selection dragged along only at the view's edge), Ctrl-K/Ctrl-L and
+  `<`/`>` horizontal in BOTH modes (browse rows clip through the offset too; `←`/`→`
+  additionally scroll in FLAT mode, keeping their expand/collapse role in BROWSE),
+  Ctrl-F/Ctrl-B / PgDn/PgUp paging and g/G as before.

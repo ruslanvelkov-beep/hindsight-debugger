@@ -313,4 +313,80 @@ final class FileTreeTest {
         assertEquals("", FileTree.rightAlign(null, 0, 0));
         assertEquals("     ", FileTree.rightAlign(null, 5, 0)); // null path -> all padding
     }
+
+    // ---- §24.6 project-root bases + coverage ----
+
+    /**
+     * A repo-shaped fixture: {@code repo/moduleA/src/main/java/com/foo/{Bar,Baz}.java} and
+     * {@code repo/moduleB/src/main/java/util/Helper.java}, whose two source roots share the
+     * {@code repo} base.
+     */
+    private static Path repoRoot(final Path dir) throws IOException {
+        Path repo = dir.resolve("repo");
+        Files.createDirectories(repo.resolve("moduleA/src/main/java/com/foo"));
+        Files.createDirectories(repo.resolve("moduleB/src/main/java/util"));
+        Files.writeString(repo.resolve("moduleA/src/main/java/com/foo/Bar.java"), "class Bar {}\n");
+        Files.writeString(repo.resolve("moduleA/src/main/java/com/foo/Baz.java"), "class Baz {}\n");
+        Files.writeString(repo.resolve("moduleB/src/main/java/util/Helper.java"), "class Helper {}\n");
+        return repo;
+    }
+
+    @Test
+    void basesShowEveryDirectoryFromTheProjectRootAndMergeSharedPrefixes(@TempDir final Path dir)
+            throws IOException {
+        Path repo = repoRoot(dir);
+        List<Path> roots = List.of(
+                repo.resolve("moduleA/src/main/java"), repo.resolve("moduleB/src/main/java"));
+        FileTree tree = FileTree.build(roots, List.of(repo), java.util.Set.of());
+        expandAll(tree);
+        // ONE top-level tree named by the base's absolute path, then every directory level down
+        // to the package roots — moduleA and moduleB merged under the shared repo base.
+        assertEquals(List.of(
+                        repo.toAbsolutePath().normalize().toString(),
+                        "moduleA", "src", "main", "java", "com", "foo", "Bar.java", "Baz.java",
+                        "moduleB", "src", "main", "java", "util", "Helper.java"),
+                names(tree));
+        // Flat rows are base-relative, so the whole path from the project root is visible.
+        tree.setFilter("helper");
+        assertEquals(List.of("moduleB/src/main/java/util/Helper.java"), flatRels(tree));
+    }
+
+    @Test
+    void rootUnderNoBaseKeepsItsOwnTopLevelTree(@TempDir final Path dir) throws IOException {
+        Path root = sampleRoot(dir);
+        FileTree tree = FileTree.build(List.of(root), List.of(dir.resolve("elsewhere")), java.util.Set.of());
+        assertEquals(root.toAbsolutePath().normalize().toString(), tree.rows().get(0).name());
+    }
+
+    @Test
+    void coverageMarksFilesBySourceRootRelativeKeyAndPropagatesToDirectories(@TempDir final Path dir)
+            throws IOException {
+        Path repo = repoRoot(dir);
+        List<Path> roots = List.of(
+                repo.resolve("moduleA/src/main/java"), repo.resolve("moduleB/src/main/java"));
+        // Coverage keys are SOURCE-ROOT-relative (§12.1), not base-relative.
+        FileTree tree = FileTree.build(roots, List.of(repo), java.util.Set.of("com/foo/Bar.java"));
+        expandAll(tree);
+        Path bar = repo.resolve("moduleA/src/main/java/com/foo/Bar.java").toAbsolutePath().normalize();
+        for (FileTree.Row r : tree.rows()) {
+            // Covered = exactly the covered file and every ancestor directory on its path
+            // (moduleA's whole chain up to the base root); moduleB's chain and Baz.java are not.
+            assertEquals(bar.startsWith(r.path()), r.covered(), r.name());
+        }
+        tree.setFilter("ba");
+        assertTrue(tree.flatRows().stream()
+                .anyMatch(f -> f.rel().endsWith("Bar.java") && f.covered()));
+        assertTrue(tree.flatRows().stream()
+                .anyMatch(f -> f.rel().endsWith("Baz.java") && !f.covered()));
+    }
+
+    @Test
+    void baseEqualToTheSourceRootAttachesChildrenDirectly(@TempDir final Path dir) throws IOException {
+        Path root = sampleRoot(dir);
+        FileTree tree = FileTree.build(List.of(root), List.of(root), java.util.Set.of());
+        expandAll(tree);
+        // The base row is the root itself; children appear right beneath it (no empty chain level).
+        assertEquals(root.toAbsolutePath().normalize().toString(), tree.rows().get(0).name());
+        assertTrue(names(tree).containsAll(List.of("com", "util", "Top.java")));
+    }
 }

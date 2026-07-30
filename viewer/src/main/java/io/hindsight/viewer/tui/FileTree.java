@@ -9,9 +9,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -19,6 +21,14 @@ import java.util.regex.PatternSyntaxException;
 /**
  * The pure model behind the redesigned open-file browser (VIEWER.md §17.7): a directory
  * tree rooted at the source roots, indexing every subdirectory and {@code .java} file.
+ *
+ * <p>§24.6: when project roots ({@code --repo} dirs) are supplied, every source root under
+ * one is shown from THAT root — the tree includes each directory between the project root
+ * and the package roots ({@code hedera-node/…/src/main/java/com/…}), source roots sharing a
+ * prefix merged into one subtree; a source root under no base keeps its own top-level tree.
+ * Each entry also carries a {@code covered} flag — whether the recording touched the file
+ * (FORMAT.md §12.1 keys, resolved against each file's path relative to its owning SOURCE
+ * root) or, for a directory, any file beneath it — which the dialog renders white vs. dim.
  *
  * <p>The index is built ONCE ({@link #build}) by walking the roots — directories whose
  * subtree contains no {@code .java} file are pruned at build time and never appear — and
@@ -51,20 +61,29 @@ public final class FileTree {
      * @param directory whether this is a directory (expandable) rather than a {@code .java} leaf
      * @param depth indentation depth (0 for a root)
      * @param expanded whether a directory row is currently expanded (always {@code false} for files)
+     * @param covered §24.6 — the recording touched this file (or, for a directory, at least
+     *     one file beneath it); drives the white-vs-dim row colour
      */
-    public record Row(Path path, String name, boolean directory, int depth, boolean expanded) {}
+    public record Row(Path path, String name, boolean directory, int depth, boolean expanded, boolean covered) {}
 
     /**
      * One row of the §21.3 FLAT filter list (non-empty filter): a matching {@code .java} file
      * with its absolute {@code path} (the open target and the info-line's full path) and
-     * {@code rel} — the path relative to its owning root, the horizontally-scrollable text the
-     * row shows so the file name is always visible while leading directories clip (see
-     * {@link #suffixView}). Folder structure is ignored in this mode (no expand/collapse).
+     * {@code rel} — the path relative to its owning top-level tree (the §24.6 project root when
+     * grouped under one), the horizontally-scrollable text the row shows so the file name is
+     * always visible while leading directories clip (see {@link #suffixView}). Folder structure
+     * is ignored in this mode (no expand/collapse). {@code covered} as in {@link Row}.
      */
-    public record FlatRow(Path path, String rel) {}
+    public record FlatRow(Path path, String rel, boolean covered) {}
 
     /** One immutable indexed entry: a directory (with children) or a {@code .java} file. */
-    private record Node(Path path, String name, boolean dir, List<Node> children) {}
+    private record Node(Path path, String name, boolean dir, List<Node> children, boolean covered) {}
+
+    /** Sibling order everywhere in the tree: directories before files, then name (case-insensitive). */
+    private static final Comparator<Node> NODE_ORDER = Comparator
+            .comparing((Node n) -> !n.dir())
+            .thenComparing(n -> n.name().toLowerCase(Locale.ROOT))
+            .thenComparing(Node::name);
 
     private final List<Node> roots;
     private final Set<Path> expandedDirs = new HashSet<>();
@@ -78,41 +97,125 @@ public final class FileTree {
         }
     }
 
+    /** Backwards-compatible build: no project roots, no coverage (§17.7 shape). */
+    public static FileTree build(final List<Path> rootDirs) {
+        return build(rootDirs, List.of(), Set.of());
+    }
+
     /**
-     * Walks {@code rootDirs} once and builds the index (§17.7): directories and
+     * Walks {@code rootDirs} once and builds the index (§17.7/§24.6): directories and
      * {@code .java} files, directories sorted before files and each group sorted by name
      * (case-insensitive). Duplicate roots are indexed once; unreadable directories
      * contribute what could be listed; directories without any {@code .java} beneath are
      * pruned. Symbolic links to directories are not followed (cycle safety).
      *
+     * <p>§24.6: a source root lying under one of {@code baseDirs} (deepest containing base
+     * wins) is shown from that base — the base becomes the top-level tree (named by its
+     * absolute path, like any root) and every directory between it and the source root
+     * appears as an ordinary expandable level, source roots sharing a prefix merged.
+     * {@code coveredKeys} are the recording's FORMAT.md §12.1 file keys; each indexed file
+     * is matched by its path relative to its owning SOURCE root (not the base).
+     *
      * @param rootDirs the source roots (each a package root), in display order
-     * @return the built tree, with every root initially expanded
+     * @param baseDirs the §24.6 project roots ({@code --repo} dirs); empty for the old shape
+     * @param coveredKeys the recording's visited-file keys ({@code com/foo/Bar.java}), or empty
+     * @return the built tree, with every top-level root initially expanded
      */
-    public static FileTree build(final List<Path> rootDirs) {
+    public static FileTree build(final List<Path> rootDirs, final List<Path> baseDirs, final Set<String> coveredKeys) {
         Set<Path> seen = new LinkedHashSet<>();
         for (Path r : rootDirs == null ? List.<Path>of() : rootDirs) {
             if (r != null) {
                 seen.add(r.toAbsolutePath().normalize());
             }
         }
-        List<Node> roots = new ArrayList<>();
+        List<Path> bases = new ArrayList<>();
+        for (Path b : baseDirs == null ? List.<Path>of() : baseDirs) {
+            if (b != null) {
+                Path norm = b.toAbsolutePath().normalize();
+                if (!bases.contains(norm)) {
+                    bases.add(norm);
+                }
+            }
+        }
+        Set<String> covered = coveredKeys == null ? Set.of() : coveredKeys;
+        List<Node> tops = new ArrayList<>();
+        Map<Path, ChainDir> byBase = new LinkedHashMap<>();
         for (Path r : seen) {
             if (!Files.isDirectory(r)) {
                 continue;
             }
-            Node root = indexDir(r, r.toString());
-            if (root != null) {
-                roots.add(root);
+            Node root = indexDir(r, r.toString(), "", covered);
+            if (root == null) {
+                continue;
+            }
+            Path base = deepestBaseOf(r, bases);
+            if (base == null) {
+                tops.add(root); // §17.7 shape: its own top-level tree
+            } else {
+                byBase.computeIfAbsent(base, ChainDir::new).attach(base.relativize(r), root);
             }
         }
-        return new FileTree(List.copyOf(roots));
+        for (Map.Entry<Path, ChainDir> e : byBase.entrySet()) {
+            tops.add(e.getValue().toNode(e.getKey().toString()));
+        }
+        return new FileTree(List.copyOf(tops));
+    }
+
+    /** The deepest base dir containing {@code root} (equality counts), or {@code null}. */
+    private static Path deepestBaseOf(final Path root, final List<Path> bases) {
+        Path best = null;
+        for (Path b : bases) {
+            if (root.startsWith(b) && (best == null || b.getNameCount() > best.getNameCount())) {
+                best = b;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * §24.6 merge helper: the in-progress directory chain between a base and its source
+     * roots. Each level holds the chain subdirectories built so far plus the children of any
+     * source root that ends exactly here; {@link #toNode} freezes the level into an ordinary
+     * {@link Node} (chain dirs and attached entries merged in {@link #NODE_ORDER}, coverage
+     * = any child covered).
+     */
+    private static final class ChainDir {
+        private final Path path;
+        private final Map<String, ChainDir> dirs = new LinkedHashMap<>();
+        private final List<Node> attached = new ArrayList<>();
+
+        ChainDir(final Path path) {
+            this.path = path;
+        }
+
+        void attach(final Path rel, final Node sourceRoot) {
+            if (rel == null || rel.toString().isEmpty()) {
+                attached.addAll(sourceRoot.children()); // base == source root: children sit here
+                return;
+            }
+            String head = rel.getName(0).toString();
+            ChainDir child = dirs.computeIfAbsent(head, h -> new ChainDir(path.resolve(h)));
+            child.attach(rel.getNameCount() > 1 ? rel.subpath(1, rel.getNameCount()) : null, sourceRoot);
+        }
+
+        Node toNode(final String name) {
+            List<Node> children = new ArrayList<>(attached);
+            for (Map.Entry<String, ChainDir> e : dirs.entrySet()) {
+                children.add(e.getValue().toNode(e.getKey()));
+            }
+            children.sort(NODE_ORDER);
+            boolean covered = children.stream().anyMatch(Node::covered);
+            return new Node(path, name, true, List.copyOf(children), covered);
+        }
     }
 
     /**
      * Recursively indexes {@code dir}, returning {@code null} when its subtree holds no
      * {@code .java} file (the build-time prune — such directories never appear).
+     * {@code rel} is the source-root-relative path of {@code dir} ({@code ""} at the root),
+     * whose extension by each file name forms the §12.1 coverage key.
      */
-    private static Node indexDir(final Path dir, final String name) {
+    private static Node indexDir(final Path dir, final String name, final String rel, final Set<String> covered) {
         List<Path> entries = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
             for (Path p : ds) {
@@ -128,19 +231,22 @@ public final class FileTree {
         List<Node> children = new ArrayList<>();
         for (Path p : entries) {
             String n = nameOf(p);
+            String childRel = rel.isEmpty() ? n : rel + "/" + n;
             if (Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS)) {
-                Node child = indexDir(p, n);
+                Node child = indexDir(p, n, childRel, covered);
                 if (child != null) {
                     children.add(child);
                 }
             } else if (n.endsWith(".java") && Files.isRegularFile(p)) {
-                children.add(new Node(p.toAbsolutePath().normalize(), n, false, List.of()));
+                children.add(new Node(p.toAbsolutePath().normalize(), n, false, List.of(),
+                        covered.contains(childRel)));
             }
         }
         if (children.isEmpty()) {
             return null;
         }
-        return new Node(dir.toAbsolutePath().normalize(), name, true, List.copyOf(children));
+        boolean cov = children.stream().anyMatch(Node::covered);
+        return new Node(dir.toAbsolutePath().normalize(), name, true, List.copyOf(children), cov);
     }
 
     private static String nameOf(final Path p) {
@@ -231,7 +337,7 @@ public final class FileTree {
 
     private void walk(final Node n, final int depth, final List<Row> out) {
         boolean expanded = n.dir() && expandedDirs.contains(n.path());
-        out.add(new Row(n.path(), n.name(), n.dir(), depth, expanded));
+        out.add(new Row(n.path(), n.name(), n.dir(), depth, expanded, n.covered()));
         if (!expanded) {
             return;
         }
@@ -282,7 +388,7 @@ public final class FileTree {
     private void collectMatchingFiles(final Node n, final Path root, final List<FlatRow> out) {
         if (!n.dir()) {
             if (matching.contains(n.path())) {
-                out.add(new FlatRow(n.path(), relativeText(root, n.path())));
+                out.add(new FlatRow(n.path(), relativeText(root, n.path()), n.covered()));
             }
             return;
         }

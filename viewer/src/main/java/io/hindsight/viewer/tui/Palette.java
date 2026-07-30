@@ -58,12 +58,13 @@ public final class Palette {
     /**
      * Background of the Source window's cursor line (the highlighted-number line moved with ↑/↓,
      * §22) when it is NOT the current record/frame line — the whole line is tinted so it reads as
-     * "where I am looking" without competing with an actual record position. Indexed 234
-     * ({@code #1c1c1c}) is deliberately DARKER than {@link #FRAME_LINE_BG} (236) so a
-     * merely-selected outer-frame record line always outranks it; the exec/frame highlight wins
-     * outright when the cursor sits on it. The palette's third 256-colour exception.
+     * "where I am looking" without competing with an actual record position. Indexed 235
+     * ({@code #262626}, §24.4 — one step lighter than §23.3's 234 so the tint is easier to see)
+     * is still deliberately DARKER than {@link #FRAME_LINE_BG} (236) so a merely-selected
+     * outer-frame record line always outranks it; the exec/frame highlight wins outright when the
+     * cursor sits on it. The palette's third 256-colour exception.
      */
-    public static final TextColor CURSOR_LINE_BG = new TextColor.Indexed(234);
+    public static final TextColor CURSOR_LINE_BG = new TextColor.Indexed(235);
 
     /**
      * Foreground of Stack rows whose recorded frame is line-less and of Threads rows whose
