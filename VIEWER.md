@@ -1525,3 +1525,13 @@ viewer then read it back for free):
   `<`/`>` horizontal in BOTH modes (browse rows clip through the offset too; `←`/`→`
   additionally scroll in FLAT mode, keeping their expand/collapse role in BROWSE),
   Ctrl-F/Ctrl-B / PgDn/PgUp paging and g/G as before.
+
+## 25. v2.5 additions & changes
+
+### 25.1 Unvisited line numbers darker
+The Source gutter's THREE-way line-number colouring: a line the recording visited (§24.5)
+stays WHITE; an unvisited line's number is now `UNVISITED_FG` — xterm-256 indexed 239
+(`#4e4e4e`), deliberately DARKER than the `DIM` chrome grey (which the §24.6 file-browser
+rows and other de-emphasised chrome keep) — so recorded and unrecorded lines read apart at
+a glance while unvisited numbers recede. The §13.4 cursor-line inversion still wins. The
+palette's fourth 256-colour exception.

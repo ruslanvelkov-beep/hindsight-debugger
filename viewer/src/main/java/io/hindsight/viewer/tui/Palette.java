@@ -10,15 +10,14 @@ import io.hindsight.viewer.highlight.JavaHighlighter;
  *
  * <p>Only the standard 16 ANSI colours are used (no RGB), so the scheme renders
  * identically on a plain xterm, an SSH session and a rich emulator — the viewer is
- * a terminal tool and must not assume truecolour. The two deliberate exceptions are
- * {@link #FRAME_LINE_BG} (VIEWER.md §12.3, xterm-256 indexed 236: no ANSI-16
- * background is both darker than every syntax foreground and still visible against
- * the default background) and {@link #EXEC_NOLINE_BG} (§18.3, xterm-256 indexed 22:
- * a dark green with the same legibility property, distinguishable from the blue
- * {@link #EXEC_LINE_BG} at a glance); 256-colour support is ubiquitous. The choices
- * favour readability of code over decoration: comments dimmed, string/number/keyword
- * each distinct, and the current-line backgrounds (exec vs. merely-selected frame)
- * chosen to keep foreground syntax legible on top.
+ * a terminal tool and must not assume truecolour. The deliberate exceptions are a
+ * handful of xterm-256 greys/greens no ANSI-16 colour can stand in for, each
+ * documented on its constant: {@link #FRAME_LINE_BG} (236), {@link #EXEC_NOLINE_BG}
+ * (22), {@link #CURSOR_LINE_BG} (235) and {@link #UNVISITED_FG} (239); 256-colour
+ * support is ubiquitous. The choices favour readability of code over decoration:
+ * comments dimmed, string/number/keyword each distinct, and the current-line
+ * backgrounds (exec vs. merely-selected frame) chosen to keep foreground syntax
+ * legible on top.
  */
 public final class Palette {
 
@@ -72,6 +71,16 @@ public final class Palette {
      * marking; selection inversion still wins.
      */
     public static final TextColor CALLS_ONLY_FG = TextColor.ANSI.GREEN_BRIGHT;
+
+    /**
+     * Foreground of a Source gutter line number the recording never visited (§25.1) —
+     * DARKER than the {@link #DIM} chrome grey so recorded (white, §24.5) and unrecorded
+     * numbers read apart at a glance while the unvisited ones recede. Indexed 239
+     * ({@code #4e4e4e}): still legible on the default background and on the
+     * {@link #FRAME_LINE_BG}/{@link #EXEC_LINE_BG} highlight rows a number can sit on.
+     * The palette's fourth 256-colour exception.
+     */
+    public static final TextColor UNVISITED_FG = new TextColor.Indexed(239);
 
     /** Background of the selected row in a list/tree window. */
     public static final TextColor SELECTION_BG = TextColor.ANSI.CYAN;

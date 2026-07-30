@@ -796,11 +796,12 @@ public final class ViewerApp {
             TextColor lineBg = isHl ? highlightBg : (isCursor ? Palette.CURSOR_LINE_BG : Palette.BG);
 
             // §13.4: the cursor line's GUTTER keeps the bright selection marker regardless of lineBg.
-            // §24.5: a line the recording touched at least once (the §12.1 index) gets a WHITE
-            // number; unvisited lines keep the dim gutter grey. Cursor inversion still wins.
+            // §24.5/§25.1: a line the recording touched at least once (the §12.1 index) gets a
+            // WHITE number; an unvisited line's number is darker than the DIM chrome grey so the
+            // two read apart at a glance. Cursor inversion still wins.
             boolean visited = visitedLines != null && visitedLines.get(lineNo);
             put(g, ix, y, String.format("%" + numW + "d ", lineNo),
-                    isCursor ? Palette.SELECTION_FG : (visited ? Palette.FG : Palette.DIM),
+                    isCursor ? Palette.SELECTION_FG : (visited ? Palette.FG : Palette.UNVISITED_FG),
                     isCursor ? Palette.SELECTION_BG : lineBg, false);
             if (contentW <= 0) {
                 continue;
