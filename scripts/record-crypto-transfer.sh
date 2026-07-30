@@ -128,6 +128,12 @@ echo "==> verify"
 "$READER_BIN" verify --dir "$REC_DIR" || echo "(verify reported violations — see above)"
 echo "==> stats"
 "$READER_BIN" stats --dir "$REC_DIR" | tee "$REC_DIR/stats.txt"
+# Pre-build the FORMAT.md §12.1 visited-line index (lines.tsv) right after recording, so the
+# viewer's first open reads it back instead of rescanning. Per-file rows are elided here (the
+# report is one row per touched source file); the # summary lines say what was built where.
+# Best-effort by design — on failure the viewer simply builds it lazily on first use.
+echo "==> lines index"
+"$READER_BIN" lines --dir "$REC_DIR" | grep '^#' || echo "(lines index failed — the viewer will build it lazily)"
 echo "==> first 100 records of the merged trace"
 "$READER_BIN" dump --dir "$REC_DIR" --limit 100
 echo
