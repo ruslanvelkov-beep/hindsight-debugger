@@ -46,7 +46,7 @@ public final class Main {
             opts = parseOpts(args, switch (cmd) {
                 case "dump" -> List.of("--dir", "--thread", "--limit", "--from-seq", "--method", "--depth-max");
                 case "find" -> List.of("--dir", "--object", "--limit");
-                case "stats", "verify" -> List.of("--dir");
+                case "stats", "verify", "lines" -> List.of("--dir");
                 default -> null;
             });
         } catch (IllegalArgumentException e) {
@@ -65,6 +65,7 @@ public final class Main {
                 case "find" -> find(rec, opts, out, err);
                 case "stats" -> stats(rec, out);
                 case "verify" -> verify(rec, out);
+                case "lines" -> lines(rec, out);
                 default -> usage(err, null); // unreachable
             };
         } catch (IOException | UncheckedIOException e) {
@@ -115,6 +116,7 @@ public final class Main {
                   find   --dir D --object ID [--limit N]   (ID: bare number or Class#id)
                   stats  --dir D
                   verify --dir D
+                  lines  --dir D   (build/read the FORMAT.md §12.1 visited-line index)
                 exit codes: 0 ok, 1 verify violations, 2 usage""");
         return 2;
     }
@@ -463,6 +465,29 @@ public final class Main {
         int hash = raw.lastIndexOf('#');
         String num = hash >= 0 ? raw.substring(hash + 1) : raw;
         return Long.parseLong(num.trim());
+    }
+
+    // ---- lines ----
+
+    /**
+     * The {@code lines} subcommand (FORMAT.md §12.1): reads — or builds and persists —
+     * the visited-line index, then reports one {@code <file-key><TAB><count>} row per
+     * touched source file plus totals. Running it right after taking a recording
+     * pre-computes the index so later consumers (CLI and viewer alike) open it for free.
+     */
+    private static int lines(final Recording rec, final PrintStream out) throws IOException {
+        surfaceTruncation(rec, out);
+        boolean had = LineIndex.present(rec);
+        LineIndex idx = LineIndex.openOrBuild(rec);
+        // Persisting is best-effort (§12.1) — say so when the dir was unwritable, so the user
+        // knows the next run will rescan.
+        String how = had ? "read" : LineIndex.present(rec) ? "built" : "built (in memory only — dir not writable)";
+        out.println("# " + how + " " + rec.dir().resolve(LineIndex.FILE_NAME));
+        for (String row : idx.report()) {
+            out.println(row);
+        }
+        out.println("# files: " + idx.files().size() + "  visited lines: " + idx.lineCount());
+        return 0;
     }
 
     // ---- stats ----

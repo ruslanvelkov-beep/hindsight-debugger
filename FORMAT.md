@@ -31,6 +31,7 @@ smallest free `n ≥ 2` and logs the substitution. Contents:
 | `rt-symbols.tsv` | runtime | runtime symbols (thread names, runtime class names, snapshot field names) |
 | `agent.log` | agent | diagnostics; transform failures (fail-open — class left uninstrumented) |
 | `TRUNCATED` | runtime | marker file, created iff recording stopped early (size cap / internal error); first line = reason |
+| `lines.tsv` | reader (derived) | §12.1 visited-line index — computed after recording or lazily on first use; safe to delete (rebuilt on demand) |
 
 All binary integers are **little-endian**. `tid` is a process-local dense counter
 (1, 2, 3, …) assigned on a thread's first recorded event — NOT the Java thread id
@@ -489,6 +490,36 @@ must be skipped: storing an uninitialized `this` is a verify error.)
   followed (in dump) by the frames as `at Class.method (File:line)`, innermost first.
   `verify` additionally checks each STACK payload: count within payload bounds and every
   frame's class/method/file symbol id resolvable (fileSym 0 allowed).
+
+### 12.1 Derived visited-line index — `lines.tsv` (reader ≥ v2.4)
+
+Part of the recording's *calculated* info: for every source file present in the recording,
+the set of lines the recording touched at least once. Computed by ONE full scan of all
+record files — either right after taking the recording (`lines` CLI command) or lazily the
+first time a consumer needs it (`LineIndex.openOrBuild`) — then persisted in the recording
+dir so both the CLI and the viewer read it back for free.
+
+- A record marks `(file, line)` iff its `location` is a **site** (types `METHOD_ENTER`,
+  `METHOD_EXIT`, `ARG`, `LINE`, `BRANCH`, `FIELD_WRITE`, `LOCAL_WRITE`) whose
+  `fileSym ≠ 0` and `line > 0` — i.e. executed statement lines (`LINE`/`BRANCH`), write
+  lines (`FIELD_WRITE`/`LOCAL_WRITE`) and the declaration line of every entered method
+  (so enter/exit-only methods still surface). `OBJECT_FIRST_SEEN`/`THREAD_START` carry
+  symbol ids, not sites, and are skipped.
+- File key: the class's package path + the site's file name, `/`-joined
+  (`com/foo/Bar.java`; bare `Bar.java` in the default package) — exactly the relative
+  path the viewer's source resolution probes under each source root, so keys match
+  on-disk files without further mapping. Multiple classes in one file merge into one key.
+- On-disk format: header line `# hindsight lines v1 records=<total record count>`, then
+  one TSV row per file, sorted by key: `<key>\t<runs>` where runs are sorted,
+  comma-separated line numbers with `a-b` ranges (`14,16-19,42`).
+- Loading validates the header (version + record count matches the recording); a
+  mismatched or corrupt file is rebuilt, atomically replaced (temp file + move; run
+  values above the class-file line limit 65535 are treated as corruption). The index is
+  a pure derivation — deleting `lines.tsv` merely costs the next open a rescan — and
+  persisting it is BEST-EFFORT: an unwritable recording dir serves the freshly built
+  index from memory and simply rescans on the next open.
+- CLI: `lines --dir D` → builds (if absent/stale) and prints per-file visited-line
+  counts plus totals; exit 0.
 
 ## 13. Versioning
 
