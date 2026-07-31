@@ -5,9 +5,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 
 /**
- * Parsed command-line arguments for the viewer (VIEWER.md §1).
+ * Parsed command-line arguments for the viewer (VIEWER.md §1, §26.7).
  *
  * <p>Kept as a small immutable value object with a pure {@link #parse(String[])}
  * factory so the argument grammar can be unit-tested without constructing a
@@ -22,13 +23,16 @@ import java.util.OptionalInt;
  * @param sources explicit package roots gathered from every {@code --source} colon list
  * @param repos repository trees to auto-scan for source roots ({@code --repo}, repeatable)
  * @param tid the initial thread to focus ({@code --tid}), or empty for the engine default
+ * @param seq the record (global seq) to open on ({@code --seq}, §26.7), or empty
+ * @param last open on the last line-traced record ({@code --last}, §26.7)
  */
-public record CliArgs(Path dir, List<Path> sources, List<Path> repos, OptionalInt tid) {
+public record CliArgs(
+        Path dir, List<Path> sources, List<Path> repos, OptionalInt tid, OptionalLong seq, boolean last) {
 
     /** Usage string printed on a parse error or {@code --help}. */
     public static final String USAGE =
             "usage: viewer --dir <recordingDir> [--source <root1:root2:...>]... "
-                    + "[--repo <dir>]... [--tid N]";
+                    + "[--repo <dir>]... [--tid N] [--seq N | --last]";
 
     /** Thrown when the argument vector does not conform to §1; message is user-facing. */
     public static final class CliException extends RuntimeException {
@@ -42,7 +46,8 @@ public record CliArgs(Path dir, List<Path> sources, List<Path> repos, OptionalIn
 
     /**
      * Parses an argument vector into a {@link CliArgs}, throwing {@link CliException} with a
-     * user-facing message on any structural violation.
+     * user-facing message on any structural violation ({@code --seq} and {@code --last} are
+     * mutually exclusive, §26.7).
      *
      * @param argv the raw program arguments
      * @return the parsed arguments
@@ -53,6 +58,8 @@ public record CliArgs(Path dir, List<Path> sources, List<Path> repos, OptionalIn
         List<Path> sources = new ArrayList<>();
         List<Path> repos = new ArrayList<>();
         OptionalInt tid = OptionalInt.empty();
+        OptionalLong seq = OptionalLong.empty();
+        boolean last = false;
 
         for (int i = 0; i < argv.length; i++) {
             String a = argv[i];
@@ -74,13 +81,25 @@ public record CliArgs(Path dir, List<Path> sources, List<Path> repos, OptionalIn
                         throw new CliException("--tid must be an integer, got: " + v);
                     }
                 }
+                case "--seq" -> {
+                    String v = value(argv, ++i, a);
+                    try {
+                        seq = OptionalLong.of(Long.parseLong(v.trim()));
+                    } catch (NumberFormatException e) {
+                        throw new CliException("--seq must be an integer record number, got: " + v);
+                    }
+                }
+                case "--last" -> last = true;
                 default -> throw new CliException("unknown argument: " + a);
             }
         }
         if (dir == null) {
             throw new CliException("--dir <recordingDir> is required");
         }
-        return new CliArgs(dir, List.copyOf(sources), List.copyOf(repos), tid);
+        if (seq.isPresent() && last) {
+            throw new CliException("--seq and --last are mutually exclusive");
+        }
+        return new CliArgs(dir, List.copyOf(sources), List.copyOf(repos), tid, seq, last);
     }
 
     /** Reads the value token at {@code i}, or fails with a message naming the {@code flag}. */

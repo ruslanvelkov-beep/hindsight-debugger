@@ -134,6 +134,16 @@ public final class TreeView {
         selection = Math.max(selection - n, 0);
     }
 
+    /**
+     * §26.8: programmatic selection (the find-in-window jump) — clamped to the current row count
+     * on the next {@code rows()} call, like every other mutation.
+     *
+     * @param index the row index to select (negative selects the first row)
+     */
+    public void select(final int index) {
+        selection = Math.max(0, index);
+    }
+
     /** Selects the first row. */
     public void toFirst() {
         selection = 0;

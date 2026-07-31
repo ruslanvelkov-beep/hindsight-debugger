@@ -42,6 +42,34 @@ final class CliArgsTest {
         assertTrue(a.sources().isEmpty());
         assertTrue(a.repos().isEmpty());
         assertTrue(a.tid().isEmpty());
+        assertTrue(a.seq().isEmpty());
+        assertTrue(!a.last());
+    }
+
+    // ---- §26.7 opening-record flags ----
+
+    @Test
+    void seqAndLastParse() {
+        CliArgs s = CliArgs.parse(new String[] {"--dir", "/rec", "--seq", "2034516"});
+        assertEquals(2034516L, s.seq().orElseThrow());
+        assertTrue(!s.last());
+        CliArgs l = CliArgs.parse(new String[] {"--dir", "/rec", "--last"});
+        assertTrue(l.last());
+        assertTrue(l.seq().isEmpty());
+    }
+
+    @Test
+    void nonIntegerSeqFails() {
+        CliArgs.CliException e = assertThrows(CliArgs.CliException.class,
+                () -> CliArgs.parse(new String[] {"--dir", "/rec", "--seq", "abc"}));
+        assertTrue(e.getMessage().contains("--seq"));
+    }
+
+    @Test
+    void seqAndLastAreMutuallyExclusive() {
+        CliArgs.CliException e = assertThrows(CliArgs.CliException.class,
+                () -> CliArgs.parse(new String[] {"--dir", "/rec", "--seq", "5", "--last"}));
+        assertTrue(e.getMessage().contains("mutually exclusive"));
     }
 
     @Test

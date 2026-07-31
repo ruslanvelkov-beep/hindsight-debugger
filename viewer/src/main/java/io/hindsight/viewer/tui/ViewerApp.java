@@ -267,6 +267,24 @@ public final class ViewerApp {
     }
 
     /**
+     * Live state of the §26.8 find-in-window search for the four LIST windows (Threads, Stack,
+     * Locals, Records) — the Source window keeps its own §16.4 {@link SourceSearch}. Same field,
+     * same keys, same two-press boundary semantics; occurrences are per ROW ({@code {row+1, col}}
+     * pseudo-lines, so the §16.4 pure helpers apply unchanged) and a match moves the window's
+     * SELECTION rather than a source cursor.
+     */
+    private static final class ListSearch {
+        Win target = Win.THREADS;
+        boolean active;
+        final StringBuilder query = new StringBuilder();
+        List<int[]> occurrences = List.of();
+        int current = -1;
+        InFileSearch.Dir boundary;
+        boolean reverse;
+        boolean justFlipped;
+    }
+
+    /**
      * Live state of the §20.9/§22.11 global variable-change window ({@code V}): a case-insensitive
      * field-name {@code filter} (empty = all) plus a §22.11 {@code thread:} id filter, the
      * currently-built rows/hits/count-note (rebuilt on every filter/thread keystroke via
@@ -318,6 +336,8 @@ public final class ViewerApp {
     private SearchDialog dialog;
     // §15.5: the one persistent `/` dialog — kept across Esc/close so reopening restores it.
     private SearchDialog searchDialog;
+    // §26.1: the one persistent `.` dialog — same treatment as the `/` dialog.
+    private SearchDialog objectDialog;
     // §17.7: the persistent open-file browser state (lazily built on first `F`) + its open flag.
     private FileDialog fileDialog;
     private boolean fileDialogOpen;
@@ -330,6 +350,8 @@ public final class ViewerApp {
     private RecordJump recordJump;
     // §16.4: the Source Code in-file search state (one instance; `active` toggles it).
     private final SourceSearch sourceSearch = new SourceSearch();
+    // §26.8: the one find-in-window state, retargeted to whichever list window opened it.
+    private final ListSearch listSearch = new ListSearch();
     // §16.2: the tid last shown, so afterMove collapses Locals only on a real cross-thread jump.
     private int lastShownTid;
     private TerminalPosition cursorPos;
@@ -398,12 +420,18 @@ public final class ViewerApp {
             final Path recordingDir,
             final OptionalInt initialTid) {
         this(screen, engine, recording, sourcePath, recordingDir, initialTid,
-                LineIndex.openOrBuildUnchecked(recording));
+                LineIndex.openOrBuildUnchecked(recording), OptionalLong.empty(), false);
     }
 
     /**
-     * Full-injection constructor (§24.5): {@code lineIndex} is the FORMAT.md §12.1 visited-line
-     * index — normally pre-built by {@code Main} before the UI starts, injectable for tests.
+     * Full-injection constructor (§24.5/§26.7): {@code lineIndex} is the FORMAT.md §12.1
+     * visited-line index — normally pre-built by {@code Main} before the UI starts, injectable
+     * for tests. {@code initialSeq}/{@code startAtLast} pick the opening record (§26.7):
+     * {@code --seq N} lands on the nearest exec record at/before that seq; {@code --last} lands
+     * on the recording's LAST line-traced record; by default the viewer opens on the FIRST
+     * line-traced record of the initial thread ({@code --tid}, else thread 1) so the Source
+     * window shows a project file immediately — falling back to the engine's default position
+     * when the thread has no line records.
      */
     public ViewerApp(
             final Screen screen,
@@ -412,7 +440,9 @@ public final class ViewerApp {
             final SourcePath sourcePath,
             final Path recordingDir,
             final OptionalInt initialTid,
-            final LineIndex lineIndex) {
+            final LineIndex lineIndex,
+            final OptionalLong initialSeq,
+            final boolean startAtLast) {
         this.screen = screen;
         this.engine = engine;
         this.recording = recording;
@@ -424,16 +454,81 @@ public final class ViewerApp {
         this.recordingName = dirName != null ? dirName.toString() : this.recordingPath;
         this.tids = engine.threads();
         this.localsTree = new TreeView(engine::children);
+        boolean tidOk = true;
         if (initialTid.isPresent()) {
             StepResult r = engine.selectThread(initialTid.getAsInt());
             if (!r.moved()) {
-                status = r.message();
+                status = r.message(); // §26.7: a rejected --tid must stay visible
+                tidOk = false;
             }
         }
+        openAtInitialPosition(initialTid.isPresent() && tidOk, initialSeq, startAtLast);
         threadSel = Math.max(0, tids.indexOf(engine.currentTid()));
         stackSel = 0;
         lastShownTid = engine.currentTid(); // §16.2: seed so the first in-thread step never collapses
         appendHistory(); // seed the trail with the initial landing so Records is never empty (§11.5)
+    }
+
+    /** §26.7: position the engine on the requested opening record (see the constructor javadoc). */
+    private void openAtInitialPosition(
+            final boolean tidPinned, final OptionalLong initialSeq, final boolean startAtLast) {
+        if (initialSeq.isPresent()) {
+            // §26.7: nearest record at/before the seq — real recordings have in-range seq holes
+            // (unflushed counter ticks), so an exact match must not be required.
+            SeqLocation loc = engine.findSeqAtOrBefore(initialSeq.getAsLong());
+            if (loc.found()) {
+                landOnNearestExecAtOrBefore(loc.tid(), loc.index());
+                status = "opened at seq " + engine.currentSeq() + " (t" + engine.currentTid() + ")";
+            } else {
+                status = "no record at or before seq " + initialSeq.getAsLong()
+                        + " — opened at the default position";
+            }
+            return;
+        }
+        if (startAtLast) {
+            // The recording's LAST line-traced record: each line-bearing thread's last LINE is
+            // one binary search away from its final record; the greatest seq across threads wins.
+            long bestSeq = -1;
+            int bestTid = 0;
+            long bestIndex = 0;
+            for (int t : tids) {
+                if (!engine.threadHasLines(t)) {
+                    continue;
+                }
+                engine.seek(t, count(t) - 1);
+                if (rec(engine.currentTid(), engine.currentIndex()).type() != Format.LINE
+                        && !engine.toLineTrace(false).moved()) {
+                    continue;
+                }
+                if (engine.currentSeq() > bestSeq) {
+                    bestSeq = engine.currentSeq();
+                    bestTid = engine.currentTid();
+                    bestIndex = engine.currentIndex();
+                }
+            }
+            if (bestSeq >= 0) {
+                engine.seek(bestTid, bestIndex);
+                status = "opened at the last line-traced record: seq " + engine.currentSeq()
+                        + " (t" + engine.currentTid() + ")";
+            } else {
+                status = "no line-traced records — opened at the default position";
+            }
+            return;
+        }
+        // Default: the FIRST line-traced record of the initial thread (an accepted --tid, else
+        // thread 1), so the Source window opens on a project file. Threads without lines keep
+        // the engine default; a rejected --tid keeps its error status visible.
+        int target = tidPinned ? engine.currentTid() : 1;
+        if (tids.contains(target) && engine.threadHasLines(target)) {
+            engine.seek(target, 0);
+            if (rec(engine.currentTid(), engine.currentIndex()).type() != Format.LINE) {
+                engine.toLineTrace(true);
+            }
+            if (status.isEmpty()) {
+                status = "opened at the first line-traced record of t" + target
+                        + ": seq " + engine.currentSeq();
+            }
+        }
     }
 
     /**
@@ -720,37 +815,66 @@ public final class ViewerApp {
      */
     private void renderSourceSearchField(
             final TextGraphics g, final Layout.Rect rect, final TextColor border, final boolean bold) {
+        renderSearchFieldOver(g, rect, border, bold, sourceSearch.reverse,
+                sourceSearch.boundary != null, sourceSearch.justFlipped, sourceSearch.query.toString());
+    }
+
+    /**
+     * The shared title-row search-field painter (§20.7/§26.8) — the Source in-file search and the
+     * list-window find draw the identical {@code [ Search ↓: … ]} field over their window's title.
+     */
+    private void renderSearchFieldOver(
+            final TextGraphics g, final Layout.Rect rect, final TextColor border, final boolean bold,
+            final boolean reverse, final boolean boundaryArmed, final boolean justFlipped,
+            final String query) {
         int startX = rect.col() + 2; // the '[' column
         int endBracket = rect.col() + rect.width() - 3; // the ']' column: 2 cols inside the corner
-        String prefix = InFileSearch.searchPrefix(sourceSearch.reverse);
+        String prefix = InFileSearch.searchPrefix(reverse);
         int prefixLen = prefix.length();
         int inputW = endBracket - startX - prefixLen; // the input area fills the rest of the row
         if (inputW <= 0) {
             return; // too narrow to draw a sensible field
         }
-        String visible = InFileSearch.visibleInput(sourceSearch.query.toString(), inputW);
+        String visible = InFileSearch.visibleInput(query, inputW);
         StringBuilder box = new StringBuilder(prefix).append(visible);
         while (box.length() < prefixLen + inputW) {
             box.append(' ');
         }
         box.append(']'); // ends exactly at endBracket
         // §20.7: always yellow-on-black; the §19.4 armed-boundary state inverts the whole field fg/bg.
-        boolean invert = sourceSearch.boundary != null;
+        boolean invert = boundaryArmed;
         TextColor fieldFg = invert ? TextColor.ANSI.BLACK : TextColor.ANSI.YELLOW;
         TextColor fieldBg = invert ? TextColor.ANSI.YELLOW : TextColor.ANSI.BLACK;
         put(g, startX, rect.row(), box.toString(), fieldFg, fieldBg, false);
         // §21.2: on a fresh Tab flip, repaint the ONE arrow cell inverted relative to the field as a
-        // transient cue (cleared as soon as the user types or presses Enter — see handleSourceSearch).
-        if (sourceSearch.justFlipped) {
+        // transient cue (cleared as soon as the user types or presses Enter).
+        if (justFlipped) {
             put(g, startX + InFileSearch.ARROW_OFFSET, rect.row(),
-                    String.valueOf(InFileSearch.directionArrow(sourceSearch.reverse)), fieldBg, fieldFg, false);
+                    String.valueOf(InFileSearch.directionArrow(reverse)), fieldBg, fieldFg, false);
         }
         // Restore the ONE border cell between ']' (endBracket) and the corner (endBracket+2) so a
-        // long browse title cannot leak through it — the field itself covers everything up to ']'.
+        // long title cannot leak through it — the field itself covers everything up to ']'.
         put(g, endBracket + 1, rect.row(), "─", border, Palette.BG, bold);
         // §19.4 visible cursor: the caret column, clamped into the input area.
         int caret = startX + prefixLen + Math.min(visible.length(), inputW - 1);
         cursorPos = new TerminalPosition(caret, rect.row());
+    }
+
+    /** §26.8: paints the find field over {@code win}'s title when the list search targets it. */
+    private void maybeRenderListSearchField(
+            final TextGraphics g, final Layout.Rect rect, final boolean focused, final Win win) {
+        if (listSearch.active && listSearch.target == win) {
+            renderSearchFieldOver(g, rect, focused ? Palette.FOCUS : Palette.UNFOCUS, focused,
+                    listSearch.reverse, listSearch.boundary != null, listSearch.justFlipped,
+                    listSearch.query.toString());
+        }
+    }
+
+    /** §26.8: the highlight query for {@code win}'s rows, or {@code null} when not searching it. */
+    private String listSearchQuery(final Win win) {
+        return listSearch.active && listSearch.target == win && listSearch.query.length() > 0
+                ? listSearch.query.toString()
+                : null;
     }
 
     /** The lines currently shown in the Source window: browse lines, else the selected frame's source. */
@@ -853,18 +977,28 @@ public final class ViewerApp {
         if (iw <= 0 || ih <= 0) {
             return;
         }
-        int cur = engine.currentTid();
-        List<String> rows = new ArrayList<>();
+        List<String> rows = threadRowTexts();
         List<TextColor> rowFg = new ArrayList<>();
         for (int tid : tids) {
-            String mark = tid == cur ? "* " : "  ";
-            rows.add(mark + "t" + tid + "  \"" + engine.threadName(tid) + "\"  (" + count(tid) + ")");
             // §18.3: threads with no LINE records at all render light green; '*' text unchanged.
             rowFg.add(engine.threadHasLines(tid) ? Palette.FG : Palette.CALLS_ONLY_FG);
         }
         threadSel = clamp(threadSel, 0, Math.max(0, rows.size() - 1));
         threadScroll = ScrollMath.adjustScroll(threadScroll, threadSel, ih, rows.size());
-        drawRows(g, ix, iy, iw, ih, rows, threadSel, threadScroll, threadsHcol, true, rowFg);
+        drawRows(g, ix, iy, iw, ih, rows, threadSel, threadScroll, threadsHcol, true, rowFg,
+                listSearchQuery(Win.THREADS));
+        maybeRenderListSearchField(g, rect, focused, Win.THREADS); // §26.8: over title + name
+    }
+
+    /** §26.8: the Threads rows exactly as rendered (search matches what the user sees). */
+    private List<String> threadRowTexts() {
+        int cur = engine.currentTid();
+        List<String> rows = new ArrayList<>();
+        for (int tid : tids) {
+            String mark = tid == cur ? "* " : "  ";
+            rows.add(mark + "t" + tid + "  \"" + engine.threadName(tid) + "\"  (" + count(tid) + ")");
+        }
+        return rows;
     }
 
     /**
@@ -909,15 +1043,7 @@ public final class ViewerApp {
             return;
         }
         List<Frame> frames = engine.stack();
-        int sf = engine.selectedFrame();
-        List<String> rows = new ArrayList<>();
-        for (int i = frames.size() - 1; i >= 0; i--) {
-            Frame f = frames.get(i);
-            String mark = i == sf ? "* " : "  ";
-            String m = f.methodName() != null ? f.methodName() : "?";
-            rows.add(mark + simpleClass(f.classBinary()) + "." + m + Descriptors.simplifyParams(f.descriptor())
-                    + " (" + (f.fileName() != null ? f.fileName() : "?") + ":" + f.currentLine() + ")");
-        }
+        List<String> rows = stackRowTexts();
         stackSel = clamp(stackSel, 0, Math.max(0, rows.size() - 1));
         stackScroll = ScrollMath.adjustScroll(stackScroll, stackSel, ih, rows.size());
         // §14.5: unrecorded (capture-only) frames render DIM, same row text; selection as usual.
@@ -937,7 +1063,24 @@ public final class ViewerApp {
             put(g, ix, iy + r, HScroll.clip(rows.get(idx), stackHcol, iw),
                     s ? selFg : fg,
                     s ? Palette.SELECTION_BG : Palette.BG, false);
+            overlayRowMatches(g, ix, iy + r, rows.get(idx), stackHcol, iw, listSearchQuery(Win.STACK));
         }
+        maybeRenderListSearchField(g, rect, focused, Win.STACK);
+    }
+
+    /** §26.8: the Stack rows (innermost first) exactly as rendered. */
+    private List<String> stackRowTexts() {
+        List<Frame> frames = engine.stack();
+        int sf = engine.selectedFrame();
+        List<String> rows = new ArrayList<>();
+        for (int i = frames.size() - 1; i >= 0; i--) {
+            Frame f = frames.get(i);
+            String mark = i == sf ? "* " : "  ";
+            String m = f.methodName() != null ? f.methodName() : "?";
+            rows.add(mark + simpleClass(f.classBinary()) + "." + m + Descriptors.simplifyParams(f.descriptor())
+                    + " (" + (f.fileName() != null ? f.fileName() : "?") + ":" + f.currentLine() + ")");
+        }
+        return rows;
     }
 
     private void renderLocals(final TextGraphics g, final Layout.Rect rect) {
@@ -960,6 +1103,7 @@ public final class ViewerApp {
             // §14.5: a capture-only frame has no reconstructable locals.
             localsTree.setRoots(List.of());
             put(g, ix, iy, clip("(unrecorded frame — no locals)", iw), Palette.DIM, Palette.BG, false);
+            maybeRenderListSearchField(g, rect, focused, Win.LOCALS); // §26.8: never an invisible field
             return;
         }
         List<Local> locals = engine.locals(sf);
@@ -979,7 +1123,8 @@ public final class ViewerApp {
                 localsSelDescriptor = locals.get(rootIdx).descriptor();
             }
         }
-        drawTree(g, ix, iy, iw, ih, localsTree, localsHcol);
+        drawTree(g, ix, iy, iw, ih, localsTree, localsHcol, listSearchQuery(Win.LOCALS));
+        maybeRenderListSearchField(g, rect, focused, Win.LOCALS);
     }
 
     private void renderRecords(final TextGraphics g, final Layout.Rect rect) {
@@ -993,18 +1138,27 @@ public final class ViewerApp {
         if (iw <= 0 || ih <= 0) {
             return;
         }
-        List<HistoryTrail.HistoryEntry> entries = history.entries();
-        if (entries.isEmpty()) {
+        List<String> rows = recordRowTexts();
+        if (rows.isEmpty()) {
             put(g, ix, iy, clip("(no navigation yet — step to record history)", iw), Palette.DIM, Palette.BG, false);
+            maybeRenderListSearchField(g, rect, focused, Win.RECORDS); // §26.8: never an invisible field
             return;
         }
+        recordsSel = clamp(recordsSel, 0, rows.size() - 1);
+        recordsScroll = ScrollMath.adjustScroll(recordsScroll, recordsSel, ih, rows.size());
+        drawRows(g, ix, iy, iw, ih, rows, recordsSel, recordsScroll, recordsHcol, true, null,
+                listSearchQuery(Win.RECORDS));
+        maybeRenderListSearchField(g, rect, focused, Win.RECORDS);
+    }
+
+    /** §26.8: the Records rows exactly as rendered. */
+    private List<String> recordRowTexts() {
+        List<HistoryTrail.HistoryEntry> entries = history.entries();
         List<String> rows = new ArrayList<>(entries.size());
         for (HistoryTrail.HistoryEntry e : entries) {
             rows.add(HistoryTrail.render(e));
         }
-        recordsSel = clamp(recordsSel, 0, rows.size() - 1);
-        recordsScroll = ScrollMath.adjustScroll(recordsScroll, recordsSel, ih, rows.size());
-        drawRows(g, ix, iy, iw, ih, rows, recordsSel, recordsScroll, recordsHcol, true);
+        return rows;
     }
 
     /** §19.3 green info-line suffix appended (after 10 spaces) to the position text in a green context. */
@@ -1051,12 +1205,18 @@ public final class ViewerApp {
         if (dialog != null && dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
             InstanceBrowse.Row row = selectedInstanceRow();
             if (row != null) {
-                return (row.classBinary() != null ? row.classBinary() : "?") + "#" + row.objectId();
+                // §26.6: the explored NODE's value (scalar/boxed/atomic/string) rides after the
+                // owning instance's class#id, so values peek without expanding further.
+                return (row.classBinary() != null ? row.classBinary() : "?") + "#" + row.objectId()
+                        + exploredValueSuffix(selectedInstanceNodeValue());
             }
         } else if (dialog == null && focus == Win.LOCALS) {
             String type = TypeName.of(localsSelValue, localsSelDescriptor, recording::objectClassName);
             if (type != null) {
-                return type;
+                // §26.6: append the value unless the "type" text already IS the rendered value
+                // (the descriptor-less primitive fallthrough) — no point printing it twice.
+                String suffix = exploredValueSuffix(localsSelValue);
+                return suffix.equals("  =  " + type) ? type : type + suffix;
             }
         } else if (dialog == null && focus == Win.STACK) {
             Frame f = selectedFrameOrNull();
@@ -1070,6 +1230,37 @@ public final class ViewerApp {
             }
         }
         return "seq " + ri.seq() + DOT + "t" + ri.tid() + DOT + ri.siteText();
+    }
+
+    /**
+     * §26.6: the info-line value suffix {@code "  =  <value>"} for an explored scalar-ish node —
+     * a native/boxed primitive ({@link Value.Primitive}, whose rendered text already carries the
+     * §20.5 hex and the §26.4 date when the number reads as one), a string ({@link Value.Str} —
+     * it simply fills the line to its end), or a scalar wrapper reference
+     * ({@code StringBuilder}/{@code StringBuffer}/{@code AtomicInteger}/{@code AtomicLong}/
+     * {@code AtomicBoolean}, whose display embeds the inline {@code [ value ]}). Anything else
+     * (plain refs, null, absent) yields no suffix.
+     */
+    private String exploredValueSuffix(final Value v) {
+        return switch (v) {
+            case Value.Primitive p -> "  =  " + p.rendered();
+            case Value.Str s -> "  =  " + s.display();
+            case Value.Ref ref when engine.isScalarWrapper(ref.objectId()) -> "  =  " + ref.display();
+            case null, default -> "";
+        };
+    }
+
+    /** §26.6: the value of the SELECTED instance-tree node (any depth), or {@code null}. */
+    private Value selectedInstanceNodeValue() {
+        if (dialog == null || dialog.instanceTree == null) {
+            return null;
+        }
+        List<TreeView.Row> rows = dialog.instanceTree.rows();
+        if (rows.isEmpty()) {
+            return null;
+        }
+        int sel = clamp(dialog.instanceTree.selection(), 0, rows.size() - 1);
+        return rows.get(sel).node().value();
     }
 
     /**
@@ -1138,10 +1329,11 @@ public final class ViewerApp {
             case SOURCE -> browseMode
                     ? "↑↓ cursor  v var-history  Alt-F search  <> hscroll  o return  g/G/Home/End"
                     : "↑↓ cursor  v var-history  Alt-F search  ←→/<> hscroll  g/G/Home/End";
-            case THREADS -> "↑↓ select  ↵ switch  ←→/<> hscroll";
-            case STACK -> "↑↓ select frame  ←→/<> hscroll";
-            case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  <> hscroll";
-            case RECORDS -> "↑↓ select  ↵ jump  r record#  ←→/<> hscroll"; // §22.13: r (was c)
+            case THREADS -> "↑↓ select  ↵ switch  Alt-F find  ←→/<> hscroll";
+            case STACK -> "↑↓ select frame  Alt-F find  ←→/<> hscroll";
+            case LOCALS -> "↑↓ move  →/↵ expand  ← collapse  Alt-F find  <> hscroll";
+            case RECORDS -> // §22.13: r (was c); §26.9: +/- cross-thread exec step
+                    "↑↓ select  ↵ jump  r record#  +/- next/prev exec any-thread  Alt-F find  ←→/<> hscroll";
         };
         put(g, 0, row, clipPad(ctx + "  |  " + base, cols), Palette.DIM, Palette.BG, false);
     }
@@ -1150,15 +1342,21 @@ public final class ViewerApp {
 
     private void drawTree(
             final TextGraphics g, final int ix, final int iy, final int iw, final int ih,
-            final TreeView tree, final int hcol) {
+            final TreeView tree, final int hcol, final String matchQuery) {
+        List<String> text = treeRowTexts(tree);
+        tree.ensureVisible(ih, text.size());
+        drawRows(g, ix, iy, iw, ih, text, tree.selection(), tree.scroll(), hcol, true, null, matchQuery);
+    }
+
+    /** §26.8: a TreeView's visible rows exactly as {@link #drawTree} renders them. */
+    private static List<String> treeRowTexts(final TreeView tree) {
         List<TreeView.Row> rows = tree.rows();
-        tree.ensureVisible(ih, rows.size());
         List<String> text = new ArrayList<>(rows.size());
         for (TreeView.Row r : rows) {
             String glyph = r.expandable() ? (r.expanded() ? "▾ " : "▸ ") : "  ";
             text.add("  ".repeat(r.depth()) + glyph + r.node().label());
         }
-        drawRows(g, ix, iy, iw, ih, text, tree.selection(), tree.scroll(), hcol, true);
+        return text;
     }
 
     private void drawRows(
@@ -1172,7 +1370,7 @@ public final class ViewerApp {
             final int scroll,
             final int hcol,
             final boolean showSel) {
-        drawRows(g, ix, iy, iw, ih, rows, sel, scroll, hcol, showSel, null);
+        drawRows(g, ix, iy, iw, ih, rows, sel, scroll, hcol, showSel, null, null);
     }
 
     /**
@@ -1192,6 +1390,27 @@ public final class ViewerApp {
             final int hcol,
             final boolean showSel,
             final List<TextColor> rowFg) {
+        drawRows(g, ix, iy, iw, ih, rows, sel, scroll, hcol, showSel, rowFg, null);
+    }
+
+    /**
+     * The full variant (§18.3 per-row foreground + §26.8 find-in-window highlight): every visible
+     * occurrence of {@code matchQuery} within a row's clipped text repaints reverse-video on top,
+     * selected and unselected rows alike (the §20.7 style).
+     */
+    private void drawRows(
+            final TextGraphics g,
+            final int ix,
+            final int iy,
+            final int iw,
+            final int ih,
+            final List<String> rows,
+            final int sel,
+            final int scroll,
+            final int hcol,
+            final boolean showSel,
+            final List<TextColor> rowFg,
+            final String matchQuery) {
         for (int r = 0; r < ih; r++) {
             int idx = scroll + r;
             if (idx < 0 || idx >= rows.size()) {
@@ -1204,6 +1423,27 @@ public final class ViewerApp {
             TextColor selFg = fg == Palette.CALLS_ONLY_FG ? Palette.CALLS_ONLY_FG : Palette.SELECTION_FG;
             put(g, ix, iy + r, HScroll.clip(rows.get(idx), hcol, iw),
                     s ? selFg : fg, s ? Palette.SELECTION_BG : Palette.BG, false);
+            overlayRowMatches(g, ix, iy + r, rows.get(idx), hcol, iw, matchQuery);
+        }
+    }
+
+    /**
+     * §26.8: repaints {@code query} matches of one already-painted row, reverse-video. Matches are
+     * found on the FULL row text and each span clipped into the {@code [hcol, hcol+iw)} viewport
+     * (the §20.7 Source behavior), so a match half-scrolled off an edge keeps its visible part.
+     */
+    private void overlayRowMatches(final TextGraphics g, final int x, final int y,
+            final String fullRow, final int hcol, final int iw, final String query) {
+        if (query == null || query.isEmpty()) {
+            return;
+        }
+        for (int[] span : InFileSearch.matchColumns(fullRow, query, TAB_WIDTH)) {
+            int from = Math.max(span[0], hcol);
+            int to = Math.min(Math.min(span[1], hcol + iw), fullRow.length());
+            if (to > from) {
+                put(g, x + (from - hcol), y, fullRow.substring(from, to),
+                        Palette.SEARCH_MATCH_FG, Palette.SEARCH_MATCH_BG, false);
+            }
         }
     }
 
@@ -1346,7 +1586,6 @@ public final class ViewerApp {
             drawInstanceTree(g, ix, listTop, iw, listH);
             return;
         }
-        boolean numbered = dialog.kind == DialogKind.METHOD; // §15.4: `/` rows only
         dialog.sel = clamp(dialog.sel, 0, dialog.rows.size() - 1);
         // §13.1: adjust the persisted offset incrementally — never recompute from 0.
         dialog.scroll = ScrollMath.adjustScroll(dialog.scroll, dialog.sel, listH, dialog.rows.size());
@@ -1362,22 +1601,24 @@ public final class ViewerApp {
             }
             // §22.3/§24.1: both dialogs clear the list highlight while an input field has focus.
             boolean s = idx == dialog.sel && dialog.focus == DialogFocus.LIST;
-            String text = numbered
-                    ? DialogFormat.number(idx, dialog.rows.size()) + dialog.rows.get(idx)
-                    : dialog.rows.get(idx) + dialog.chains.getOrDefault(idx, "");
+            // §15.4/§26.1: both flat lists number their rows from 1.
+            String text = DialogFormat.number(idx, dialog.rows.size()) + dialog.rows.get(idx)
+                    + (dialog.kind == DialogKind.OBJECT ? dialog.chains.getOrDefault(idx, "") : "");
             // §24.1: rows participate in the <>/←→/^K^L horizontal scroll, whole row included.
             String visible = HScroll.clip(text, dialog.hcol, iw);
             TextColor fg = s ? Palette.SELECTION_FG : Palette.FG;
             TextColor bg = s ? Palette.SELECTION_BG : Palette.DIALOG_BG;
             put(g, ix, listTop + r, clipPad(visible, iw), fg, bg, false);
             if (dialog.kind == DialogKind.OBJECT && !query.isEmpty()) {
-                // §24.2: every occurrence of the typed filter within the visible text repaints
-                // reverse-video, exactly like the §22.2 file-browser match highlight.
-                for (int[] span : InFileSearch.matchColumns(visible, query, TAB_WIDTH)) {
-                    int from = Math.max(0, span[0]);
-                    int to = Math.min(visible.length(), span[1]);
+                // §24.2/§26.1: every occurrence of the typed filter repaints reverse-video —
+                // matched on the row CONTENT (past the §26.1 number prefix, so a digits query
+                // does not light the number column), spans clipped into the hcol viewport.
+                int prefixLen = DialogFormat.number(idx, dialog.rows.size()).length();
+                for (int[] span : InFileSearch.matchColumns(text.substring(prefixLen), query, TAB_WIDTH)) {
+                    int from = Math.max(prefixLen + span[0], dialog.hcol);
+                    int to = Math.min(Math.min(prefixLen + span[1], dialog.hcol + iw), text.length());
                     if (to > from) {
-                        put(g, ix + from, listTop + r, visible.substring(from, to),
+                        put(g, ix + (from - dialog.hcol), listTop + r, text.substring(from, to),
                                 Palette.SEARCH_MATCH_FG, Palette.SEARCH_MATCH_BG, false);
                     }
                 }
@@ -1389,12 +1630,12 @@ public final class ViewerApp {
     private String searchHint() {
         if (dialog.kind == DialogKind.OBJECT) {
             if (dialog.focus == DialogFocus.QUERY) {
-                return "type #id or class  → thread  ↓ results  ^U clear  Esc";
+                return "type #id, Class#id or class  ⇥/^T thread  ↓ results  ^U clear  Esc";
             }
             if (dialog.focus == DialogFocus.THREAD) {
-                return "digits: filter by thread id  ← query  ↓ results  ^U clear  Esc";
+                return "digits: filter by thread id  ⇥/^F query  ↓ results  ^U clear  Esc";
             }
-            return "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K^L hscroll  ^F/^B pg  g/G  / query  Esc";
+            return "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K^L hscroll  PgUp/PgDn  ^F/^T fields  g/G  Esc";
         }
         if (dialog.focus == DialogFocus.QUERY) {
             return dialog.instancesMode
@@ -1405,8 +1646,8 @@ public final class ViewerApp {
             return "digits: filter by thread id  ← regex  ↓ results  ^U clear  Esc";
         }
         return dialog.instancesMode
-                ? "↑↓ move  →/↵ expand  ← collapse  f first-mention  / query  Esc close"
-                : "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K^L hscroll  ^F/^B pg  g/G  / query  Esc";
+                ? "↑↓ move  →/↵ expand  ← collapse  f first-mention  ^F/^T fields  / query  Esc"
+                : "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K^L hscroll  PgUp/PgDn  ^F/^T fields  g/G  Esc";
     }
 
     /**
@@ -1592,17 +1833,22 @@ public final class ViewerApp {
             "Ctrl+D                show the recording directory's full path",
             "c t s l r             focus Source/Threads/Stack/Locals/Records",
             "r (in Records)        jump to a record by seq  (l fills the last)",
+            "+/= -/_ (in Records)  next / prev record with line info or",
+            "                      method enter/exit — ANY thread (unlike F7)",
             "Tab / Shift+Tab       cycle focus forward / backward",
             "Arrows PgUp PgDn      navigate the focused window",
             "Ctrl+U / Ctrl+N       scroll focused window up / down one line",
             "Ctrl+K / Ctrl+L       hscroll left / right (= < / > and ←/→)",
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End     page / jump to ends;  g / G  top/bottom",
+            "^F ^T (in dialogs)    focus the filter / thread field (⇥ in .)",
             "v                     variable history for the cursor line",
             "V                     global variable-change list (field filter)",
-            "Alt-F                 Source in-file search (Tab flips ↓/↑; ↵ search)",
+            "Alt-F                 find in Source / the focused list window",
+            "                      (Tab flips ↓/↑; ↵ searches; Esc closes)",
             "/  .  F               browse calls / find object / open file",
             "Tab in /              calls ↔ instances;  → thread;  f first-mention",
+            "Tab in .              query ↔ thread;  ↵ jump to the usage record",
             "green                 enter/exit-only (no line records)",
             "?  F1                 toggle this help window",
             "q  Ctrl+X             quit (open the confirm box)",
@@ -1762,6 +2008,10 @@ public final class ViewerApp {
                 handleSourceSearch(k);
                 return;
             }
+            if (listSearch.active) {
+                handleListSearch(k); // §26.8: same interception for the list-window search
+                return;
+            }
             // §12.4/§21.8 quit: only q / Ctrl-X open the confirm box (Ctrl-C no longer quits). Ctrl-Q
             // is NOT quit (it is the §21.7 backward run-to-line), so plain-q must exclude a Ctrl mod.
             if ((isChar(k, 'q') && !k.isCtrlDown()) || isCtrlX(k)) {
@@ -1905,6 +2155,16 @@ public final class ViewerApp {
             origin();
             return true;
         }
+        // §16.4/§26.8: Alt-F opens find — the Source in-file search, or the focused list
+        // window's row search (Threads/Stack/Locals/Records).
+        if (isChar(k, 'f') && k.isAltDown()) {
+            if (focus == Win.SOURCE) {
+                enterSourceSearch();
+            } else {
+                enterListSearch();
+            }
+            return true;
+        }
         // Per-window horizontal scroll (§11.4).
         if (isChar(k, '<')) {
             hscrollFocused(-HSTEP);
@@ -2018,8 +2278,6 @@ public final class ViewerApp {
             setSrcCursor(lastLine);
         } else if (isChar(k, 'v') && !k.isCtrlDown() && !k.isAltDown()) {
             varHistory();
-        } else if (isChar(k, 'f') && k.isAltDown()) {
-            enterSourceSearch(); // §16.4: mirror the Alt-R dispatch
         }
     }
 
@@ -2158,6 +2416,16 @@ public final class ViewerApp {
             recordJump = new RecordJump(); // §16.3
             return;
         }
+        // §26.9: +/= jump to the NEXT and -/_ to the PREVIOUS record with line info or method
+        // enter/exit by GLOBAL seq — crossing threads freely (unlike F7/⇧F7, which stay put).
+        if (isChar(k, '+') || isChar(k, '=')) {
+            doStep(engine.toExecAnyThread(true));
+            return;
+        }
+        if (isChar(k, '-') || isChar(k, '_')) {
+            doStep(engine.toExecAnyThread(false));
+            return;
+        }
         if (t == KeyType.ArrowLeft) {
             recordsHcol = Math.max(0, recordsHcol - HSTEP);
         } else if (t == KeyType.ArrowRight) {
@@ -2192,7 +2460,7 @@ public final class ViewerApp {
         if (kind == DialogKind.METHOD) {
             // §15.5: the `/` dialog is persistent — reopening restores mode, query, results,
             // selection, scroll, expansion and focus exactly (expanded trees still re-resolve
-            // as-of the current seq at render time). `.`/`F` stay transient below.
+            // as-of the current seq at render time).
             if (searchDialog == null) {
                 searchDialog = new SearchDialog(kind);
                 searchDialog.instanceTree = new TreeView(engine::children);
@@ -2207,8 +2475,18 @@ public final class ViewerApp {
             }
             return;
         }
-        dialog = new SearchDialog(kind);
-        recomputeDialog();
+        // §26.1: the `.` dialog is persistent too — close/reopen continues from the same query,
+        // thread filter, results, selection, scroll and focus (the chains cache rides along, its
+        // row-index keys still matching the preserved result list).
+        if (objectDialog == null) {
+            objectDialog = new SearchDialog(kind);
+            dialog = objectDialog;
+            recomputeDialog();
+        } else {
+            dialog = objectDialog;
+            objectDialog.caretRegex = objectDialog.query.length();
+            objectDialog.caretThread = objectDialog.threadQuery.length();
+        }
     }
 
     private void handleDialog(final KeyStroke k) {
@@ -2228,11 +2506,28 @@ public final class ViewerApp {
      * depending on {@code dialog.focus}.
      */
     private void handleSearchDialog(final KeyStroke k) {
-        if (k.getKeyType() == KeyType.Tab && dialog.kind == DialogKind.METHOD) {
-            dialog.instancesMode = !dialog.instancesMode;
-            dialog.sel = 0;
-            dialog.scroll = 0;
-            recomputeDialog();
+        if (k.getKeyType() == KeyType.Tab) {
+            if (dialog.kind == DialogKind.METHOD) {
+                dialog.instancesMode = !dialog.instancesMode;
+                dialog.sel = 0;
+                dialog.scroll = 0;
+                recomputeDialog();
+            } else {
+                // §26.2: in the `.` dialog Tab toggles the query ↔ thread fields (from the LIST
+                // it enters the primary query field first; the `/` browser keeps Tab for its
+                // calls ↔ instances mode — use ^T/^F there).
+                focusDialogField(dialog.focus == DialogFocus.QUERY ? DialogFocus.THREAD : DialogFocus.QUERY);
+            }
+            return;
+        }
+        // §26.2: ^F focuses the filter/query field and ^T the thread field, from ANY focus —
+        // both dialogs. (^F therefore no longer pages the list; PgDn and ^B/PgUp still do.)
+        if (k.isCtrlDown() && isChar(k, 'f')) {
+            focusDialogField(DialogFocus.QUERY);
+            return;
+        }
+        if (k.isCtrlDown() && isChar(k, 't')) {
+            focusDialogField(DialogFocus.THREAD);
             return;
         }
         if (dialog.focus == DialogFocus.QUERY) {
@@ -2241,6 +2536,16 @@ public final class ViewerApp {
             handleSearchThreadKey(k);
         } else {
             handleSearchListKey(k);
+        }
+    }
+
+    /** §26.2: focus a dialog input field with its caret at the end (Tab / ^F / ^T jumps). */
+    private void focusDialogField(final DialogFocus field) {
+        dialog.focus = field;
+        if (field == DialogFocus.THREAD) {
+            dialog.caretThread = dialog.threadQuery.length();
+        } else {
+            dialog.caretRegex = dialog.query.length();
         }
     }
 
@@ -2403,8 +2708,9 @@ public final class ViewerApp {
     }
 
     /**
-     * LIST-focus keys (§15.2/§24.1, shared by {@code /} and {@code .}): ↑/↓ move, Ctrl-F/Ctrl-B
-     * and PgDn/PgUp page, {@code g}/{@code G} jump to the first/last row; the four §20.13
+     * LIST-focus keys (§15.2/§24.1, shared by {@code /} and {@code .}): ↑/↓ move, PgDn/PgUp
+     * (and Ctrl-B) page — Ctrl-F/Ctrl-T focus the filter/thread fields instead (§26.2) —
+     * {@code g}/{@code G} jump to the first/last row; the four §20.13
      * per-window scroll keys work like in every other window — Ctrl-U/Ctrl-N scroll the viewport
      * one line and Ctrl-K/Ctrl-L (with {@code <}/{@code >}) scroll horizontally. In instances
      * mode →/↵ expand, ← collapses, {@code f} jumps to the selected row's owning instance's first
@@ -2439,7 +2745,7 @@ public final class ViewerApp {
             moveSearchSelection(-page);
             return;
         }
-        if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
+        if (t == KeyType.PageDown) {
             moveSearchSelection(page);
             return;
         }
@@ -2702,11 +3008,12 @@ public final class ViewerApp {
             dialog.objectIds = objectIds;
             return;
         }
-        String idText = q.startsWith("#") ? q.substring(1) : q;
-        Long id = null;
-        if (idText.matches("\\d+")) {
+        // §26.1: the `/` instances grammar decides id-vs-class — so "Timestamp#123" (and "#123")
+        // selects the specific object exactly like the slash command; bare digits stay an id too.
+        Long id = InstanceBrowse.parseQuery(q).objectId();
+        if (id == null && q.matches("\\d+")) {
             try {
-                id = Long.parseLong(idText);
+                id = Long.parseLong(q);
             } catch (NumberFormatException e) {
                 id = null;
             }
@@ -2822,8 +3129,9 @@ public final class ViewerApp {
      * Each chain answers: is the row's object directly accessible in the record's own frame
      * (a local, an argument or {@code this})? If yes the suffix is empty; if not, it is
      * {@code " -> parent -> … -> name=Class#id"} — the object's containment chain, walked
-     * upward until an object that IS directly accessible; {@code " -> ?"} when no chain to an
-     * accessible object was found within the §24.3 depth/budget limits.
+     * upward until an object that IS directly accessible; empty when no chain to an accessible
+     * object was found within the §24.3 depth/budget limits (§26.1 dropped the old
+     * {@code " -> ?"} marker as noise).
      */
     private void ensureObjectChains(final int from, final int to) {
         if (dialog == null || dialog.kind != DialogKind.OBJECT) {
@@ -2870,7 +3178,7 @@ public final class ViewerApp {
         engine.seek((int) target[0], target[1]);
         int top = engine.stack().size() - 1;
         if (top < 0) {
-            return " -> ?"; // no frame context at all (e.g. a thread prologue record)
+            return ""; // §26.1: no frame context at all — the row simply carries no chain
         }
         Map<Long, Long> parent = new HashMap<>(); // child object id -> parent object id (0 = a root)
         Map<Long, String> rootName = new HashMap<>(); // root object id -> local/arg/this name
@@ -2906,7 +3214,7 @@ public final class ViewerApp {
                 }
             }
         }
-        return " -> ?"; // §24.3: not reachable from the frame's roots within the limits
+        return ""; // §26.1: unreachable within the limits — no suffix (the old " -> ?" was noise)
     }
 
     /**
@@ -3522,7 +3830,131 @@ public final class ViewerApp {
         status = "jumped to seq " + seq + " (t" + loc.tid() + ")";
     }
 
-    // ---- source in-file search (§16.4) ----
+    // ---- find-in-window (§16.4 Source, §26.8 list windows) ----
+
+    /** §26.8: open find-in-window on the focused list window (Alt-F outside Source). */
+    private void enterListSearch() {
+        listSearch.target = focus;
+        listSearch.active = true;
+        listSearch.query.setLength(0);
+        listSearch.reverse = false;
+        listSearch.justFlipped = false;
+        listSearch.boundary = null;
+        recomputeListSearch();
+    }
+
+    /**
+     * §26.8: the searched window's rows as rendered — except Stack, whose 2-char {@code "* "}
+     * selected-frame marker is blanked for MATCHING: the marker moves with every landing, and
+     * occurrences must not depend on which row currently carries it.
+     */
+    private List<String> listRowTexts(final Win w) {
+        return switch (w) {
+            case THREADS -> threadRowTexts();
+            case STACK -> {
+                List<String> rows = new ArrayList<>(stackRowTexts());
+                rows.replaceAll(t -> t.length() >= 2 ? "  " + t.substring(2) : t);
+                yield rows;
+            }
+            case LOCALS -> treeRowTexts(localsTree);
+            case RECORDS -> recordRowTexts();
+            case SOURCE -> List.of(); // Source uses its own §16.4 search
+        };
+    }
+
+    /** §26.8: the searched window's current selection row index. */
+    private int listSelection(final Win w) {
+        return switch (w) {
+            case THREADS -> threadSel;
+            case STACK -> stackSel;
+            case LOCALS -> localsTree.selection();
+            case RECORDS -> recordsSel;
+            case SOURCE -> 0;
+        };
+    }
+
+    /**
+     * §26.8: moves the searched window's selection to {@code row} — through the SAME path the
+     * window's own ↑/↓ use, so a Stack landing selects the frame (source re-centred) and the
+     * others just move their selection.
+     */
+    private void setListSelection(final Win w, final int row) {
+        switch (w) {
+            case THREADS -> threadSel = clamp(row, 0, Math.max(0, tids.size() - 1));
+            case STACK -> selectStackRow(clamp(row, 0, Math.max(0, engine.stack().size() - 1)));
+            case LOCALS -> localsTree.select(row);
+            case RECORDS -> recordsSel = clamp(row, 0, Math.max(0, history.size() - 1));
+            case SOURCE -> { }
+        };
+    }
+
+    /** §26.8: recompute occurrences after an edit; the row at/after the selection is current. */
+    private void recomputeListSearch() {
+        listSearch.boundary = null;
+        List<String> rows = listRowTexts(listSearch.target);
+        listSearch.occurrences = InFileSearch.occurrences(rows, listSearch.query.toString());
+        listSearch.current = InFileSearch.currentIndex(
+                listSearch.occurrences, listSelection(listSearch.target) + 1);
+        focusListOccurrence();
+    }
+
+    private void focusListOccurrence() {
+        if (listSearch.current >= 0 && listSearch.current < listSearch.occurrences.size()) {
+            setListSelection(listSearch.target, listSearch.occurrences.get(listSearch.current)[0] - 1);
+        }
+    }
+
+    /** §26.8: Enter — the §16.4 two-press boundary state machine over row pseudo-lines. */
+    private void moveListSearch(final InFileSearch.Dir dir) {
+        int refRow = listSearch.current >= 0 && listSearch.current < listSearch.occurrences.size()
+                ? listSearch.occurrences.get(listSearch.current)[0]
+                : listSelection(listSearch.target) + 1;
+        InFileSearch.Step st = InFileSearch.step(listSearch.occurrences, refRow, dir, listSearch.boundary);
+        listSearch.boundary = st.armed();
+        if (st.index() >= 0) {
+            listSearch.current = st.index();
+            focusListOccurrence();
+        }
+    }
+
+    /** §26.8: the find field's keys — identical to the Source search field (§16.4/§21.2). */
+    private void handleListSearch(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (t == KeyType.Tab) {
+            listSearch.reverse = !listSearch.reverse;
+            listSearch.justFlipped = true;
+            listSearch.boundary = null;
+            return;
+        }
+        listSearch.justFlipped = false;
+        if (t == KeyType.Escape) {
+            listSearch.active = false; // the selection stays on the last match
+            return;
+        }
+        if (k.isCtrlDown() && (isChar(k, 'u') || isChar(k, 'w'))) {
+            listSearch.query.setLength(0);
+            recomputeListSearch();
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (listSearch.query.length() > 0) {
+                listSearch.query.deleteCharAt(listSearch.query.length() - 1);
+                recomputeListSearch();
+            }
+            return;
+        }
+        if (t == KeyType.Enter) {
+            moveListSearch(listSearch.reverse ? InFileSearch.Dir.REVERSE : InFileSearch.Dir.FORWARD);
+            return;
+        }
+        if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= ' ') {
+                listSearch.query.append(ch.charValue());
+                recomputeListSearch();
+            }
+        }
+    }
 
     /** §16.4: enter in-file search (empty query; the cursor stays where it is until a match). */
     private void enterSourceSearch() {
@@ -3649,7 +4081,17 @@ public final class ViewerApp {
         if (fileDialog == null) {
             // §24.6: trees start at the project roots (--repo dirs) with every directory down to
             // the package roots visible; the recording's §12.1 file keys drive white-vs-dim rows.
-            FileTree tree = FileTree.build(sourcePath.roots(), sourcePath.bases(), lineIndex.files());
+            // §26.3: a commit-pinned repo lists the COMMIT's files (virtual tree from git ls-tree)
+            // instead of walking its drifted working tree.
+            List<FileTree.VirtualTree> virtual = new ArrayList<>();
+            for (var gs : sourcePath.gitSources()) {
+                List<FileTree.VirtualFile> files = new ArrayList<>(gs.fileCount());
+                for (var e : gs.files()) {
+                    files.add(new FileTree.VirtualFile(e.getKey(), e.getValue()));
+                }
+                virtual.add(new FileTree.VirtualTree(gs.repo(), files));
+            }
+            FileTree tree = FileTree.build(sourcePath.roots(), sourcePath.bases(), lineIndex.files(), virtual);
             fileDialog = new FileDialog(tree);
             tree.setFilter(fileDialog.query.toString());
         }
@@ -3661,6 +4103,10 @@ public final class ViewerApp {
      * longer quits); Esc closes from either §15.2 focus, keeping the state for reopen (§15.5).
      */
     private void handleFileDialog(final KeyStroke k) {
+        if (k.isCtrlDown() && isChar(k, 'f')) {
+            fileDialog.focus = DialogFocus.QUERY; // §26.2: ^F jumps to the filter field
+            return;
+        }
         if (k.getKeyType() == KeyType.Escape) {
             fileDialogOpen = false; // §17.7: state persists across close/reopen
             return;
@@ -3736,7 +4182,8 @@ public final class ViewerApp {
      * {@code g}/{@code G} jump to the ends, {@code /} returns to the filter line. In BROWSE mode
      * →/↵ expand a directory (↵ on a FILE opens it), ← collapses (or moves to the parent). In FLAT
      * mode expand/collapse is hidden: ↵ opens the selected file and ←/→ (and {@code <}/{@code >})
-     * horizontally scroll the selected row to reveal its clipped path prefix.
+     * horizontally scroll the selected row to reveal its clipped path prefix. PgDn/PgUp (and
+     * Ctrl-B) page; Ctrl-F focuses the filter field instead (§26.2).
      */
     private void handleFileListKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -3767,7 +4214,7 @@ public final class ViewerApp {
             fileDialog.sel = Math.max(0, fileDialog.sel - page);
             return;
         }
-        if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
+        if (t == KeyType.PageDown) {
             fileDialog.sel = Math.min(last, fileDialog.sel + page);
             return;
         }
@@ -3915,9 +4362,9 @@ public final class ViewerApp {
         if (fileDialog.focus == DialogFocus.QUERY) {
             hint = "type to filter (regex)  ↓ list  ^U clear  Esc close";
         } else if (flat) {
-            hint = "↑↓ move  ↵ open  ←→/<>/^K^L hscroll  ^U/^N scroll  ^F/^B pg  g/G  / filter  Esc";
+            hint = "↑↓ move  ↵ open  ←→/<>/^K^L hscroll  ^U/^N scroll  PgUp/PgDn  / or ^F filter  g/G  Esc";
         } else {
-            hint = "↑↓ move  →/↵ open/expand  ← collapse  <>/^K^L hscroll  ^U/^N scroll  ^F/^B pg  g/G  / filter  Esc";
+            hint = "↑↓ move  →/↵ open/expand  ← collapse  <>/^K^L hscroll  ^U/^N scroll  PgUp/PgDn  / or ^F filter  g/G  Esc";
         }
         put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
@@ -4004,22 +4451,14 @@ public final class ViewerApp {
     }
 
     /**
-     * §24.5: the visited lines of an arbitrary on-disk file — its §12.1 key is the path relative
-     * to the owning source root (the same relative path source resolution probes), so a browsed
-     * file lights up its recorded line numbers exactly like a frame-resolved one. Empty when the
-     * file lies outside every source root or the recording never touched it.
+     * §24.5: the visited lines of an arbitrary (on-disk or §26.3 virtual) file — its §12.1 key
+     * comes from {@link SourcePath#coverageKey} (the owning commit-pinned repo, else the path
+     * relative to the deepest containing source root), so a browsed file lights up its recorded
+     * line numbers exactly like a frame-resolved one. Empty when the file lies outside every
+     * source root or the recording never touched it.
      */
     private BitSet visitedLinesOfFile(final Path file) {
-        Path abs = file.toAbsolutePath().normalize();
-        Path owner = null;
-        for (Path root : sourcePath.roots()) {
-            Path r = root.toAbsolutePath().normalize();
-            // Deepest containing root wins, so nested/overlapping roots derive the right key.
-            if (abs.startsWith(r) && (owner == null || r.getNameCount() > owner.getNameCount())) {
-                owner = r;
-            }
-        }
-        return owner == null ? new BitSet() : lineIndex.linesOf(FileTree.relativeText(owner, abs));
+        return sourcePath.coverageKey(file).map(lineIndex::linesOf).orElseGet(BitSet::new);
     }
 
     // ---- navigation glue ----

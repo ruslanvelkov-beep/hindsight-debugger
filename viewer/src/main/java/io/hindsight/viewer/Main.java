@@ -70,14 +70,23 @@ public final class Main {
             return;
         }
 
-        SourcePath sourcePath = SourcePath.of(parsed.sources(), parsed.repos());
-
         Recording recording = null;
         Engine engine = null;
         Screen screen = null;
         int code = 0;
         try {
             recording = Recording.open(parsed.dir());
+            // §26.3: pin every --repo to the recording's sourceCommit when git can resolve it —
+            // the recording is only line-accurate against that exact tree; a drifted checkout
+            // (different branch, newer commits) would show shifted or missing code.
+            String sourceCommit = recording.manifest().getProperty("sourceCommit", "");
+            SourcePath sourcePath = SourcePath.of(parsed.sources(), parsed.repos(), sourceCommit);
+            for (var gs : sourcePath.gitSources()) {
+                String c = gs.commit().substring(0, Math.min(12, gs.commit().length()));
+                System.out.println("sources: " + gs.repo() + " pinned to git commit " + c
+                        + " (" + gs.fileCount() + " files"
+                        + (gs.headMatches() ? "" : "; checked-out HEAD differs") + ")");
+            }
             // §24.5: the FORMAT.md §12.1 visited-line index — read back when present, computed
             // (one full record scan, a few seconds at most on large recordings) and persisted
             // best-effort on the recording's first use (a read-only dir just rescans next time).
@@ -96,7 +105,8 @@ public final class Main {
             // (Ctrl-R/T/W have no such meaning and already work). Clear IXON on the controlling tty
             // AFTER lanterna's own raw-mode stty so it sticks; restore it in the finally. Best-effort.
             setFlowControl(false);
-            new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid(), lineIndex).run();
+            new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid(), lineIndex,
+                    parsed.seq(), parsed.last()).run();
         } catch (IOException e) {
             code = 1;
             System.err.println("viewer: " + e.getMessage());

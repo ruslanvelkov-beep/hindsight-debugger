@@ -18,15 +18,17 @@ Module: `io.hindsight.viewer`, depends on `:reader` (parsing + `Recording`/`Rec`
 
 ## 1. CLI
 
-`viewer --dir <recordingDir> [--source <root1:root2:...>]... [--repo <dir>]... [--tid N]`
+`viewer --dir <recordingDir> [--source <root1:root2:...>]... [--repo <dir>]... [--tid N] [--seq N | --last]`
 
 - `--dir` (required): a recording directory (`Recording.open`).
 - `--source`: colon-separated source roots (each a directory that is the package root, i.e.
   `<root>/com/foo/Bar.java`). Repeatable.
 - `--repo`: a directory tree under which every `*/src/main/java` and `*/src/test/java`
   directory is auto-discovered and added as a source root. Repeatable.
-- `--tid`: initial thread to focus (default: the thread of the first LINE record by global
-  `seq`; if none, the lowest tid).
+- `--tid`: initial thread to focus (default: the engine opens on the earliest exec record;
+  §26.7 then lands on the first line-traced record of the chosen thread — an accepted
+  `--tid`, else thread 1 — when it has line records).
+- `--seq` / `--last`: the opening record (§26.7). Mutually exclusive.
 - Missing source roots are non-fatal — the Source window shows a placeholder (§7.1).
 - On a terminal smaller than 80×24, the UI shows a "terminal too small (need ≥80×24)"
   message and waits for resize or `q`.
@@ -1535,3 +1537,101 @@ stays WHITE; an unvisited line's number is now `UNVISITED_FG` — xterm-256 inde
 rows and other de-emphasised chrome keep) — so recorded and unrecorded lines read apart at
 a glance while unvisited numbers recede. The §13.4 cursor-line inversion still wins. The
 palette's fourth 256-colour exception.
+
+## 26. v2.6 additions & changes
+
+### 26.1 `.` (find object usage) — numbering, persistence, field navigation, `Class#id`
+- Result rows are numbered from 1 (§15.4 style), the number participating in horizontal
+  scroll like the `/` lists.
+- The dialog is PERSISTENT like `/` (§15.5): Esc/close keeps query, thread filter, results,
+  selection, scroll and focus; reopening with `.` continues exactly where it left (carets at
+  each field's end; the §24.3 chains cache rides along).
+- The query accepts the `/` instances grammar: `#123`, bare `123` AND `Class#123` all select
+  the specific object (the class part is informational — the id is unique).
+- The §24.3 containment chain drops the `" -> ?"` marker: a row whose object cannot be
+  traced to an accessible root within the limits simply carries no suffix.
+
+### 26.2 Dialog field navigation — `Tab`, `^F`, `^T`
+In the `.` dialog `Tab` toggles the `query:` ↔ `thread:` fields (the `/` browser keeps Tab
+for calls ↔ instances). `^F` focuses the filter/query field and `^T` the thread field from
+ANY focus, in both the `/` and `.` dialogs; the `F` browser's `^F` focuses its filter too.
+Consequently `^F` no longer pages inside these dialogs — PgDn (and `^B`/PgUp) still page.
+
+### 26.3 Sources pinned to the recording's git commit
+A recording is only line-accurate against the commit it was made at (`sourceCommit`,
+§21.4/FORMAT.md §13); the checkout may have drifted — methods move, whole modules/packages
+migrate. When the manifest's commit RESOLVES in a `--repo` (git present, commit in the
+object store), that repo's sources are read from git's tree at that exact commit:
+- Discovery via `git ls-tree -r <commit>`: every `.java` under a `src/<set>/java` segment,
+  keyed package-relatively — classes whose source root does not even exist in the current
+  checkout (e.g. a module migrated on another branch) still resolve.
+- Content via `git show <commit>:<path>`, cached; a file also present in the working tree
+  reads its PINNED content (dirty/drifted checkouts included).
+- Resolved paths may be VIRTUAL (`<repo>/<relpath>` absent from disk); browse-open, the
+  §24.5 gutter and coverage keys all route through the pinned view.
+- The `F` browser lists the COMMIT's files for pinned repos (virtual trees, §24.6 coverage
+  colours intact) instead of walking the drifted working tree.
+- Startup prints one `sources: <repo> pinned to git commit <hash> (N files…)` note per
+  pinned repo, flagging when the checked-out HEAD differs.
+- Priority: a class/path found in a pinned commit reads PINNED content on EVERY access
+  path (frame resolution, browse-open, coverage keys) — one class, one content. The
+  working tree is the fallback: explicit `--source` roots and a pinned repo's own
+  discovered roots serve only what the pinned commits do not cover (e.g. a file recorded
+  from a dirty checkout that never made it into the commit).
+- Fallbacks: a repo without git / the commit (shallow clone, gc, pre-v2.1 recording
+  without `sourceCommit`) falls back to working-tree discovery exactly as before.
+
+### 26.4 Dates by value range alone (2000–2100), floats included
+The §21.1/§22.1 name gate is RETIRED: no variable name is consulted. Any positive int/long
+— or float/double — whose value lands in one of three epoch ranges gets the UTC suffix
+`(YYYY-MM-DD HH:MM:SS UTC)` after its hex: seconds `[946684800, 4102444800)`, millis
+and nanos scaled likewise — each dating between 2000-01-01 and 2100-01-01. Every INLINE
+render site is covered identically (locals, args, snapshot fields, field-write transitions,
+watches, container elements, map keys/values). Microseconds are deliberately not a range.
+The §22.9 element alignment understands the new suffixes.
+
+### 26.5 Array/container element forms
+- Element indices right-align to the widest shown index (`" [9] = "` under `"[10] = "`) so
+  the equals signs of a >10-element container line up.
+- A displayable byte (32–126) appends its character after the hex: `72  0x48  'H'`.
+- A char shows `'c'`, two spaces, its decimal code left-padded to 5, two spaces, the hex:
+  `'A'     65  0x0041`.
+- Like the §20.5 hex, the byte/char forms are CONTEXT-FREE — they apply at every INLINE
+  render site (locals, fields, watches), not only to container elements.
+
+### 26.6 Info line peeks scalar values
+While exploring in Locals or the `/` instances browser, a selected node holding a native/
+boxed primitive, a string (`String`/`StringBuilder`/`StringBuffer`) or a scalar atomic
+(`AtomicInteger`/`AtomicLong`/`AtomicBoolean`) appends `  =  <value>` to the info line
+after the type info — hex and the §26.4 date included, strings simply filling to the end
+of the line. The value shown is exactly the explored node's rendered value. A nested
+(descriptor-less) primitive whose decorated text defeats the type heuristics shows the
+value alone rather than a guessed type followed by the same text twice.
+
+### 26.7 Opening record — `--seq N`, `--last`, line-trace default
+- `viewer --seq N` opens on the nearest exec record at/before global seq N — N itself
+  need not exist (real recordings have in-range seq holes from never-flushed counter
+  ticks; anything at/before the nearest existing seq qualifies). Only an N preceding the
+  whole recording reports `no record at or before seq N`.
+- `viewer --last` opens on the recording's LAST line-traced record (mutually exclusive
+  with `--seq`).
+- By default the viewer opens on the FIRST line-traced record of the initial thread
+  (an ACCEPTED `--tid`, else thread 1) so the Source window shows a project file
+  immediately; a thread without line records keeps the engine's default position, and a
+  rejected `--tid`'s error message is never overwritten by the landing status.
+
+### 26.8 Find-in-window (Alt-F) for Threads, Stack, Locals, Records
+Alt-F on a focused list window opens the SAME search field the Source window has (§16.4/
+§21.2), drawn over the window's title: typing jumps the selection to the match at/after it,
+`↵` searches in the field's arrow direction (Tab flips ↓/↑ with the §19.4 two-press
+boundary inversion), every visible occurrence highlights reverse-video in the rows, Esc
+closes leaving the selection on the last match. Matching is case-insensitive over the rows
+exactly as rendered. A Stack landing selects the frame (the same path as ↑/↓); the other
+windows move their selection only.
+
+### 26.9 Records: cross-thread exec stepping (`+`/`=`, `-`/`_`)
+In the Records window `+` or `=` jumps to the NEXT — and `-` or `_` to the PREVIOUS —
+record with line info or method enter/exit (the §17.1 exec set) by GLOBAL seq, crossing
+threads freely (unlike F7/⇧F7, which stay in the current thread). Backed by the new
+engine API `toExecAnyThread(forward)`; each jump appends one history entry. The bottom
+help row describes the keys while Records is focused, and the Help window lists them.
