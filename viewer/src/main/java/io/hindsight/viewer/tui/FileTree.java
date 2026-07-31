@@ -103,6 +103,60 @@ public final class FileTree {
     }
 
     /**
+     * One §26.3 commit-pinned repo tree to graft alongside the filesystem trees: {@code base} is
+     * the repo root (the top-level tree, named by its absolute path) and each file is its
+     * repo-relative path plus its FORMAT.md §12.1 coverage key. File paths become
+     * {@code base.resolve(relPath)} — possibly VIRTUAL (absent from the working tree); opening
+     * them routes through the git-aware source path.
+     */
+    public record VirtualTree(Path base, List<VirtualFile> files) {}
+
+    /** One §26.3 virtual file: repo-relative {@code /}-joined path + §12.1 coverage key. */
+    public record VirtualFile(String relPath, String coverageKey) {}
+
+    /**
+     * §26.3: builds the filesystem trees per {@link #build(List, List, Set)} and then one tree
+     * per {@code virtualTrees} entry from its LISTED paths (no filesystem walk) — the open-file
+     * browser shows the pinned commit's module/package layout, coverage colours included.
+     */
+    public static FileTree build(final List<Path> rootDirs, final List<Path> baseDirs,
+            final Set<String> coveredKeys, final List<VirtualTree> virtualTrees) {
+        FileTree fs = build(rootDirs, baseDirs, coveredKeys);
+        if (virtualTrees == null || virtualTrees.isEmpty()) {
+            return fs;
+        }
+        Set<String> covered = coveredKeys == null ? Set.of() : coveredKeys;
+        List<Node> tops = new ArrayList<>(fs.roots);
+        for (VirtualTree vt : virtualTrees) {
+            Node top = virtualNode(vt.base().toAbsolutePath().normalize(), vt.files(), covered);
+            if (top != null) {
+                tops.add(top);
+            }
+        }
+        return new FileTree(List.copyOf(tops));
+    }
+
+    /** Builds one virtual top-level tree from listed rel paths (dirs implied by the segments). */
+    private static Node virtualNode(final Path base, final List<VirtualFile> files, final Set<String> covered) {
+        ChainDir root = new ChainDir(base);
+        for (VirtualFile f : files) {
+            if (f == null || f.relPath() == null || f.relPath().isEmpty()) {
+                continue;
+            }
+            String[] segments = f.relPath().split("/");
+            ChainDir dir = root;
+            for (int i = 0; i < segments.length - 1; i++) {
+                dir = dir.dir(segments[i]);
+            }
+            String name = segments[segments.length - 1];
+            dir.attachFile(new Node(base.resolve(f.relPath()), name, false, List.of(),
+                    covered.contains(f.coverageKey())));
+        }
+        Node top = root.toNode(base.toString());
+        return top.children().isEmpty() ? null : top;
+    }
+
+    /**
      * Walks {@code rootDirs} once and builds the index (§17.7/§24.6): directories and
      * {@code .java} files, directories sorted before files and each group sorted by name
      * (case-insensitive). Duplicate roots are indexed once; unreadable directories
@@ -196,6 +250,16 @@ public final class FileTree {
             String head = rel.getName(0).toString();
             ChainDir child = dirs.computeIfAbsent(head, h -> new ChainDir(path.resolve(h)));
             child.attach(rel.getNameCount() > 1 ? rel.subpath(1, rel.getNameCount()) : null, sourceRoot);
+        }
+
+        /** The (created-on-demand) chain subdirectory named {@code name} (§26.3 virtual builds). */
+        ChainDir dir(final String name) {
+            return dirs.computeIfAbsent(name, h -> new ChainDir(path.resolve(h)));
+        }
+
+        /** Attaches one leaf file node at this level (§26.3 virtual builds). */
+        void attachFile(final Node file) {
+            attached.add(file);
         }
 
         Node toNode(final String name) {
