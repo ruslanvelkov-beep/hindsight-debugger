@@ -157,6 +157,86 @@ final class EngineLineTraceTest {
         }
     }
 
+    // ---- §26.9 toExecAnyThread: next/prev exec record by global seq, any thread ----
+
+    @Test
+    void execAnyThreadCrossesFromTheLastT1ExecIntoT2(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            stepTo(e, 9); // main's EXIT — the last exec record of thread 1 (seq 10)
+            StepResult res = e.toExecAnyThread(true);
+            assertTrue(res.moved(), "the next exec by seq lives in thread 2");
+            assertEquals(2, e.currentTid(), "crossed into thread 2");
+            assertEquals(2, e.currentIndex(),
+                    "landed on background's ENTER, hopping the t2 THREAD_START/TIME_SYNC metadata");
+        }
+    }
+
+    @Test
+    void execAnyThreadCrossesBackwardFromT2IntoT1(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            assertTrue(e.selectThread(2).moved());
+            stepTo(e, 2); // background's ENTER (t2 idx 2)
+            StepResult res = e.toExecAnyThread(false);
+            assertTrue(res.moved(), "the previous exec by seq is t1's last record");
+            assertEquals(1, e.currentTid());
+            assertEquals(9, e.currentIndex(), "main's EXIT — thread 1's last exec record");
+        }
+    }
+
+    @Test
+    void execAnyThreadStaysInThreadWhenTheNearestIsLocal(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            stepTo(e, IDX_LINE20);
+            assertTrue(e.toExecAnyThread(true).moved());
+            assertEquals(1, e.currentTid());
+            assertEquals(IDX_ENTER_LEAF, e.currentIndex(),
+                    "the very next exec by seq is the same-thread leaf ENTER (no line filter)");
+        }
+    }
+
+    @Test
+    void execAnyThreadNoOpsAtTheRecordingEdges(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            assertTrue(e.selectThread(2).moved());
+            stepTo(e, 3); // background's EXIT — the recording's last exec record
+            StepResult fwd = e.toExecAnyThread(true);
+            assertFalse(fwd.moved(), "nothing after the recording's last exec record");
+            assertEquals("no later exec record in any thread", fwd.message());
+        }
+        try (Engine e = Engine.open(build(dir))) {
+            assertEquals(IDX_ENTER_MAIN, e.currentIndex(), "engine opens on the first exec record");
+            StepResult back = e.toExecAnyThread(false);
+            assertFalse(back.moved(), "nothing before the recording's first exec record");
+            assertEquals("no earlier exec record in any thread", back.message());
+        }
+    }
+
+    // ---- §26.7 findSeqAtOrBefore: nearest existing record at/before a (possibly missing) seq ----
+
+    @Test
+    void findSeqAtOrBeforeBridgesSeqHolesAndEdges(@TempDir final Path dir) throws IOException {
+        try (Engine e = Engine.open(build(dir))) {
+            // Exact hit: t1's LINE 20 record carries seq 5 (thread prologue = seqs 1,2).
+            SeqLocation exact = e.findSeqAtOrBefore(5);
+            assertTrue(exact.found());
+            assertEquals(1, exact.tid());
+            assertEquals(IDX_LINE20, exact.index());
+            // The recording's seqs are 1..14 with no holes, so probe PAST the end and between
+            // threads: at/before 999 = the global last record (t2's EXIT, seq 14)...
+            SeqLocation last = e.findSeqAtOrBefore(999);
+            assertTrue(last.found());
+            assertEquals(2, last.tid());
+            assertEquals(3, last.index());
+            // ...and at/before t2's THREAD_START seq (11) is that very metadata record.
+            SeqLocation meta = e.findSeqAtOrBefore(11);
+            assertTrue(meta.found());
+            assertEquals(2, meta.tid());
+            assertEquals(0, meta.index());
+            // Before every record: not found.
+            assertTrue(!e.findSeqAtOrBefore(0).found());
+        }
+    }
+
     // ---- helpers ----
 
     private static void stepTo(final Engine e, final int targetIndex) {

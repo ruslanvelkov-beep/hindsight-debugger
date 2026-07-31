@@ -65,6 +65,8 @@ public final class Engine implements AutoCloseable {
     static final String ALREADY_AT_FRAME_RETURN = "already at frame return";
     static final String ALREADY_AT_FRAME_ENTRY = "already at frame entry";
     static final String NO_FURTHER_LINE_TRACE = "no further line-trace record in this thread";
+    static final String NO_LATER_EXEC_ANY_THREAD = "no later exec record in any thread";
+    static final String NO_EARLIER_EXEC_ANY_THREAD = "no earlier exec record in any thread";
     static final String UNSUPPORTED_WATCH =
             "unsupported expression (v1 accepts #id or Class.field.path)";
 
@@ -671,7 +673,10 @@ public final class Engine implements AutoCloseable {
         return moveTo(bestTid, bestIndex);
     }
 
-    /** Index into {@code lines} of the first LINE record with {@code seq ≥ cursorSeq} (binary search). */
+    /**
+     * Index into {@code lines} (any index-ascending record-index array — {@code lineIndices} or
+     * {@code execIndices}) of the first record with {@code seq ≥ cursorSeq} (binary search).
+     */
     private int firstLineAtOrAfterSeq(final int tid, final long[] lines, final long cursorSeq) {
         int lo = 0;
         int hi = lines.length;
@@ -789,6 +794,62 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
+     * Jump the cursor to the nearest execution record (the §17.1 set — {@code LINE}/
+     * {@code METHOD_ENTER}/{@code METHOD_EXIT}) strictly after ({@code forward}) / before the
+     * cursor's {@code seq} in ANY thread (§26.9, the Records-window {@code +}/{@code -} keys) —
+     * unlike {@link #stepInto}/{@link #reverseStep}, which stay in the current thread. Each
+     * thread's {@link ThreadIndex#execIndices} is index-ascending, hence {@code seq}-ascending,
+     * so a per-thread binary search on {@code seq} yields that thread's nearest candidate and the
+     * global best across threads wins. No-op with {@link #NO_LATER_EXEC_ANY_THREAD} /
+     * {@link #NO_EARLIER_EXEC_ANY_THREAD} at the recording's edges. On a move the selected frame
+     * resets to innermost through the normal {@link #moveTo} path.
+     *
+     * @param forward {@code true} to advance to the next exec record by global seq, {@code false}
+     *     to the previous one
+     */
+    public StepResult toExecAnyThread(final boolean forward) {
+        long cursorSeq = currentSeq();
+        int bestTid = -1;
+        long bestIndex = -1;
+        long bestSeq = forward ? Long.MAX_VALUE : Long.MIN_VALUE;
+        for (int tid : recording.threadIds()) {
+            long[] execs = index(tid).execIndices;
+            int boundary = firstLineAtOrAfterSeq(tid, execs, cursorSeq);
+            if (forward) {
+                for (int t = boundary; t < execs.length; t++) {
+                    long seq = rec(tid, execs[t]).seq();
+                    if (seq <= cursorSeq) {
+                        continue; // the boundary record can equal cursorSeq (same thread); skip it
+                    }
+                    if (seq < bestSeq) {
+                        bestSeq = seq;
+                        bestTid = tid;
+                        bestIndex = execs[t];
+                    }
+                    break; // the first strictly-after entry is this thread's nearest
+                }
+            } else {
+                for (int t = boundary - 1; t >= 0; t--) {
+                    long seq = rec(tid, execs[t]).seq();
+                    if (seq >= cursorSeq) {
+                        continue; // defensive: boundary-1 should already be strictly before
+                    }
+                    if (seq > bestSeq) {
+                        bestSeq = seq;
+                        bestTid = tid;
+                        bestIndex = execs[t];
+                    }
+                    break;
+                }
+            }
+        }
+        if (bestTid < 0) {
+            return new StepResult(false, forward ? NO_LATER_EXEC_ANY_THREAD : NO_EARLIER_EXEC_ANY_THREAD);
+        }
+        return moveTo(bestTid, bestIndex);
+    }
+
+    /**
      * Move the cursor into another thread — onto the execution record (§17.1 set) with the
      * greatest {@code seq ≤} the current seq, else that thread's first exec record, keeping
      * the timelines roughly aligned when switching (§2.6). A thread with no exec records at
@@ -871,6 +932,46 @@ public final class Engine implements AutoCloseable {
             }
         }
         return new SeqLocation(false, 0, 0L);
+    }
+
+    /**
+     * Locate the record with the GREATEST global sequence number {@code ≤ seq} (§26.7): real
+     * recordings have in-range seq holes (the shared counter ticks for records a thread never
+     * flushed), so an exact {@link #findSeq} can miss even a mid-recording seq. Each thread is
+     * binary-searched for its last record at/before {@code seq}; the best across threads wins.
+     * {@link SeqLocation#found()} is {@code false} only when {@code seq} precedes every record.
+     * Does <em>not</em> move the cursor and does not require the record to be exec.
+     *
+     * @param seq the global sequence number to locate (an existing seq returns exactly it)
+     */
+    public SeqLocation findSeqAtOrBefore(final long seq) {
+        int bestTid = -1;
+        long bestIndex = 0;
+        long bestSeq = Long.MIN_VALUE;
+        for (int tid : recording.threadIds()) {
+            ThreadIndex ti = index(tid);
+            long lo = 0;
+            long hi = ti.count - 1L;
+            long hit = -1;
+            while (lo <= hi) {
+                long mid = (lo + hi) >>> 1;
+                if (rec(tid, mid).seq() <= seq) {
+                    hit = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if (hit >= 0) {
+                long hitSeq = rec(tid, hit).seq();
+                if (hitSeq > bestSeq) {
+                    bestSeq = hitSeq;
+                    bestTid = tid;
+                    bestIndex = hit;
+                }
+            }
+        }
+        return bestTid < 0 ? new SeqLocation(false, 0, 0L) : new SeqLocation(true, bestTid, bestIndex);
     }
 
     /**
@@ -1299,7 +1400,7 @@ public final class Engine implements AutoCloseable {
             int slot = argIdx < argSlot.length ? argSlot[argIdx] : base + argIdx;
             String d = argIdx < params.size() ? params.get(argIdx) : "";
             String name = paramNames.getOrDefault(slot, "arg" + argIdx);
-            Value v = toValueNamed(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated(), name);
+            Value v = toValue(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated());
             bySlot.put(slot, new Local(slot, name, d, v));
         }
 
@@ -1314,7 +1415,7 @@ public final class Engine implements AutoCloseable {
             String name = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
             String desc = s != null ? s.desc() : "";
             String localName = name != null ? name : "slot" + slot;
-            Value v = toValueNamed(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated(), localName);
+            Value v = toValue(r.afterKind(), r.tag(), r.after(), r.tid(), r.isTruncated());
             bySlot.put(slot, new Local(slot, localName, desc, v));
         }
 
@@ -1436,8 +1537,13 @@ public final class Engine implements AutoCloseable {
                 displays.add(ev.display());
             }
             List<String> aligned = NumberFormatUtil.alignNumericElements(displays);
+            // §26.5: indent shorter indices to the widest shown index ("[9] = " under "[10] = ")
+            // so the equals signs of a >10-element container line up.
+            int idxWidth = Integer.toString(Math.max(0, rc.elements.size() - 1)).length();
             for (int i = 0; i < rc.elements.size(); i++) {
-                out.add(valueChildNode("[" + i + "] = ", rc.elements.get(i), aligned.get(i), path, false));
+                String idx = Integer.toString(i);
+                String prefix = NumberFormatUtil.padLeft("[", idxWidth - idx.length() + 1) + idx + "] = ";
+                out.add(valueChildNode(prefix, rc.elements.get(i), aligned.get(i), path, false));
             }
             if (rc.totalSize > rc.elements.size()) {
                 out.add(moreLeaf(rc.totalSize - rc.elements.size()));
@@ -1522,7 +1628,7 @@ public final class Engine implements AutoCloseable {
                 for (Recording.SnapField f : parsed.fields()) {
                     String sym = recording.symbolText(f.nameSym());
                     String name = sym != null ? sym : "?sym" + f.nameSym();
-                    fields.put(name, toValueNamed(f.kind(), f.tag(), f.value(), snapTid, false, name));
+                    fields.put(name, toValue(f.kind(), f.tag(), f.value(), snapTid, false));
                 }
             }
             for (ObjEvent w : writes) {
@@ -1530,7 +1636,7 @@ public final class Engine implements AutoCloseable {
                 Site s = recording.site(wr.location());
                 String sym = s != null && s.memberSym() != 0 ? recording.symbolText(s.memberSym()) : null;
                 String name = sym != null ? sym : "?field";
-                fields.put(name, toValueNamed(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated(), name));
+                fields.put(name, toValue(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated()));
             }
             return Reconstructed.fields(fields);
         }
@@ -1593,8 +1699,8 @@ public final class Engine implements AutoCloseable {
                 continue;
             }
             Rec wr = rec(w.tid(), w.index());
-            // §21.1: the root expression's field name gates the date on an in-range static value.
-            Value val = toValueNamed(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated(), field);
+            // §26.4: dated by value range alone — the field name plays no part any more.
+            Value val = toValue(wr.afterKind(), wr.tag(), wr.after(), w.tid(), wr.isTruncated());
             return walkPath(expression, val, Arrays.copyOfRange(tokens, splitLen + 1, tokens.length));
         }
         return new WatchResult(expression, null, UNSUPPORTED_WATCH);
@@ -1883,8 +1989,8 @@ public final class Engine implements AutoCloseable {
                     ownerBinary,
                     fieldName,
                     s.isStatic() || r.isStatic(),
-                    fieldSlotDisplay(r, true, fieldName),
-                    fieldSlotDisplay(r, false, fieldName),
+                    fieldSlotDisplay(r, true),
+                    fieldSlotDisplay(r, false),
                     s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
                     s.line()));
         }
@@ -1996,8 +2102,8 @@ public final class Engine implements AutoCloseable {
                     recording.symbolText(s.classSym()),
                     field,
                     s.isStatic() || r.isStatic(),
-                    fieldSlotDisplay(r, true, field),
-                    fieldSlotDisplay(r, false, field),
+                    fieldSlotDisplay(r, true),
+                    fieldSlotDisplay(r, false),
                     s.fileSym() != 0 ? recording.symbolText(s.fileSym()) : null,
                     s.line()));
         }
@@ -2131,24 +2237,28 @@ public final class Engine implements AutoCloseable {
 
     /**
      * The display string of a {@code FIELD_WRITE}'s before ({@code isBefore}) / after slot with
-     * the §20.4/§20.5 numeric decoration applied to INLINE primitives — so the §16.1/§20.9
+     * the §20.5/§26.4 numeric decoration applied to INLINE primitives — so the §16.1/§20.9
      * variable-change windows render integral transitions with hex/date exactly as the object
      * trees do; references, strings and nulls stay on the reader's renderer. Per §2.3 the before
      * slot's runtime tag lives in the aux idx byte for reference-typed fields (else 0, meaning the
      * declared tag byte applies to both slots).
      */
-    private String fieldSlotDisplay(final Rec r, final boolean isBefore, final String fieldName) {
+    private String fieldSlotDisplay(final Rec r, final boolean isBefore) {
         int kind = isBefore ? r.beforeKind() : r.afterKind();
         if (kind == Format.KIND_INLINE) {
             int tag = isBefore ? (r.idx() != 0 ? r.idx() : r.tag()) : r.tag();
             long slot = isBefore ? r.before() : r.after();
-            // §21.1: the field name is known here, so a time/date/instant-named field's
-            // in-range transition is dated in the §16.1/§20.9 windows too (hex regardless).
-            return toValueNamed(Format.KIND_INLINE, tag, slot, r.tid(), r.isTruncated(), fieldName).display();
+            return toValue(Format.KIND_INLINE, tag, slot, r.tid(), r.isTruncated()).display();
         }
         return renderer.render(r, isBefore);
     }
 
+    /**
+     * The single INLINE render path: every primitive gets the §20.5 hex, the §26.5 byte/char
+     * extras and the §26.4 value-range-gated date via {@link NumberFormatUtil#decorate}, so
+     * locals, snapshot fields, watches, container elements and map keys/values all read alike
+     * (the §21.1/§22.1 name gate is retired — §26.4).
+     */
     private Value toValue(final int kind, final int tag, final long slot, final int tid, final boolean truncated) {
         return switch (kind) {
             case Format.KIND_NONE -> switch (tag) {
@@ -2162,25 +2272,6 @@ public final class Engine implements AutoCloseable {
             case Format.KIND_BLOB -> blobValue(slot, tid, truncated);
             default -> new Value.Primitive("<bad kind " + kind + ">");
         };
-    }
-
-    /**
-     * {@link #toValue} plus the §21.1 name-gated UTC date: for an INLINE integral whose {@code name}
-     * (case-insensitive) contains {@code time}/{@code date}/{@code instant} and whose value lands in an
-     * epoch range, the {@code   (…UTC)} suffix is appended after the §20.5 hex. Every other value is
-     * returned exactly as {@link #toValue} produced it, so this is the name-bearing render path
-     * (locals, snapshot fields, watches) while nameless contexts stay on plain {@link #toValue}.
-     */
-    private Value toValueNamed(
-            final int kind, final int tag, final long slot, final int tid, final boolean truncated, final String name) {
-        Value v = toValue(kind, tag, slot, tid, truncated);
-        if (kind == Format.KIND_INLINE && v instanceof Value.Primitive p) {
-            String dated = NumberFormatUtil.decorateNamed(p.rendered(), name, tag, slot);
-            if (!dated.equals(p.rendered())) {
-                return new Value.Primitive(dated);
-            }
-        }
-        return v;
     }
 
     private Value blobValue(final long offset, final int tid, final boolean truncated) {

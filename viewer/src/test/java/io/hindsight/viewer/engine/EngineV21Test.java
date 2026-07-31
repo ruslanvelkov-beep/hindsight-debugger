@@ -57,7 +57,7 @@ final class EngineV21Test {
     }
 
     @Test
-    void dateShowsOnlyForTimeNamedLocal(@TempDir final Path dir) throws IOException {
+    void dateShowsForEveryInRangeLocalRegardlessOfName(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(buildLocals(dir))) {
             e.seek(1, 5);
             List<Local> locals = e.locals(0);
@@ -65,13 +65,13 @@ final class EngineV21Test {
 
             Local time = locals.get(0); // slot 1
             assertEquals("lastUpdateTime", time.name());
-            assertEquals(MILLIS_DATED, time.value().display(),
-                    "a name containing 'time' gets the §21.1 UTC date");
+            assertEquals(MILLIS_DATED, time.value().display());
 
+            // §26.4: the date is purely value-range-gated — the name no longer matters.
             Local count = locals.get(1); // slot 3
             assertEquals("count", count.name());
-            assertEquals(MILLIS_HEX, count.value().display(),
-                    "a non-temporal name shows hex but NO date, even for an in-range value");
+            assertEquals(MILLIS_DATED, count.value().display(),
+                    "an in-range value is dated whatever its name (the §22.1 gate is retired)");
         }
     }
 
@@ -156,7 +156,7 @@ final class EngineV21Test {
     }
 
     @Test
-    void arrayListShowsSizePopulatesAndElementIsNotDated(@TempDir final Path dir) throws IOException {
+    void arrayListShowsSizePopulatesAndInRangeElementIsDated(@TempDir final Path dir) throws IOException {
         try (Engine e = Engine.open(buildContainers(dir))) {
             ObjectNode root = e.objectTree(600L);
             assertEquals("ArrayList#600, size=2", root.label());
@@ -165,9 +165,8 @@ final class EngineV21Test {
             // §22.9: [42, millis] are both integral, so 42's decimal right-aligns to the 13-digit
             // millis width; the hex tail follows the padded decimal unchanged.
             assertEquals("[0] = " + " ".repeat(11) + "42  0x0000002A", kids.get(0).label());
-            // §21.1: a bare list element is nameless — hex, but NO date even though it is in range.
-            assertEquals("[1] = " + MILLIS_HEX, kids.get(1).label());
-            assertFalse(kids.get(1).label().contains("UTC"), "nameless element gets no date");
+            // §26.4: elements are dated by value range alone — namelessness no longer matters.
+            assertEquals("[1] = " + MILLIS_DATED, kids.get(1).label());
         }
     }
 

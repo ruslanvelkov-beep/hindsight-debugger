@@ -8,179 +8,78 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
 /**
- * Pure numeric decoration for INLINE primitive values (VIEWER.md §20.5 hex, §20.4/§21.1 date).
- * The decoration is split in two so hex stays context-free while the date is <em>name-gated</em>:
+ * Pure numeric decoration for INLINE primitive values (VIEWER.md §20.5 hex, §26.4 date,
+ * §26.5 byte/char forms). Everything is context-free — {@link #decorate(String, int, long)}
+ * is applied by {@link Engine}'s {@code toValue} on every INLINE value, so locals, object
+ * trees, watches, container elements and map keys/values all render identically:
  *
  * <ul>
- *   <li>{@link #decorate(String, int, long)} — the context-free part {@link Engine}'s
- *       {@code toValue} always applies: the §20.5 hex on every integral value. This is the single
- *       place turning a reader-rendered integral/char into {@code <decimal>  0x<HEX>}, so locals,
- *       object trees, watches and the map/element/field values reconstructed from snapshots all get
- *       the hex identically.</li>
- *   <li>{@link #dateSuffix(int, long)} / {@link #decorateNamed(String, String, int, long)} — the
- *       §21.1 name-gated date, applied ONLY at the render sites that carry a variable name (locals,
- *       snapshot fields, watches). Nameless contexts (container elements, map keys/values) get no
- *       date.</li>
+ *   <li><b>Hex (§20.5).</b> Every integral value shows its two's-complement hex after the
+ *       decimal, zero-padded uppercase to the type width — byte 2, char 4, short 4, int 8,
+ *       long 16 hex digits. Booleans, floats and doubles get none.</li>
+ *   <li><b>Byte (§26.5).</b> After the hex, a displayable byte (32–126) adds its character:
+ *       {@code 72  0x48  'H'}.</li>
+ *   <li><b>Char (§26.5).</b> {@code 'c'}, two spaces, the decimal char code left-padded to 5,
+ *       then the hex: {@code 'A'     65  0x0041}.</li>
+ *   <li><b>Date (§26.4).</b> Purely value-range-gated (the §21.1/§22.1 name gate is retired):
+ *       any positive int/long — or float/double — landing in one of three epoch ranges that
+ *       fall between 2000-01-01 and 2100-01-01 (seconds, millis, nanos since 1970-01-01) gets
+ *       a UTC wall-clock suffix {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text). The
+ *       date follows the hex.</li>
  * </ul>
  *
- * <p><b>Hex (§20.5).</b> Every integral value shows its two's-complement hex after the decimal,
- * zero-padded uppercase to the type width — byte 2, char 4, short 4, int 8, long 16 hex digits.
- * Booleans, floats and doubles get none. A char keeps its {@code 'c'} form then its {@code 0x00NN}.
- *
- * <p><b>Date (§20.4/§21.1/§22.1).</b> An int/long whose value lands in one of three non-overlapping
- * epoch ranges — seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)} — has
- * a UTC wall-clock suffix {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text) available via
- * {@link #dateSuffix}. Per §22.1 the suffix is only appended when the value's variable name has a
- * time-like <em>token</em> (see {@link #nameSuggestsTime}); {@link #decorateNamed} applies that gate.
- * The §22.1 token gate replaces the §21.1 raw {@code contains} test, which mis-fired on {@code update}
- * (⊇ {@code date}) and {@code runtime} (⊇ {@code time}). An int only reaches the seconds range; a long
- * reaches all three. The date follows the hex.
- *
- * <p>This class also hosts the two pure §22 name/element predicates that share the render pipeline:
- * {@link #isIdName} (§22.12, an ID-denoting field name) and {@link #alignNumericElements} (§22.9,
- * right-aligning a container's all-numeric element column).
+ * <p>This class also hosts the two pure §22 name/element predicates that share the render
+ * pipeline: {@link #isIdName} (§22.12, an ID-denoting field name) and
+ * {@link #alignNumericElements} (§22.9, right-aligning a container's all-numeric element
+ * column — aware of the hex and date suffixes).
  */
 final class NumberFormatUtil {
 
     private static final DateTimeFormatter UTC =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT).withZone(ZoneOffset.UTC);
 
-    private static final long SEC_LO = 1_000_000_000L;
-    private static final long SEC_HI = 4_000_000_000L;
-    private static final long MS_LO = 1_000_000_000_000L;
-    private static final long MS_HI = 4_000_000_000_000L;
-    private static final long NS_LO = 1_000_000_000_000_000_000L;
-    private static final long NS_HI = 4_000_000_000_000_000_000L;
+    // §26.4: epoch ranges whose datings land between 2000-01-01T00:00Z and 2100-01-01T00:00Z.
+    private static final long SEC_LO = 946_684_800L;
+    private static final long SEC_HI = 4_102_444_800L;
+    private static final long MS_LO = 946_684_800_000L;
+    private static final long MS_HI = 4_102_444_800_000L;
+    private static final long NS_LO = 946_684_800_000_000_000L;
+    private static final long NS_HI = 4_102_444_800_000_000_000L;
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final long MILLIS_PER_SECOND = 1_000L;
 
     private NumberFormatUtil() {}
 
     /**
-     * Decorates a reader-rendered INLINE value with the context-free §20.5 hex as the tag warrants,
-     * returning {@code base} unchanged for non-integral tags (boolean/float/double/null/void and any
-     * unknown tag). The §20.4/§21.1 date is <em>not</em> applied here — it is name-gated and added by
-     * {@link #decorateNamed} at the name-bearing render sites.
+     * Decorates a reader-rendered INLINE value with the context-free §20.5 hex, the §26.5
+     * byte/char extras and the §26.4 range-gated date, as the tag warrants; {@code base} is
+     * returned unchanged for boolean/null/void and any unknown tag.
      *
      * @param base the reader's already-rendered text (decimal for integrals, {@code 'c'} for char)
      * @param tag the FORMAT.md §2.3 value tag
-     * @param slot the raw value slot (two's-complement for integrals, the char code for char)
+     * @param slot the raw value slot (two's-complement for integrals, the char code for char,
+     *     IEEE bits for float/double)
      */
     static String decorate(final String base, final int tag, final long slot) {
         return switch (tag) {
-            case Format.TAG_BYTE -> base + hex(slot, 2);
+            case Format.TAG_BYTE -> base + hex(slot, 2) + byteChar(slot);
             case Format.TAG_SHORT -> base + hex(slot, 4);
-            case Format.TAG_CHAR -> base + hex(slot, 4);
-            case Format.TAG_INT -> base + hex(slot, 8);
-            case Format.TAG_LONG -> base + hex(slot, 16);
+            case Format.TAG_CHAR -> base + "  " + padLeft(Long.toString(slot), 5) + hex(slot, 4);
+            case Format.TAG_INT -> base + hex(slot, 8) + date(slot);
+            case Format.TAG_LONG -> base + hex(slot, 16) + date(slot);
+            case Format.TAG_FLOAT -> base + date(Float.intBitsToFloat((int) slot));
+            case Format.TAG_DOUBLE -> base + date(Double.longBitsToDouble(slot));
             default -> base;
         };
     }
 
-    /**
-     * The §20.4 UTC date suffix {@code   (YYYY-MM-DD HH:MM:SS UTC)} for an int/long value that lands
-     * in an epoch range (seconds {@code [1e9,4e9)}, millis {@code [1e12,4e12)}, nanos {@code [1e18,4e18)});
-     * {@code ""} for any other tag or an out-of-range value. This is the raw, ungated suffix — callers
-     * apply the §21.1 name gate via {@link #decorateNamed}.
-     *
-     * @param tag the FORMAT.md §2.3 value tag (only {@code TAG_INT}/{@code TAG_LONG} can produce a date)
-     * @param slot the raw value slot
-     */
-    static String dateSuffix(final int tag, final long slot) {
-        return (tag == Format.TAG_INT || tag == Format.TAG_LONG) ? date(slot) : "";
-    }
-
-    /**
-     * Appends the §21.1 name-gated date to an already-hex-decorated value: the {@link #dateSuffix}
-     * is added only when {@code varName} (case-insensitive) contains {@code time}, {@code date} or
-     * {@code instant} AND the value is an in-range int/long. Nameless / non-time-named values are
-     * returned unchanged, so container elements and non-temporal fields keep hex only (§21.1).
-     *
-     * @param hexDecorated the value already carrying its §20.5 hex (the output of {@link #decorate})
-     * @param varName the value's variable/field/watch name, or {@code null} when nameless
-     * @param tag the FORMAT.md §2.3 value tag
-     * @param slot the raw value slot
-     */
-    static String decorateNamed(final String hexDecorated, final String varName, final int tag, final long slot) {
-        return nameSuggestsTime(varName) ? hexDecorated + dateSuffix(tag, slot) : hexDecorated;
-    }
-
-    /**
-     * The §22.1 time-like token set: a variable name whose {@link #tokenize tokens} include ANY of
-     * these opens the date gate. Tokens are matched exactly — {@code update} tokenises to
-     * {@code [update]} (not {@code date}) and {@code runtime} to {@code [runtime]} (not {@code time}),
-     * so the substring false positives of the old §21.1 gate no longer date.
-     */
-    private static final Set<String> TIME_TOKENS = Set.of(
-            "time", "date", "datetime", "instant", "timestamp", "ts",
-            "second", "seconds", "sec", "milli", "millis", "ms",
-            "nano", "nanos", "micro", "micros",
-            "start", "end", "epoch", "expiry", "expiration", "expires",
-            "deadline", "elapsed", "since", "until", "created", "updated", "modified");
-
-    /**
-     * Whether a variable name has a time-like token (§22.1): the name is split into lowercase tokens
-     * on camelCase boundaries (lower→Upper, and either direction of letter↔digit) and on {@code _}/
-     * {@code $}, and the gate opens iff any token is in {@link #TIME_TOKENS}. So {@code startTime},
-     * {@code endMillis}, {@code expirationSecond} and {@code createdAt} qualify, while {@code update},
-     * {@code runtime}, {@code renderCount} and {@code append} do not.
-     */
-    static boolean nameSuggestsTime(final String varName) {
-        for (final String token : tokenize(varName)) {
-            if (TIME_TOKENS.contains(token)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Splits {@code name} into lowercase tokens (§22.1): {@code _} and {@code $} are separators, a
-     * lower→upper transition starts a new token (camelCase), and either direction of a letter↔digit
-     * transition does too. {@code null}/empty yields an empty list. Consecutive uppercase letters
-     * stay together (acronyms), which is harmless since no time token is a multi-letter acronym.
-     */
-    static List<String> tokenize(final String name) {
-        final List<String> tokens = new ArrayList<>();
-        if (name == null || name.isEmpty()) {
-            return tokens;
-        }
-        final StringBuilder cur = new StringBuilder();
-        char prev = 0;
-        for (int i = 0; i < name.length(); i++) {
-            final char c = name.charAt(i);
-            if (c == '_' || c == '$') {
-                flush(tokens, cur);
-                prev = 0;
-                continue;
-            }
-            if (cur.length() > 0 && prev != 0 && isTokenBoundary(prev, c)) {
-                flush(tokens, cur);
-            }
-            cur.append(c);
-            prev = c;
-        }
-        flush(tokens, cur);
-        return tokens;
-    }
-
-    /** A camelCase (lower→Upper) or letter↔digit boundary between {@code prev} and {@code c} (§22.1). */
-    private static boolean isTokenBoundary(final char prev, final char c) {
-        final boolean lowerToUpper = Character.isLowerCase(prev) && Character.isUpperCase(c);
-        final boolean letterDigit = (Character.isLetter(prev) && Character.isDigit(c))
-                || (Character.isDigit(prev) && Character.isLetter(c));
-        return lowerToUpper || letterDigit;
-    }
-
-    private static void flush(final List<String> tokens, final StringBuilder cur) {
-        if (cur.length() > 0) {
-            tokens.add(cur.toString().toLowerCase(Locale.ROOT));
-            cur.setLength(0);
-        }
+    /** §26.5: {@code   'c'} for a displayable byte (32–126 inclusive), else empty. */
+    private static String byteChar(final long slot) {
+        return slot >= 32 && slot <= 126 ? "  '" + (char) slot + "'" : "";
     }
 
     /**
@@ -201,16 +100,17 @@ final class NumberFormatUtil {
     }
 
     private static final String HEX_MARK = "  0x";
+    private static final String DATE_MARK = "  (";
     private static final Pattern INTEGRAL_HEAD = Pattern.compile("-?\\d+");
     private static final Pattern FLOAT_TEXT = Pattern.compile("-?\\d+\\.\\d+([eE][+-]?\\d+)?");
 
     /**
      * Right-aligns the numeric column of a container's element displays (§22.9), returning a same-size
      * list. When EVERY display is integral — its decimal head (the text before the {@code   0x} hex, or
-     * the whole string when there is none) is {@code -?\d+} — each head is left-padded with spaces to
-     * the widest head, the {@code   0x…} tail (if any) following unchanged. When EVERY display is
-     * floating-point (a {@code -?\d+\.\d+} with optional exponent, no hex) the INTEGER PART (before the
-     * {@code .}) is padded to the widest integer part, the fractional part unchanged. Any other mix —
+     * before the §26.4 {@code   (} date for a hex-less display, or the whole string) is {@code -?\d+} —
+     * each head is left-padded with spaces to the widest head, the tail following unchanged. When EVERY
+     * display is floating-point (a {@code -?\d+\.\d+} with optional exponent before any date suffix, no
+     * hex) the INTEGER PART (before the {@code .}) is padded to the widest integer part. Any other mix —
      * refs, strings, {@code null}, booleans, {@code NaN} — returns the input unchanged (no alignment).
      * Pure and order-preserving, so callers map the result back to their elements by index.
      */
@@ -256,13 +156,22 @@ final class NumberFormatUtil {
         if (INTEGRAL_HEAD.matcher(decimalHead(d)).matches()) {
             return 1;
         }
-        return d.indexOf(HEX_MARK) < 0 && FLOAT_TEXT.matcher(d).matches() ? 2 : 0;
+        return d.indexOf(HEX_MARK) < 0 && FLOAT_TEXT.matcher(dateHead(d)).matches() ? 2 : 0;
     }
 
-    /** The decimal text before the {@code   0x} hex, or the whole display when it carries no hex. */
+    /**
+     * The decimal text before the {@code   0x} hex — or, for a hex-less display, before any §26.4
+     * date suffix — or the whole display when it carries neither.
+     */
     private static String decimalHead(final String d) {
         final int hex = d.indexOf(HEX_MARK);
-        return hex >= 0 ? d.substring(0, hex) : d;
+        return hex >= 0 ? d.substring(0, hex) : dateHead(d);
+    }
+
+    /** The text before the §26.4 {@code   (…)} date suffix, or the whole display without one. */
+    private static String dateHead(final String d) {
+        final int date = d.indexOf(DATE_MARK);
+        return date >= 0 ? d.substring(0, date) : d;
     }
 
     /** The integer part before the first {@code .}, or the whole display when it has none. */
@@ -271,7 +180,8 @@ final class NumberFormatUtil {
         return dot >= 0 ? d.substring(0, dot) : d;
     }
 
-    private static String padLeft(final String s, final int width) {
+    /** Left-pads {@code s} with spaces to {@code width} columns (§22.9/§26.5). */
+    static String padLeft(final String s, final int width) {
         if (s.length() >= width) {
             return s;
         }
@@ -293,8 +203,11 @@ final class NumberFormatUtil {
         return b.append(h).toString();
     }
 
-    /** {@code   (YYYY-MM-DD HH:MM:SS UTC)} when {@code v} lands in an epoch range, else empty. */
-    private static String date(final long v) {
+    /**
+     * {@code   (YYYY-MM-DD HH:MM:SS UTC)} when {@code v} lands in one of the §26.4 epoch ranges
+     * (all positive, all dating between 2000-01-01 and 2100-01-01), else empty.
+     */
+    static String date(final long v) {
         final Instant instant;
         if (v >= SEC_LO && v < SEC_HI) {
             instant = Instant.ofEpochSecond(v);
@@ -302,6 +215,28 @@ final class NumberFormatUtil {
             instant = Instant.ofEpochMilli(v);
         } else if (v >= NS_LO && v < NS_HI) {
             instant = Instant.ofEpochSecond(Math.floorDiv(v, NANOS_PER_SECOND), Math.floorMod(v, NANOS_PER_SECOND));
+        } else {
+            return "";
+        }
+        return "  (" + UTC.format(instant) + " UTC)";
+    }
+
+    /**
+     * The §26.4 date for a floating-point value: the same three ranges as {@link #date(long)},
+     * the fractional part contributing sub-second precision that the (second-granular) text
+     * simply truncates. NaN/infinite/negative/out-of-range values yield empty.
+     */
+    static String date(final double v) {
+        if (!Double.isFinite(v) || v <= 0) {
+            return "";
+        }
+        final Instant instant;
+        if (v >= SEC_LO && v < SEC_HI) {
+            instant = Instant.ofEpochSecond((long) v);
+        } else if (v >= MS_LO && v < MS_HI) {
+            instant = Instant.ofEpochSecond((long) (v / MILLIS_PER_SECOND));
+        } else if (v >= NS_LO && v < NS_HI) {
+            instant = Instant.ofEpochSecond((long) (v / NANOS_PER_SECOND));
         } else {
             return "";
         }
