@@ -2263,14 +2263,30 @@ public final class Engine implements AutoCloseable {
         return switch (kind) {
             case Format.KIND_NONE -> switch (tag) {
                 case Format.TAG_NULL -> new Value.Null();
-                case Format.TAG_VOID -> new Value.Primitive("void");
+                case Format.TAG_VOID -> new Value.Primitive("void", "void");
                 default -> new Value.Absent();
             };
             case Format.KIND_INLINE -> new Value.Primitive(
-                    NumberFormatUtil.decorate(renderer.render(Format.KIND_INLINE, tag, slot, tid, false), tag, slot));
+                    NumberFormatUtil.decorate(renderer.render(Format.KIND_INLINE, tag, slot, tid, false), tag, slot),
+                    primitiveTypeName(tag));
             case Format.KIND_OBJECT_ID -> slot == 0 ? new Value.Null() : makeRef(slot);
             case Format.KIND_BLOB -> blobValue(slot, tid, truncated);
             default -> new Value.Primitive("<bad kind " + kind + ">");
+        };
+    }
+
+    /** The Java type name a FORMAT §2.3 INLINE tag denotes (§27.4), or {@code null} if unknown. */
+    private static String primitiveTypeName(final int tag) {
+        return switch (tag) {
+            case Format.TAG_INT -> "int";
+            case Format.TAG_LONG -> "long";
+            case Format.TAG_FLOAT -> "float";
+            case Format.TAG_DOUBLE -> "double";
+            case Format.TAG_BOOLEAN -> "boolean";
+            case Format.TAG_BYTE -> "byte";
+            case Format.TAG_CHAR -> "char";
+            case Format.TAG_SHORT -> "short";
+            default -> null;
         };
     }
 

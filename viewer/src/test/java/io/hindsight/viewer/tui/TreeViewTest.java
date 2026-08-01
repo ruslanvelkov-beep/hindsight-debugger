@@ -198,4 +198,29 @@ final class TreeViewTest {
         assertEquals(Set.of(100L, 200L), cs.ancestorsSeen.get("w = #300"),
                 "a Ref node still adds its id for its children");
     }
+
+    @Test
+    void viewportScrollDragsTheSelectionAlongTheEdge() {
+        // §27.1: the 2-arg scrollBy scrolls PAST the selection, dragging it along the nearest
+        // viewport edge — so repeated Ctrl-U/Ctrl-N never stick (ensureVisible then has nothing
+        // to undo). 6 leaf roots, viewport of 3 rows.
+        TreeView tree = new TreeView((node, ancestors) -> List.of());
+        tree.setRoots(List.of(leaf("a", "1"), leaf("b", "2"), leaf("c", "3"),
+                leaf("d", "4"), leaf("e", "5"), leaf("f", "6")));
+        assertEquals(0, tree.selection());
+
+        tree.scrollBy(1, 3); // viewport now rows 1..3; selection 0 dragged to the top edge
+        assertEquals(1, tree.scroll());
+        assertEquals(1, tree.selection());
+        tree.scrollBy(2, 3); // rows 3..5 — the max offset for 6 rows
+        assertEquals(3, tree.scroll());
+        assertEquals(3, tree.selection());
+        tree.scrollBy(5, 3); // clamped at the bottom
+        assertEquals(3, tree.scroll());
+        tree.ensureVisible(3, 6);
+        assertEquals(3, tree.scroll(), "ensureVisible has nothing to undo after a dragged scroll");
+        tree.scrollBy(-10, 3); // and back to the top, selection dragged into the viewport
+        assertEquals(0, tree.scroll());
+        assertEquals(2, tree.selection(), "selection dragged to the bottom edge of the viewport");
+    }
 }

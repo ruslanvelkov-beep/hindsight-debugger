@@ -25,8 +25,19 @@ public sealed interface Value {
     /** Human-readable text for this value, ready to drop into a tree label or locals row. */
     String display();
 
-    /** A primitive or boxed primitive, already rendered by the reader's {@code ValueRenderer}. */
-    record Primitive(String rendered) implements Value {
+    /**
+     * A primitive or boxed primitive, already rendered by the reader's {@code ValueRenderer}.
+     * {@code typeName} is the Java type the FORMAT §2.3 tag names ({@code "long"}, {@code "char"},
+     * …) so the info line can always name the type even for nested fields whose slot descriptor
+     * is unknown (§27.4); {@code null} when built without tag knowledge.
+     */
+    record Primitive(String rendered, String typeName) implements Value {
+
+        /** A primitive of unknown type (hand-built values, error sentinels). */
+        public Primitive(final String rendered) {
+            this(rendered, null);
+        }
+
         @Override
         public String display() {
             return rendered;

@@ -72,6 +72,8 @@ final class EngineV21Test {
             assertEquals("count", count.name());
             assertEquals(MILLIS_DATED, count.value().display(),
                     "an in-range value is dated whatever its name (the §22.1 gate is retired)");
+            // §27.4: engine-produced primitives carry their tag's exact type name.
+            assertEquals("long", ((Value.Primitive) count.value()).typeName());
         }
     }
 

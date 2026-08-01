@@ -76,4 +76,17 @@ final class TypeNameTest {
     void unrecognisableTextIsReturnedAsIs() {
         assertEquals("<bad kind 9>", TypeName.of(new Value.Primitive("<bad kind 9>"), null, KNOWN));
     }
+
+    @Test
+    void tagCarriedTypeNameWinsOverEveryHeuristic() {
+        // §27.4: an engine-produced primitive names its exact type even for nested fields whose
+        // slot descriptor is unknown — hex/date-decorated text no longer defeats the type.
+        assertEquals("long", TypeName.of(new Value.Primitive("11  0x000000000000000B", "long"), null, KNOWN));
+        assertEquals("byte", TypeName.of(new Value.Primitive("72  0x48  'H'", "byte"), null, KNOWN));
+        assertEquals("float", TypeName.of(new Value.Primitive("1.5", "float"), null, KNOWN));
+        // The tag name also beats a (theoretically contradicting) descriptor — it is exact.
+        assertEquals("long", TypeName.of(new Value.Primitive("5", "long"), "I", KNOWN));
+        // Without a tag name, the old text/descriptor heuristics still apply (tests above).
+        assertEquals("int", TypeName.of(new Value.Primitive("42"), null, KNOWN));
+    }
 }

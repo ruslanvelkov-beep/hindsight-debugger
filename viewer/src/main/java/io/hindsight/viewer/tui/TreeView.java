@@ -108,6 +108,19 @@ public final class TreeView {
         scroll = Math.max(0, scroll + delta);
     }
 
+    /**
+     * §27.1: viewport scroll that can run PAST the selection — scrolls by {@code delta} within a
+     * {@code viewH}-row viewport and drags the selection along the nearest edge when it would fall
+     * outside, exactly like the flat list windows' Ctrl-U/Ctrl-N. {@link #ensureVisible} then has
+     * nothing to undo, so scrolling continues freely instead of sticking at the selection.
+     */
+    public void scrollBy(final int delta, final int viewH) {
+        int total = rows().size();
+        int h = Math.max(1, viewH);
+        scroll = Math.max(0, Math.min(scroll + delta, Math.max(0, total - h)));
+        selection = Math.max(scroll, Math.min(selection, scroll + h - 1));
+    }
+
     /** Adjusts the scroll offset so the selection is visible within a {@code height}-row viewport. */
     public void ensureVisible(final int height, final int total) {
         if (height <= 0) {

@@ -52,7 +52,9 @@ public final class TypeName {
             case Value.Str ignored -> "java.lang.String";
             case Value.Null ignored -> "null";
             case Value.Absent ignored -> "<absent>";
-            case Value.Primitive p -> primitiveName(p.rendered(), descriptor);
+            // §27.4: the tag-carried type is exact — nested fields name their type even without
+            // a slot descriptor; the text/descriptor heuristics remain for hand-built values.
+            case Value.Primitive p -> p.typeName() != null ? p.typeName() : primitiveName(p.rendered(), descriptor);
         };
     }
 

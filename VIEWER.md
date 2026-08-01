@@ -1556,6 +1556,7 @@ In the `.` dialog `Tab` toggles the `query:` ↔ `thread:` fields (the `/` brows
 for calls ↔ instances). `^F` focuses the filter/query field and `^T` the thread field from
 ANY focus, in both the `/` and `.` dialogs; the `F` browser's `^F` focuses its filter too.
 Consequently `^F` no longer pages inside these dialogs — PgDn (and `^B`/PgUp) still page.
+(§27.2 moves the filter-focus key to `^L` and returns `^F` to PageDown.)
 
 ### 26.3 Sources pinned to the recording's git commit
 A recording is only line-accurate against the commit it was made at (`sourceCommit`,
@@ -1587,8 +1588,8 @@ The §21.1/§22.1 name gate is RETIRED: no variable name is consulted. Any posit
 `(YYYY-MM-DD HH:MM:SS UTC)` after its hex: seconds `[946684800, 4102444800)`, millis
 and nanos scaled likewise — each dating between 2000-01-01 and 2100-01-01. Every INLINE
 render site is covered identically (locals, args, snapshot fields, field-write transitions,
-watches, container elements, map keys/values). Microseconds are deliberately not a range.
-The §22.9 element alignment understands the new suffixes.
+watches, container elements, map keys/values). Microseconds were initially left out;
+§27.3 adds them. The §22.9 element alignment understands the new suffixes.
 
 ### 26.5 Array/container element forms
 - Element indices right-align to the widest shown index (`" [9] = "` under `"[10] = "`) so
@@ -1606,7 +1607,8 @@ boxed primitive, a string (`String`/`StringBuilder`/`StringBuffer`) or a scalar 
 after the type info — hex and the §26.4 date included, strings simply filling to the end
 of the line. The value shown is exactly the explored node's rendered value. A nested
 (descriptor-less) primitive whose decorated text defeats the type heuristics shows the
-value alone rather than a guessed type followed by the same text twice.
+value alone rather than a guessed type followed by the same text twice. (§27.4 retires
+that fallback for engine-produced values: their tag names the exact type.)
 
 ### 26.7 Opening record — `--seq N`, `--last`, line-trace default
 - `viewer --seq N` opens on the nearest exec record at/before global seq N — N itself
@@ -1635,3 +1637,36 @@ record with line info or method enter/exit (the §17.1 exec set) by GLOBAL seq, 
 threads freely (unlike F7/⇧F7, which stay in the current thread). Backed by the new
 engine API `toExecAnyThread(forward)`; each jump appends one history entry. The bottom
 help row describes the keys while Records is focused, and the Help window lists them.
+
+## 27. v2.7 fixes
+
+### 27.1 Instances-tree viewport scroll drags the selection
+`Ctrl-U`/`Ctrl-N` in the `/` browser's instances tree behaved unlike the `.`/calls flat
+lists: the tree scrolled the offset only, and the render-time selection-visibility clamp
+snapped it back once the selection reached a viewport edge — so scrolling stuck. The tree
+now uses the same rule as the flat lists (a new viewport-aware `TreeView.scrollBy`): the
+selection is dragged along the nearest edge when it would fall outside, so scrolling
+continues freely. The MAIN windows' §20.13 semantics (offset pinned by the selection)
+are deliberately unchanged.
+
+### 27.2 `^L` focuses the filter; `^F` is PageDown again
+§26.2 gave `^F` a second job (focus-the-filter) inside the `/`, `.` and `F` dialogs,
+colliding with its PageDown role everywhere else. Now: `^L` focuses the filter/query field
+(and `^T` the thread field, unchanged) in all three dialogs, from any focus; `^F` pages
+down again exactly like everywhere else (`^B` pages up). Consequently `^L` no longer
+horizontal-scrolls inside these dialogs — `^K`, `<`/`>` and `←`/`→` still do.
+
+### 27.3 Microseconds date range
+The §26.4 trio left a gap between millis and nanos: a microseconds timestamp like
+`startTime = 1338404429826375` (2012-05-30 19:00:29 UTC) never dated. A fourth range —
+micros `[946684800000000, 4102444800000000)`, dating between 2000-01-01 and 2100-01-01
+like the others — closes it, for ints/longs and floats/doubles alike.
+
+### 27.4 The info line always names the explored value's type
+`Value.Primitive` now carries the Java type its FORMAT §2.3 tag denotes (`"long"`,
+`"char"`, …), assigned by the engine's single INLINE render path — so the info line names
+the exact type even for NESTED fields whose slot descriptor is unknown (an `AccountID`'s
+`shardNum` reads `long  =  11  0x000000000000000B`, not a bare value). The `/` instances
+browser's info line gains the same type-and-value text after the owning instance's
+`class#id`. Hand-built values without tag knowledge keep the old text/descriptor
+heuristics.

@@ -1205,10 +1205,20 @@ public final class ViewerApp {
         if (dialog != null && dialog.kind == DialogKind.METHOD && dialog.instancesMode) {
             InstanceBrowse.Row row = selectedInstanceRow();
             if (row != null) {
-                // §26.6: the explored NODE's value (scalar/boxed/atomic/string) rides after the
-                // owning instance's class#id, so values peek without expanding further.
-                return (row.classBinary() != null ? row.classBinary() : "?") + "#" + row.objectId()
-                        + exploredValueSuffix(selectedInstanceNodeValue());
+                // §26.6/§27.4: the explored NODE's type and value (scalar/boxed/atomic/string)
+                // ride after the owning instance's class#id, so values peek without expanding.
+                String base = (row.classBinary() != null ? row.classBinary() : "?") + "#" + row.objectId();
+                Value nodeVal = selectedInstanceNodeValue();
+                String suffix = exploredValueSuffix(nodeVal);
+                if (suffix.isEmpty()) {
+                    return base;
+                }
+                String type = TypeName.of(nodeVal, null, recording::objectClassName);
+                // §27.4: skip the type when it IS the base (a wrapper ROOT's own class#id) or
+                // the suffix already carries the same text — never the same thing twice.
+                return type != null && !type.equals(base) && !suffix.equals("  =  " + type)
+                        ? base + DOT + type + suffix
+                        : base + suffix;
             }
         } else if (dialog == null && focus == Win.LOCALS) {
             String type = TypeName.of(localsSelValue, localsSelDescriptor, recording::objectClassName);
@@ -1604,7 +1614,7 @@ public final class ViewerApp {
             // §15.4/§26.1: both flat lists number their rows from 1.
             String text = DialogFormat.number(idx, dialog.rows.size()) + dialog.rows.get(idx)
                     + (dialog.kind == DialogKind.OBJECT ? dialog.chains.getOrDefault(idx, "") : "");
-            // §24.1: rows participate in the <>/←→/^K^L horizontal scroll, whole row included.
+            // §24.1/§27.2: rows participate in the <>/←→/^K horizontal scroll, whole row included.
             String visible = HScroll.clip(text, dialog.hcol, iw);
             TextColor fg = s ? Palette.SELECTION_FG : Palette.FG;
             TextColor bg = s ? Palette.SELECTION_BG : Palette.DIALOG_BG;
@@ -1633,9 +1643,9 @@ public final class ViewerApp {
                 return "type #id, Class#id or class  ⇥/^T thread  ↓ results  ^U clear  Esc";
             }
             if (dialog.focus == DialogFocus.THREAD) {
-                return "digits: filter by thread id  ⇥/^F query  ↓ results  ^U clear  Esc";
+                return "digits: filter by thread id  ⇥/^L query  ↓ results  ^U clear  Esc";
             }
-            return "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K^L hscroll  PgUp/PgDn  ^F/^T fields  g/G  Esc";
+            return "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K hscroll  ^F/^B pg  ^L filter  ^T thread  g/G  Esc";
         }
         if (dialog.focus == DialogFocus.QUERY) {
             return dialog.instancesMode
@@ -1646,8 +1656,8 @@ public final class ViewerApp {
             return "digits: filter by thread id  ← regex  ↓ results  ^U clear  Esc";
         }
         return dialog.instancesMode
-                ? "↑↓ move  →/↵ expand  ← collapse  f first-mention  ^F/^T fields  / query  Esc"
-                : "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K^L hscroll  PgUp/PgDn  ^F/^T fields  g/G  Esc";
+                ? "↑↓ move  →/↵ expand  ← collapse  f first-mention  ^F/^B pg  ^L/^T fields  / query  Esc"
+                : "↑↓ select  ↵ jump  ^U/^N scroll  <>/^K hscroll  ^F/^B pg  ^L filter  ^T thread  g/G  Esc";
     }
 
     /**
@@ -1841,7 +1851,7 @@ public final class ViewerApp {
             "Ctrl+K / Ctrl+L       hscroll left / right (= < / > and ←/→)",
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End     page / jump to ends;  g / G  top/bottom",
-            "^F ^T (in dialogs)    focus the filter / thread field (⇥ in .)",
+            "^L ^T (in dialogs)    focus the filter / thread field (⇥ in .)",
             "v                     variable history for the cursor line",
             "V                     global variable-change list (field filter)",
             "Alt-F                 find in Source / the focused list window",
@@ -2515,14 +2525,15 @@ public final class ViewerApp {
             } else {
                 // §26.2: in the `.` dialog Tab toggles the query ↔ thread fields (from the LIST
                 // it enters the primary query field first; the `/` browser keeps Tab for its
-                // calls ↔ instances mode — use ^T/^F there).
+                // calls ↔ instances mode — use ^T/^L there).
                 focusDialogField(dialog.focus == DialogFocus.QUERY ? DialogFocus.THREAD : DialogFocus.QUERY);
             }
             return;
         }
-        // §26.2: ^F focuses the filter/query field and ^T the thread field, from ANY focus —
-        // both dialogs. (^F therefore no longer pages the list; PgDn and ^B/PgUp still do.)
-        if (k.isCtrlDown() && isChar(k, 'f')) {
+        // §27.2: ^L focuses the filter/query field and ^T the thread field, from ANY focus —
+        // both dialogs. (^F stays PageDown, like everywhere else; ^L therefore no longer
+        // horizontal-scrolls inside these dialogs — ^K, </> and ←/→ still do.)
+        if (k.isCtrlDown() && isChar(k, 'l')) {
             focusDialogField(DialogFocus.QUERY);
             return;
         }
@@ -2539,7 +2550,7 @@ public final class ViewerApp {
         }
     }
 
-    /** §26.2: focus a dialog input field with its caret at the end (Tab / ^F / ^T jumps). */
+    /** §26.2/§27.2: focus a dialog input field with its caret at the end (Tab / ^L / ^T jumps). */
     private void focusDialogField(final DialogFocus field) {
         dialog.focus = field;
         if (field == DialogFocus.THREAD) {
@@ -2708,11 +2719,11 @@ public final class ViewerApp {
     }
 
     /**
-     * LIST-focus keys (§15.2/§24.1, shared by {@code /} and {@code .}): ↑/↓ move, PgDn/PgUp
-     * (and Ctrl-B) page — Ctrl-F/Ctrl-T focus the filter/thread fields instead (§26.2) —
+     * LIST-focus keys (§15.2/§24.1, shared by {@code /} and {@code .}): ↑/↓ move, Ctrl-F/Ctrl-B
+     * and PgDn/PgUp page — Ctrl-L/Ctrl-T focus the filter/thread fields (§27.2) —
      * {@code g}/{@code G} jump to the first/last row; the four §20.13
      * per-window scroll keys work like in every other window — Ctrl-U/Ctrl-N scroll the viewport
-     * one line and Ctrl-K/Ctrl-L (with {@code <}/{@code >}) scroll horizontally. In instances
+     * one line and Ctrl-K (with {@code <}/{@code >} and ←/→, §27.2) scrolls horizontally. In instances
      * mode →/↵ expand, ← collapses, {@code f} jumps to the selected row's owning instance's first
      * mention (dialog stays open); in the flat lists (calls / object usage) ←/→ scroll
      * horizontally and ↵ jumps and closes. {@code /} returns the focus to the query line; all
@@ -2745,15 +2756,16 @@ public final class ViewerApp {
             moveSearchSelection(-page);
             return;
         }
-        if (t == KeyType.PageDown) {
+        if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
             moveSearchSelection(page);
             return;
         }
         if (ctrl && (isChar(k, 'u') || isChar(k, 'n'))) {
-            // §24.1: viewport scroll, selection dragged along only at the view's edge.
+            // §24.1/§27.1: viewport scroll, selection dragged along only at the view's edge —
+            // the instances tree included, so scrolling never sticks at the selection.
             int delta = isChar(k, 'u') ? -1 : 1;
             if (dialog.instancesMode) {
-                dialog.instanceTree.scrollBy(delta);
+                dialog.instanceTree.scrollBy(delta, Math.max(1, dialog.listViewH));
             } else {
                 dialog.scroll = clamp(dialog.scroll + delta,
                         0, Math.max(0, dialog.rows.size() - dialog.listViewH));
@@ -2762,8 +2774,8 @@ public final class ViewerApp {
             }
             return;
         }
-        if (ctrl && (isChar(k, 'k') || isChar(k, 'l'))) {
-            dialog.hcol = Math.max(0, dialog.hcol + (isChar(k, 'k') ? -HSTEP : HSTEP));
+        if (ctrl && isChar(k, 'k')) {
+            dialog.hcol = Math.max(0, dialog.hcol - HSTEP); // §27.2: ^L now focuses the filter
             return;
         }
         if (!ctrl && isChar(k, 'g')) {
@@ -4103,8 +4115,8 @@ public final class ViewerApp {
      * longer quits); Esc closes from either §15.2 focus, keeping the state for reopen (§15.5).
      */
     private void handleFileDialog(final KeyStroke k) {
-        if (k.isCtrlDown() && isChar(k, 'f')) {
-            fileDialog.focus = DialogFocus.QUERY; // §26.2: ^F jumps to the filter field
+        if (k.isCtrlDown() && isChar(k, 'l')) {
+            fileDialog.focus = DialogFocus.QUERY; // §27.2: ^L jumps to the filter field
             return;
         }
         if (k.getKeyType() == KeyType.Escape) {
@@ -4182,8 +4194,8 @@ public final class ViewerApp {
      * {@code g}/{@code G} jump to the ends, {@code /} returns to the filter line. In BROWSE mode
      * →/↵ expand a directory (↵ on a FILE opens it), ← collapses (or moves to the parent). In FLAT
      * mode expand/collapse is hidden: ↵ opens the selected file and ←/→ (and {@code <}/{@code >})
-     * horizontally scroll the selected row to reveal its clipped path prefix. PgDn/PgUp (and
-     * Ctrl-B) page; Ctrl-F focuses the filter field instead (§26.2).
+     * horizontally scroll the selected row to reveal its clipped path prefix. Ctrl-F/Ctrl-B and
+     * PgDn/PgUp page; Ctrl-L focuses the filter field (§27.2).
      */
     private void handleFileListKey(final KeyStroke k) {
         KeyType t = k.getKeyType();
@@ -4214,13 +4226,13 @@ public final class ViewerApp {
             fileDialog.sel = Math.max(0, fileDialog.sel - page);
             return;
         }
-        if (t == KeyType.PageDown) {
+        if (t == KeyType.PageDown || (ctrl && isChar(k, 'f'))) {
             fileDialog.sel = Math.min(last, fileDialog.sel + page);
             return;
         }
         // §24.6: the four §20.13 per-window scroll keys work here like in every other window —
         // Ctrl-U/Ctrl-N scroll the viewport one line (selection dragged along the nearest edge
-        // only when it would leave the view), Ctrl-K/Ctrl-L (and </> below) scroll horizontally.
+        // only when it would leave the view), Ctrl-K (and </> below, §27.2) scrolls horizontally.
         if (ctrl && (isChar(k, 'u') || isChar(k, 'n'))) {
             fileDialog.scroll = clamp(fileDialog.scroll + (isChar(k, 'u') ? -1 : 1),
                     0, Math.max(0, count - fileDialog.listViewH));
@@ -4228,8 +4240,8 @@ public final class ViewerApp {
                     fileDialog.scroll + Math.max(0, fileDialog.listViewH - 1));
             return;
         }
-        if (ctrl && (isChar(k, 'k') || isChar(k, 'l'))) {
-            fileDialog.hcol = Math.max(0, fileDialog.hcol + (isChar(k, 'k') ? -HSTEP : HSTEP));
+        if (ctrl && isChar(k, 'k')) {
+            fileDialog.hcol = Math.max(0, fileDialog.hcol - HSTEP); // §27.2: ^L focuses the filter
             return;
         }
         if (!ctrl && isChar(k, 'g')) {
@@ -4362,9 +4374,9 @@ public final class ViewerApp {
         if (fileDialog.focus == DialogFocus.QUERY) {
             hint = "type to filter (regex)  ↓ list  ^U clear  Esc close";
         } else if (flat) {
-            hint = "↑↓ move  ↵ open  ←→/<>/^K^L hscroll  ^U/^N scroll  PgUp/PgDn  / or ^F filter  g/G  Esc";
+            hint = "↑↓ move  ↵ open  ←→/<>/^K hscroll  ^U/^N scroll  ^F/^B pg  / or ^L filter  g/G  Esc";
         } else {
-            hint = "↑↓ move  →/↵ open/expand  ← collapse  <>/^K^L hscroll  ^U/^N scroll  PgUp/PgDn  / or ^F filter  g/G  Esc";
+            hint = "↑↓ move  →/↵ open/expand  ← collapse  <>/^K hscroll  ^U/^N scroll  ^F/^B pg  / or ^L filter  g/G  Esc";
         }
         put(g, ix, hintRow, clip(hint, iw), Palette.DIM, Palette.DIALOG_BG, false);
 
@@ -4399,7 +4411,7 @@ public final class ViewerApp {
             if (flat) {
                 drawFlatFileRow(g, ix, listTop + r, iw, flatRows.get(idx).rel(), query, fg, bg);
             } else {
-                // §24.6: BROWSE rows participate in the ^K/^L / </> horizontal scroll like every
+                // §24.6/§27.2: BROWSE rows participate in the ^K / </> horizontal scroll like every
                 // other list window (deep trees clip on the right otherwise).
                 put(g, ix, listTop + r, clipPad(HScroll.clip(browseRowText(browseRows.get(idx)),
                         fileDialog.hcol, iw), iw), fg, bg, false);

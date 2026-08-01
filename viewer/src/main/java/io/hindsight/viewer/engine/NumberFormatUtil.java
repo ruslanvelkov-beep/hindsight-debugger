@@ -26,8 +26,9 @@ import java.util.regex.Pattern;
  *   <li><b>Char (§26.5).</b> {@code 'c'}, two spaces, the decimal char code left-padded to 5,
  *       then the hex: {@code 'A'     65  0x0041}.</li>
  *   <li><b>Date (§26.4).</b> Purely value-range-gated (the §21.1/§22.1 name gate is retired):
- *       any positive int/long — or float/double — landing in one of three epoch ranges that
- *       fall between 2000-01-01 and 2100-01-01 (seconds, millis, nanos since 1970-01-01) gets
+ *       any positive int/long — or float/double — landing in one of four epoch ranges that
+ *       fall between 2000-01-01 and 2100-01-01 (seconds, millis, micros, nanos since
+ *       1970-01-01) gets
  *       a UTC wall-clock suffix {@code (YYYY-MM-DD HH:MM:SS UTC)} (no sub-second text). The
  *       date follows the hex.</li>
  * </ul>
@@ -42,14 +43,17 @@ final class NumberFormatUtil {
     private static final DateTimeFormatter UTC =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT).withZone(ZoneOffset.UTC);
 
-    // §26.4: epoch ranges whose datings land between 2000-01-01T00:00Z and 2100-01-01T00:00Z.
+    // §26.4/§27.3: epoch ranges whose datings land between 2000-01-01T00:00Z and 2100-01-01T00:00Z.
     private static final long SEC_LO = 946_684_800L;
     private static final long SEC_HI = 4_102_444_800L;
     private static final long MS_LO = 946_684_800_000L;
     private static final long MS_HI = 4_102_444_800_000L;
+    private static final long US_LO = 946_684_800_000_000L;
+    private static final long US_HI = 4_102_444_800_000_000L;
     private static final long NS_LO = 946_684_800_000_000_000L;
     private static final long NS_HI = 4_102_444_800_000_000_000L;
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final long MICROS_PER_SECOND = 1_000_000L;
     private static final long MILLIS_PER_SECOND = 1_000L;
 
     private NumberFormatUtil() {}
@@ -213,6 +217,9 @@ final class NumberFormatUtil {
             instant = Instant.ofEpochSecond(v);
         } else if (v >= MS_LO && v < MS_HI) {
             instant = Instant.ofEpochMilli(v);
+        } else if (v >= US_LO && v < US_HI) {
+            // §27.3: microseconds — the gap the §26.4 trio left between millis and nanos.
+            instant = Instant.ofEpochSecond(v / MICROS_PER_SECOND, (v % MICROS_PER_SECOND) * 1_000L);
         } else if (v >= NS_LO && v < NS_HI) {
             instant = Instant.ofEpochSecond(Math.floorDiv(v, NANOS_PER_SECOND), Math.floorMod(v, NANOS_PER_SECOND));
         } else {
@@ -222,7 +229,7 @@ final class NumberFormatUtil {
     }
 
     /**
-     * The §26.4 date for a floating-point value: the same three ranges as {@link #date(long)},
+     * The §26.4/§27.3 date for a floating-point value: the same four ranges as {@link #date(long)},
      * the fractional part contributing sub-second precision that the (second-granular) text
      * simply truncates. NaN/infinite/negative/out-of-range values yield empty.
      */
@@ -235,6 +242,8 @@ final class NumberFormatUtil {
             instant = Instant.ofEpochSecond((long) v);
         } else if (v >= MS_LO && v < MS_HI) {
             instant = Instant.ofEpochSecond((long) (v / MILLIS_PER_SECOND));
+        } else if (v >= US_LO && v < US_HI) {
+            instant = Instant.ofEpochSecond((long) (v / MICROS_PER_SECOND));
         } else if (v >= NS_LO && v < NS_HI) {
             instant = Instant.ofEpochSecond((long) (v / NANOS_PER_SECOND));
         } else {

@@ -93,6 +93,13 @@ final class NumberFormatUtilTest {
         assertEquals("", NumberFormatUtil.date(4_102_444_800_000L));
         assertEquals("  (2000-01-01 00:00:00 UTC)", NumberFormatUtil.date(946_684_800_000_000_000L));
         assertEquals("", NumberFormatUtil.date(4_102_444_800_000_000_000L));
+        // §27.3: MICROSECONDS date too — the gap the original trio left between millis and nanos.
+        assertEquals("  (2000-01-01 00:00:00 UTC)", NumberFormatUtil.date(946_684_800_000_000L));
+        assertEquals("  (2099-12-31 23:59:59 UTC)", NumberFormatUtil.date(4_102_444_799_999_999L));
+        assertEquals("", NumberFormatUtil.date(946_684_799_999_999L)); // just below the micros low
+        // The report that motivated §27.3: a micros timestamp (startTime) must read as a date.
+        assertEquals("  (2012-05-30 19:00:29 UTC)", NumberFormatUtil.date(1_338_404_429_826_375L));
+        assertEquals("  (2012-05-30 19:00:29 UTC)", NumberFormatUtil.date(1.338404429826375e15d));
         // Between ranges / negative: no date.
         assertEquals("", NumberFormatUtil.date(5_000_000_000L));
         assertEquals("", NumberFormatUtil.date(-1_700_000_000L));
