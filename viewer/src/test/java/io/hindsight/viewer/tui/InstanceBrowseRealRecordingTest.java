@@ -22,9 +22,10 @@ import org.junit.jupiter.api.Test;
  */
 final class InstanceBrowseRealRecordingTest {
 
+    // The directory containing the transfer-N recordings, from -Dhindsight.recordingsDir=<dir>;
+    // a non-existent placeholder when unset, so the tests below self-skip via assumeTrue.
     private static final Path BASE = Path.of(
-            "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/"
-                    + "hedera-node/test-clients/build/hindsight/recordings");
+            System.getProperty("hindsight.recordingsDir", "hindsight-recordings-not-configured"));
 
     @Test
     void simpleNameQueriesReturnOnlySimpleNameMatchesSchema3() throws IOException {

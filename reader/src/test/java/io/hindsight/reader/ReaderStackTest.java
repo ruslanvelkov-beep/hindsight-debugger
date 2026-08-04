@@ -137,18 +137,20 @@ final class ReaderStackTest {
     }
 
     /**
-     * Real-world schema-3 regression: the consensus-node transfer capture must keep opening,
+     * Real-world schema-3 regression: a large real-world capture must keep opening,
      * reading and verifying untouched by the schema-4 additions. The capture itself carries a
-     * handful of pre-existing violations (the node died by SIGKILL: torn blob tails,
+     * handful of pre-existing violations (the app died by SIGKILL: torn blob tails,
      * unbalanced exits), so the assertion is not "verify is clean" but "nothing the schema-4
      * machinery added fires on it". Self-skips when the recording is not on this machine.
      */
     @Test
     void realSchema3RecordingStillOpensAndVerifies() throws IOException {
-        Path dir = Path.of(System.getProperty("hindsight.realRecordingDir",
-                "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/hedera-node/"
-                        + "test-clients/build/hindsight/recordings/transfer-11"));
-        assumeTrue(Files.isDirectory(dir), "real schema-3 recording not present — skipping");
+        // The transfer-11 recording under -Dhindsight.recordingsDir=<dir>, or a non-existent
+        // placeholder when unset — so this test self-skips off the author's machine.
+        String base = System.getProperty("hindsight.recordingsDir");
+        Path dir = Path.of(base != null ? base : "hindsight-recordings-not-configured", "transfer-11");
+        assumeTrue(Files.isDirectory(dir), "real schema-3 recording not present — skipping "
+                + "(set -Dhindsight.recordingsDir to run)");
         try (Recording rec = Recording.open(dir)) {
             assertEquals(3, rec.schemaVersion());
         }

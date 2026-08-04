@@ -26,13 +26,19 @@ import org.junit.jupiter.api.Test;
  */
 final class EngineRealRecordingTest {
 
-    private static final Path REAL = Path.of(
-            "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/"
-                    + "hedera-node/test-clients/build/hindsight/recordings/transfer-11");
+    private static final Path REAL = realRecording("transfer-11");
 
-    private static final Path REAL2 = Path.of(
-            "/Users/ruslan.velkov/IdeaProjects/cloned/hiero-consensus-node/"
-                    + "hedera-node/test-clients/build/hindsight/recordings/transfer-12");
+    private static final Path REAL2 = realRecording("transfer-12");
+
+    /**
+     * A named recording under the directory given by {@code -Dhindsight.recordingsDir=<dir>}
+     * (the directory containing the {@code transfer-N} recordings), or a non-existent placeholder
+     * when the property is unset — so the tests below self-skip via {@code assumeTrue}.
+     */
+    private static Path realRecording(final String name) {
+        String base = System.getProperty("hindsight.recordingsDir");
+        return Path.of(base != null ? base : "hindsight-recordings-not-configured", name);
+    }
 
     @Test
     void stepsThroughRealRecordingWithoutThrowing() throws IOException {
