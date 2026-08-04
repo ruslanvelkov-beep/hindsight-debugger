@@ -197,4 +197,45 @@ final class DeclLineTest {
         assertEquals(5, DeclLine.find(List.of(), "helper", "Foo", 5), "empty file");
         assertEquals(0, DeclLine.find(lines, "helper", "Foo", 0), "non-positive body line");
     }
+
+    // ---- §28.2 review regressions: call sites and string literals never win ----
+
+    @Test
+    void methodCallSiteDoesNotOutvoteTheDeclaration() {
+        List<String> f = List.of(
+                "class V {",                    // 1
+                "    void visit(Node n) {",     // 2
+                "        prepare();",           // 3
+                "        child.visit(n.left);", // 4 — a CALL, must not win
+                "        int x = 1;",           // 5
+                "    }",                        // 6
+                "}");                           // 7
+        assertEquals(2, DeclLine.findOrZero(f, "visit", "V", 5, Integer.MAX_VALUE),
+                "the child.visit(...) call on line 4 is not the declaration");
+    }
+
+    @Test
+    void typeMentionInAStringLiteralIsIgnored() {
+        List<String> f = List.of(
+                "class Buffer {",                             // 1 — the real declaration
+                "    void log() {",                           // 2
+                "        LOG.info(\"in class Buffer now\");",  // 3 — a string, must not win
+                "        int x = 1;",                         // 4
+                "    }",                                      // 5
+                "}");                                         // 6
+        assertEquals(1, DeclLine.findTypeOrZero(f, "Buffer", 4),
+                "the 'class Buffer' inside the string on line 3 is not a declaration");
+    }
+
+    @Test
+    void nameInsideALongerIdentifierIsNotAWholeWordMatch() {
+        List<String> f = List.of(
+                "class X {",                 // 1
+                "    void previsit() { }",   // 2 — contains 'visit' but is not it
+                "    void visit() { }",      // 3
+                "}");                        // 4
+        assertEquals(3, DeclLine.findOrZero(f, "visit", "X", 3, Integer.MAX_VALUE));
+        assertEquals("say", DeclLine.stripLiterals("say \"hi\" // and bye").strip(),
+                "the string and line comment blank to whitespace; code words stay");
+    }
 }

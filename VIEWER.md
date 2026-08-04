@@ -926,7 +926,10 @@ everything else works on existing schema-4 recordings.
 Stepping stops ONLY at records that change the execution position — the **exec set**:
 `LINE`, `METHOD_ENTER`, `METHOD_EXIT`. Metadata records (first-seen, snapshots,
 thread-start, time-sync, stack captures) and value records (ARG, LOCAL_WRITE,
-FIELD_WRITE, BRANCH) are never step landings.
+FIELD_WRITE, BRANCH) are never step landings — **except** (§28.9) a `BRANCH` record in a
+branch-mode frame (one with no `LINE` records of its own), which joins the exec set so
+branch-resolution recordings step naturally; landing legality is therefore per-index
+(`Engine.isExecLanding`), not per record type.
 - `ThreadIndex` gains `execIndices` (ascending record indices of the exec set) beside
   `lineIndices`; all stepping walks it.
 - `stepInto` / `reverseStep`: the next/previous exec record in the thread.
@@ -1670,3 +1673,97 @@ the exact type even for NESTED fields whose slot descriptor is unknown (an `Acco
 browser's info line gains the same type-and-value text after the owning instance's
 `class#id`. Hand-built values without tag knowledge keep the old text/descriptor
 heuristics.
+
+## 28. v2.8 additions & changes
+
+### 28.1 Source title = the file's repo-relative path
+The Source window title text is the shown file's path from the repo (`.git`) root
+(via the §26.3 pinned view or the `--repo` bases; source-root-relative, then the bare name,
+as fallbacks), drawn `␣<path>␣` on the top border between `┌─ Source Code [c] ────` and
+`───┐` — right-anchored with its trailing space four columns before the corner, starting no
+earlier than four dashes after the title, and trimmed from the LEFT with a leading ellipsis
+when too long. It replaces both the old §18.1 frame text and the browse-mode title suffix
+(the class/method identity now lives in §28.2's pinned lines and the Stack window).
+
+### 28.2 Sticky definition lines
+When the enclosing CLASS declaration line is scrolled above the viewport (≤ the top line),
+it is pinned as the first Source body row; when the enclosing METHOD/constructor
+declaration is also out of view (≤ top+1 with the class pinned), it is pinned as the second
+row — file, then class, then method, exactly the context that would otherwise be invisible.
+Pinned rows are REAL rows: real line numbers, syntax, highlights; the body keeps its normal
+top-anchored mapping (the pins simply cover the top rows; scrolling up reveals them and the
+pins dissolve — nothing is pinned that could otherwise be seen). Declarations are found
+lexically, scanning UP from the frame's current line, so the NEAREST declaration wins —
+which disambiguates overloads, and a constructor pins its own definition line (never an
+`<init>` rendering). Exec mode only (browse has no frame identity).
+
+### 28.3 Scroll-only partial redraw
+A pure scroll/selection-move key repaints ONLY the focused window (its rectangle is cleared
+and redrawn) plus the status and help rows — every other window's cells stay untouched in
+the back buffer, and no engine state is recomputed for them. Anything else — jumps, `o`,
+frame selection, opening/closing any window or dialog, a terminal resize — keeps the full
+render. Correctness rule: a scroll never moves the engine, so the skipped windows are
+still exact.
+
+### 28.4 Unpinned scrolling everywhere
+Supersedes §20.13's pinned-offset semantics: the main list windows (Threads, Stack, Locals,
+Records — the last previously did not scroll at all) scroll exactly like the dialogs — the
+viewport moves freely and the selection is dragged along the nearest edge when it would
+fall outside (`dragScroll`/`dragSel`, one shared rule). The Stack drag moves the VIEW
+selection only; it never selects a frame (↑/↓ and Enter still do).
+
+### 28.5 `.` (find object usage) — simple-name matching + landing-context chains
+- An unqualified class query (no `.`/`$`) matches the SIMPLE class name only (the §15.1
+  rule), so `buffer` no longer matches every class whose PACKAGE contains `.buffer.`;
+  qualified queries still match the full binary name.
+- The §24.3 containment chains are computed at the exec LANDING of the row's record —
+  exactly where Enter puts the cursor — with roots drawn from EVERY stack frame's
+  locals/args/`this` (innermost first) and higher search limits (depth 6, 600 expansions),
+  so an instance that is not directly visible in Locals shows the path to a variable that
+  IS explorable there.
+
+### 28.6 Open-file browser: single-child chain expansion
+Expanding a directory that contains exactly one subdirectory expands recursively until a
+directory with more than one entry (or a leaf) is reached; collapsing does the reverse —
+the directory plus every single-entry ancestor collapse together (stopping below a root or
+at a multi-entry parent), the selection landing on the topmost collapsed row.
+
+### 28.7 Go to line — Alt-L
+Alt-L opens a small line-number modal for the shown file; Enter centres the chosen line
+(exactly like `o` centres the execution line) and puts the source cursor on it; Esc
+cancels. (Terminals do not deliver Command-key chords, so Option/Alt carries the binding.)
+
+### 28.8 Structure window — `S`
+`S` (shift-s) opens the Structure window for the class enclosing the CURRENT LINE IN THE
+FILE (browse mode included — the outline is lexical, independent of execution): three
+side-by-side, independently scrollable lists — fields | constructors & methods | inner
+types. `←`/`→`/Tab switch the active list, ↑↓/PgUp/PgDn/g/G move in it, `a` toggles
+appearance ↔ alphabetical ordering for all three lists at once, Enter jumps to the selected
+member's definition (centred) and closes, Esc closes. The window keeps its state across
+close/reopen until the shown class changes, then resets to the upper-left; the note line
+shows the selected member's full declaration text.
+
+### 28.9 Branch-resolution recording mode (engine side)
+FORMAT.md §10/§11 gains the `branchOnly` scope — brackets + args + locals + fields +
+BRANCH records, no LINE records. The engine treats such frames as first-class:
+- A BRANCH record joins the exec set (stepping lands on it) and the line-info index
+  EXACTLY when its frame executed no LINE record — line-mode frames, where every BRANCH
+  immediately follows its LINE, never double-stop.
+- A BRANCH cursor supplies the current line from its site; a branch-mode frame's shown
+  line follows its last decided branch (`lineInfoIndices` back every line-oriented command:
+  j/J line trace, run-to-line, exit-frame, the (file,line) site index).
+- `frameHasLineInfo`/`threadHasLineInfo` replace the LINE-only predicates for the §18.3
+  green treatment and the Threads/Stack colouring: a branch-mode frame has line info and
+  renders like a line-traced one; only true enter/exit-only frames stay green.
+- Landing legality is now per-index (`Engine.isExecLanding`), not per record type.
+
+### 28.10 Two-step method entry — F7/⇧F7 (line and branch modes alike)
+F7, when the NEXT exec record is a `METHOD_ENTER`, first STOPS on the call line without
+moving the engine — the callee's name highlights on that line, the status names the call —
+and the second F7 performs the entry; from a `METHOD_EXIT` cursor (chained calls like
+`a().b()`) the CALLER frame is shown while armed, since the call line lives there. ⇧F7 is
+symmetric: leaving an ENTER backward arrives AT its call site (armed, callee highlighted,
+F7 re-enters), and a reverse step that would land ON an ENTER lands at the call site before
+it instead — one logical step, one history entry. Any actual move disarms the stop. F8/⇧F8
+keep their classic frame-sticky behaviour, and the engine peek (`peekExec`) never moves the
+cursor, so no additional records are needed.

@@ -60,12 +60,31 @@ public final class DeclLine {
             final String methodName,
             final String simpleClassName,
             final int bodyFirstLine) {
+        int found = findOrZero(lines, methodName, simpleClassName, bodyFirstLine, MAX_SCAN);
+        return found != 0 ? found : bodyFirstLine;
+    }
+
+    /**
+     * §28.2 core: the 1-based declaration line of {@code methodName} (constructors via the class's
+     * simple name, exactly like {@link #find}) scanning upward from {@code fromLine} for at most
+     * {@code maxScan} lines — or {@code 0} when nothing matches. Scanning upward means the NEAREST
+     * declaration at/above the line wins, which is what disambiguates overloads: the enclosing
+     * definition is the closest one above the executing line.
+     *
+     * @param maxScan the scan budget ({@link Integer#MAX_VALUE} = to the top of the file)
+     */
+    public static int findOrZero(
+            final List<String> lines,
+            final String methodName,
+            final String simpleClassName,
+            final int fromLine,
+            final int maxScan) {
         String name = "<init>".equals(methodName) ? simpleClassName : methodName;
         if (lines == null || name == null || name.isEmpty()) {
-            return bodyFirstLine;
+            return 0;
         }
-        int start = Math.min(bodyFirstLine, lines.size());
-        int stop = Math.max(1, start - (MAX_SCAN - 1));
+        int start = Math.min(fromLine, lines.size());
+        int stop = maxScan >= start ? 1 : Math.max(1, start - (maxScan - 1));
         for (int l = start; l >= stop; l--) {
             String text = lines.get(l - 1);
             if (skip(text)) {
@@ -75,7 +94,50 @@ public final class DeclLine {
                 return l;
             }
         }
-        return bodyFirstLine;
+        return 0;
+    }
+
+    /**
+     * §28.2: the 1-based declaration line of the TYPE named {@code simpleClassName} — the nearest
+     * line at/above {@code fromLine} containing {@code class}/{@code interface}/{@code enum}/
+     * {@code record} followed by the name as a whole word (comment/annotation lines skipped) —
+     * or {@code 0} when none is found up to the top of the file.
+     */
+    public static int findTypeOrZero(final List<String> lines, final String simpleClassName, final int fromLine) {
+        if (lines == null || simpleClassName == null || simpleClassName.isEmpty()) {
+            return 0;
+        }
+        int start = Math.min(fromLine, lines.size());
+        for (int l = start; l >= 1; l--) {
+            String text = lines.get(l - 1);
+            if (skip(text)) {
+                continue;
+            }
+            if (declaresType(text, simpleClassName)) {
+                return l;
+            }
+        }
+        return 0;
+    }
+
+    /** Whether {@code text} declares the type: a type keyword then {@code name} as a whole word. */
+    private static boolean declaresType(final String rawText, final String name) {
+        String text = stripLiterals(rawText); // §28.2: not a `class Foo` mentioned in a string
+        for (String kw : new String[] {"class ", "interface ", "enum ", "record "}) {
+            int from = 0;
+            int at;
+            while ((at = text.indexOf(kw + name, from)) >= 0) {
+                // keyword must start a word (not e.g. "subclass Foo")
+                boolean kwOk = at == 0 || !Character.isJavaIdentifierPart(text.charAt(at - 1));
+                int end = at + kw.length() + name.length();
+                boolean nameOk = end >= text.length() || !Character.isJavaIdentifierPart(text.charAt(end));
+                if (kwOk && nameOk) {
+                    return true;
+                }
+                from = at + 1;
+            }
+        }
+        return false;
     }
 
     /** §18.3 skip rule: annotation lines ({@code @} first) and comment-only lines ({@code //} or {@code *}). */
@@ -85,10 +147,25 @@ public final class DeclLine {
     }
 
     /** Whether {@code text} contains {@code name} immediately followed by optional whitespace and {@code '('}. */
-    private static boolean containsNameBeforeParen(final String text, final String name) {
+    private static boolean containsNameBeforeParen(final String rawText, final String name) {
+        String text = stripLiterals(rawText); // §28.2: never match a name inside a string/comment
         int from = 0;
         int at;
         while ((at = text.indexOf(name, from)) >= 0) {
+            from = at + 1;
+            // Whole word: the char before must not continue an identifier (guards `preVisit`).
+            if (at > 0 && Character.isJavaIdentifierPart(text.charAt(at - 1))) {
+                continue;
+            }
+            // §28.2: a name preceded (after whitespace) by '.' is a method CALL, not a
+            // declaration (`child.visit(` must not out-vote the real `void visit(`).
+            int b = at - 1;
+            while (b >= 0 && Character.isWhitespace(text.charAt(b))) {
+                b--;
+            }
+            if (b >= 0 && text.charAt(b) == '.') {
+                continue;
+            }
             int p = at + name.length();
             while (p < text.length() && Character.isWhitespace(text.charAt(p))) {
                 p++;
@@ -96,8 +173,46 @@ public final class DeclLine {
             if (p < text.length() && text.charAt(p) == '(') {
                 return true;
             }
-            from = at + 1;
         }
         return false;
+    }
+
+    /**
+     * §28.2: blanks string/char literal contents and line comments on ONE line (structure
+     * preserved, lengths kept) so a {@code class}/method name mentioned in a string or a
+     * {@code //} comment never counts as a declaration. Block comments across lines are already
+     * handled by {@link #skip} (a {@code *}-led continuation line is skipped whole).
+     */
+    static String stripLiterals(final String raw) {
+        StringBuilder b = new StringBuilder(raw.length());
+        int i = 0;
+        while (i < raw.length()) {
+            char c = raw.charAt(i);
+            if (c == '/' && i + 1 < raw.length() && raw.charAt(i + 1) == '/') {
+                while (i < raw.length()) {
+                    b.append(' ');
+                    i++;
+                }
+            } else if (c == '"' || c == '\'') {
+                char q = c;
+                b.append(' ');
+                i++;
+                while (i < raw.length()) {
+                    char d = raw.charAt(i);
+                    b.append(' ');
+                    i++;
+                    if (d == '\\' && i < raw.length()) {
+                        b.append(' ');
+                        i++;
+                    } else if (d == q) {
+                        break;
+                    }
+                }
+            } else {
+                b.append(c);
+                i++;
+            }
+        }
+        return b.toString();
     }
 }

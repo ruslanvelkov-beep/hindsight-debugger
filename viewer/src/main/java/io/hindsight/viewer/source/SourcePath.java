@@ -220,6 +220,47 @@ public final class SourcePath {
     }
 
     /**
+     * §28.1: the shown file's display path — from the repo ({@code .git}) root when the file lies
+     * in a commit-pinned or {@code --repo} tree, else the source-root-relative key, else the bare
+     * file name. Always {@code /}-joined. Empty only for a {@code null} file.
+     */
+    public String displayPath(final Path file) {
+        if (file == null) {
+            return "";
+        }
+        for (GitSource g : gitSources) {
+            Optional<String> rel = g.relPathOf(file);
+            if (rel.isPresent()) {
+                return rel.get();
+            }
+        }
+        Path abs = file.toAbsolutePath().normalize();
+        Path owner = null;
+        for (Path base : bases) {
+            if (abs.startsWith(base) && (owner == null || base.getNameCount() > owner.getNameCount())) {
+                owner = base;
+            }
+        }
+        if (owner != null) {
+            return joinSlash(owner.relativize(abs));
+        }
+        return coverageKey(file).orElseGet(
+                () -> abs.getFileName() != null ? abs.getFileName().toString() : abs.toString());
+    }
+
+    /** A relative path {@code /}-joined regardless of platform separators. */
+    private static String joinSlash(final Path rel) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < rel.getNameCount(); i++) {
+            if (i > 0) {
+                sb.append('/');
+            }
+            sb.append(rel.getName(i));
+        }
+        return sb.toString();
+    }
+
+    /**
      * The FORMAT.md §12.1 package-relative coverage key of an on-disk or §26.3 virtual file —
      * from the owning commit-pinned repo when the path is git-indexed, else the path relative to
      * the deepest containing working-tree source root. Empty when the file lies outside both.

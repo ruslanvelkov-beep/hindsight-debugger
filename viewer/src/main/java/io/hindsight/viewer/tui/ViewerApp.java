@@ -92,7 +92,8 @@ import java.util.regex.PatternSyntaxException;
  *       ↑/↓ move; {@code v} parses it via {@link FieldDecl} and lists the matching
  *       {@link Engine#fieldWrites} in a jumpable modal.
  *   <li><b>Exec-record landings</b> (§17.1/§17.2): every step and jump lands on the
- *       exec set (LINE/METHOD_ENTER/METHOD_EXIT, {@link ExecRecords}) — never on a
+ *       exec set (LINE/METHOD_ENTER/METHOD_EXIT — §28.9 adds a branch-mode frame's BRANCH;
+ *       {@link Engine#isExecLanding}) — never on a
  *       metadata record — and stepping honours a selected outer frame by seeking to
  *       its as-of record first (§17.5, {@link Engine#frameAsOf}).
  *   <li><b>Open-file browser</b> (§17.7): {@code F} is a persistent directory-tree
@@ -333,6 +334,10 @@ public final class ViewerApp {
     private String status = "";
     private boolean helpOverlay;
     private boolean quitConfirm;
+    // §28.3: when a key was a pure scroll/selection move, only this window (plus the status and
+    // help rows) is repainted on the next render — everything else stays as drawn. Reset on every
+    // key; render() consumes it. Full renders remain the default for anything non-scroll.
+    private Win partialWin;
     private SearchDialog dialog;
     // §15.5: the one persistent `/` dialog — kept across Esc/close so reopening restores it.
     private SearchDialog searchDialog;
@@ -348,6 +353,54 @@ public final class ViewerApp {
     private VarChangeWindow varChanges;
     // §16.3: the Records "jump to record number" modal (null when closed).
     private RecordJump recordJump;
+    // §28.7: the Alt-L go-to-line modal — digits of the target line, or null when closed.
+    private StringBuilder lineJump;
+
+    /**
+     * §28.8: the Structure window's persistent state — three independently scrollable lists
+     * (fields | constructors & methods | inner types) of the class enclosing the CURRENT LINE IN
+     * THE FILE. Selection/scroll/active-list survive close/reopen until the shown class changes
+     * (then they reset to the upper-left); the appearance↔alphabetical toggle always survives.
+     */
+    private static final class StructureWindow {
+        String identity = "";
+        JavaStructure.ClassStructure data;
+        int activeList;
+        final int[] sel = new int[3];
+        final int[] scroll = new int[3];
+        int listViewH = 1;
+        boolean alphabetical;
+    }
+
+    private final StructureWindow structure = new StructureWindow();
+    private boolean structureOpen;
+
+    /**
+     * §28.10: the armed two-step method entry — F7, seeing that the NEXT exec record is a
+     * METHOD_ENTER, first STOPS on the call line (highlighting the callee's name there) without
+     * moving the engine; the second F7 performs the entry. Valid only while the engine sits at
+     * exactly the armed position; any move (afterMove) disarms.
+     */
+    private static final class PendingCall {
+        final int tid;
+        final long index;
+        final long enterIndex;
+        final String callee;
+        final String label;
+        final int callLine;
+
+        PendingCall(final int tid, final long index, final long enterIndex,
+                final String callee, final String label, final int callLine) {
+            this.tid = tid;
+            this.index = index;
+            this.enterIndex = enterIndex;
+            this.callee = callee;
+            this.label = label;
+            this.callLine = callLine;
+        }
+    }
+
+    private PendingCall pendingCall;
     // §16.4: the Source Code in-file search state (one instance; `active` toggles it).
     private final SourceSearch sourceSearch = new SourceSearch();
     // §26.8: the one find-in-window state, retargeted to whichever list window opened it.
@@ -383,6 +436,8 @@ public final class ViewerApp {
     private boolean browseCenterPending;
     // §24.5: the browsed file's recording-visited lines (computed once on entering browse).
     private BitSet browseVisited = new BitSet();
+    // §28.1: the browsed file's path (for the title's repo-relative display).
+    private Path browseFile;
 
     // List window scroll/selection/hscroll.
     private int threadSel;
@@ -492,7 +547,7 @@ public final class ViewerApp {
             int bestTid = 0;
             long bestIndex = 0;
             for (int t : tids) {
-                if (!engine.threadHasLines(t)) {
+                if (!engine.threadHasLineInfo(t)) { // §28.9: branch-mode threads count too
                     continue;
                 }
                 engine.seek(t, count(t) - 1);
@@ -519,7 +574,7 @@ public final class ViewerApp {
         // thread 1), so the Source window opens on a project file. Threads without lines keep
         // the engine default; a rejected --tid keeps its error status visible.
         int target = tidPinned ? engine.currentTid() : 1;
-        if (tids.contains(target) && engine.threadHasLines(target)) {
+        if (tids.contains(target) && engine.threadHasLineInfo(target)) {
             engine.seek(target, 0);
             if (rec(engine.currentTid(), engine.currentIndex()).type() != Format.LINE) {
                 engine.toLineTrace(true);
@@ -540,7 +595,9 @@ public final class ViewerApp {
      */
     public void run() throws IOException {
         while (running) {
-            screen.doResizeIfNecessary();
+            if (screen.doResizeIfNecessary() != null) {
+                partialWin = null; // §28.3: a resize invalidates every cell — full render
+            }
             render();
             screen.refresh();
             KeyStroke key = screen.readInput();
@@ -558,12 +615,18 @@ public final class ViewerApp {
     // ---- rendering ----
 
     private void render() {
-        screen.clear();
-        cursorPos = null;
+        Win partial = partialWin;
+        partialWin = null;
         TextGraphics g = screen.newTextGraphics();
         TerminalSize sz = screen.getTerminalSize();
         int cols = sz.getColumns();
         int rows = sz.getRows();
+        if (partial != null && !anyOverlayOpen() && cols >= MIN_COLS && rows >= MIN_ROWS) {
+            renderPartial(g, partial, cols, rows); // §28.3: scroll-only — repaint one window
+            return;
+        }
+        screen.clear();
+        cursorPos = null;
         if (cols < MIN_COLS || rows < MIN_ROWS) {
             drawTooSmall(g, cols, rows);
             screen.setCursorPosition(null);
@@ -588,6 +651,9 @@ public final class ViewerApp {
         if (fileDialogOpen) {
             drawFileDialog(g, cols, rows);
         }
+        if (structureOpen) {
+            drawStructure(g, cols, rows);
+        }
         if (varHist != null) {
             drawVarHistory(g, cols, rows);
         }
@@ -597,6 +663,9 @@ public final class ViewerApp {
         if (recordJump != null) {
             drawRecordJump(g, cols, rows);
         }
+        if (lineJump != null) {
+            drawLineJump(g, cols, rows);
+        }
         if (recordingPopup) {
             drawRecordingPopup(g, cols, rows);
         }
@@ -604,6 +673,55 @@ public final class ViewerApp {
             drawQuitConfirm(g, cols, rows);
         }
         screen.setCursorPosition(cursorPos);
+    }
+
+    /** §28.3: whether any modal/overlay owns the screen — partial redraw must not run then. */
+    private boolean anyOverlayOpen() {
+        return helpOverlay || quitConfirm || recordingPopup || dialog != null || fileDialogOpen
+                || varHist != null || varChanges != null || recordJump != null || lineJump != null
+                || structureOpen || sourceSearch.active || listSearch.active;
+    }
+
+    /**
+     * §28.3: the scroll-only render — repaints just {@code win}'s rectangle (cleared first, so a
+     * shrunk row list cannot leave stale cells) plus the status and help rows (the Locals info
+     * line follows its selection), leaving every other window's cells untouched in the screen's
+     * back buffer. The engine was not moved by a scroll, so the skipped windows are still exact.
+     */
+    private void renderPartial(final TextGraphics g, final Win win, final int cols, final int rows) {
+        Layout layout = Layout.compute(cols, rows);
+        RecordInfo ri = engine.recordInfo();
+        Layout.Rect rect = switch (win) {
+            case SOURCE -> layout.source();
+            case THREADS -> layout.right().get(0);
+            case STACK -> layout.right().get(1);
+            case LOCALS -> layout.right().get(2);
+            case RECORDS -> layout.right().get(3);
+        };
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(rect.col(), rect.row()),
+                new TerminalSize(rect.width(), rect.height()), ' ');
+        switch (win) {
+            case SOURCE -> renderSource(g, rect);
+            case THREADS -> renderThreads(g, rect);
+            case STACK -> renderStack(g, rect);
+            case LOCALS -> renderLocals(g, rect);
+            case RECORDS -> renderRecords(g, rect);
+        }
+        renderStatus(g, cols, layout.statusRow(), ri);
+        renderHelp(g, cols, layout.helpRow());
+    }
+
+    /** §28.3: a pure scroll/selection-move key — safe for the partial redraw of a list window. */
+    private static boolean isListMoveKey(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        return t == KeyType.ArrowUp || t == KeyType.ArrowDown || t == KeyType.ArrowLeft
+                || t == KeyType.ArrowRight || t == KeyType.PageUp || t == KeyType.PageDown
+                || t == KeyType.Home || t == KeyType.End
+                || (k.isCtrlDown() && (isChar(k, 'b') || isChar(k, 'f')))
+                || (!k.isCtrlDown() && (isChar(k, 'g') || isChar(k, 'G')));
     }
 
     private void drawTooSmall(final TextGraphics g, final int cols, final int rows) {
@@ -620,7 +738,7 @@ public final class ViewerApp {
             // filename); the §18.1 frame text is suppressed while searching.
             renderSourceSearchField(g, rect, focused ? Palette.FOCUS : Palette.UNFOCUS, focused);
         } else {
-            drawSourceFrameText(g, rect, focused);
+            drawSourceFilePath(g, rect, focused); // §28.1: the repo-relative path as the title text
         }
         int ix = rect.col() + 1;
         int iy = rect.row() + 1;
@@ -637,44 +755,55 @@ public final class ViewerApp {
         }
     }
 
-    /** The exec-mode Source title; §18.1 renders the frame text separately, past a dashed gap. */
+    /** The fixed Source title; §28.1 renders the shown file's path separately, right-anchored. */
     private static final String SOURCE_TITLE = "Source Code [c]";
 
-    /**
-     * The Source window title (§15.7/§18.1): browse mode keeps
-     * {@code Source Code [c] — <fileName>}; exec mode is the plain fixed title — the SELECTED
-     * frame's {@code SimpleClass.method} is drawn separately by {@link #drawSourceFrameText}
-     * so the border dashes stay visible in the ten-column gap.
-     */
+    /** The Source window title (§28.1): always the plain fixed text — the file path block
+     * ({@link #drawSourceFilePath}) carries the identity in both exec and browse modes. */
     private String sourceTitle() {
-        if (browseMode) {
-            return SOURCE_TITLE + " — " + browseName;
-        }
         return SOURCE_TITLE;
     }
 
     /**
-     * The §18.1 exec-mode frame text: {@code ␣<SimpleClass>.<method>␣} (one space each side),
-     * put on the top border AFTER {@link #drawBox} at the offset the text previously started —
-     * title start + title length + ten — so the border's own dashes remain visible between the
-     * fixed title and the frame text, and after it. Browse mode (and a frame-less exec cursor)
-     * draws nothing.
+     * §28.1: the shown file's path from the repo ({@code .git}) root, drawn on the top border —
+     * {@code ␣<path>␣} (one space each side) with its trailing space ending four columns before
+     * the right corner (so {@code ───┐} stays visible), starting no earlier than four dashes
+     * after the title. A path too long for that span is trimmed from the LEFT and starts with
+     * an ellipsis. Nothing is drawn when no file is shown.
      */
-    private void drawSourceFrameText(final TextGraphics g, final Layout.Rect rect, final boolean focused) {
-        if (browseMode) {
+    private void drawSourceFilePath(final TextGraphics g, final Layout.Rect rect, final boolean focused) {
+        String path = shownFilePathText();
+        if (path.isEmpty()) {
             return;
+        }
+        int leftBound = rect.col() + 3 + SOURCE_TITLE.length() + 1 + 4; // " title " + 4 dashes
+        int endCol = rect.col() + rect.width() - 5; // trailing space here; then ───┐
+        int maxLen = endCol - leftBound - 1; // minus the two enclosing spaces
+        if (maxLen < 1) {
+            return;
+        }
+        if (path.length() > maxLen) {
+            path = "…" + path.substring(path.length() - (maxLen - 1));
+        }
+        String block = " " + path + " ";
+        put(g, endCol - block.length() + 1, rect.row(), block,
+                focused ? Palette.FOCUS : Palette.UNFOCUS, Palette.BG, focused);
+    }
+
+    /** §28.1: the shown file's repo-relative display path ({@link SourcePath#displayPath}). */
+    private String shownFilePathText() {
+        if (browseMode) {
+            return browseFile != null ? sourcePath.displayPath(browseFile) : browseName;
         }
         Frame f = selectedFrameOrNull();
         if (f == null) {
-            return;
+            return "";
         }
-        int start = rect.col() + 3 + SOURCE_TITLE.length() + 10; // title text begins at col+3
-        int maxLen = rect.col() + rect.width() - 1 - start; // clip before the corner, like a title
-        if (maxLen <= 0) {
-            return;
+        java.nio.file.Path file = sourcePath.resolveClass(f.classBinary(), f.fileName()).orElse(null);
+        if (file == null) {
+            return f.fileName() != null ? f.fileName() : "";
         }
-        put(g, start, rect.row(), clip(" " + FrameText.simple(f) + " ", maxLen),
-                focused ? Palette.FOCUS : Palette.UNFOCUS, Palette.BG, focused);
+        return sourcePath.displayPath(file);
     }
 
     /** The currently selected stack frame — recorded or unrecorded (§14.5) — or {@code null}. */
@@ -692,7 +821,7 @@ public final class ViewerApp {
      */
     private boolean greenContext() {
         int innermost = engine.stack().size() - 1;
-        return innermost >= 0 && !engine.frameHasLines(innermost);
+        return innermost >= 0 && !engine.frameHasLineInfo(innermost); // §28.9
     }
 
     private void renderExecSource(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -712,7 +841,7 @@ public final class ViewerApp {
         // non-innermost line-less frame keeps its own reconstructed call-site line (frame
         // .currentLine()) with the ordinary §12.3 frame marker — never the declaration line.
         boolean declTreatment = DeclLine.innermostLineless(
-                sf, frames.size(), frame != null && frame.recorded(), engine.frameHasLines(sf));
+                sf, frames.size(), frame != null && frame.recorded(), engine.frameHasLineInfo(sf));
         if (declTreatment && srcResolved) {
             line = DeclLine.find(src.get(), frame.methodName(), simpleClass(cls), line);
         }
@@ -762,8 +891,56 @@ public final class ViewerApp {
         TextColor hlBg = !exec ? Palette.FRAME_LINE_BG
                 : declTreatment ? Palette.EXEC_NOLINE_BG
                 : Palette.EXEC_LINE_BG;
+        // §28.2: pin the enclosing class/method definition lines at the top while they are
+        // scrolled out of view — never when already visible from srcTop.
+        int[] pins = stickyPins(lines, frame, line);
+        // §28.10: while the two-step call stop is armed at this exact position, the callee's
+        // name highlights on the call line.
+        String calleeHl = null;
+        int calleeLine = -1;
+        if (pendingCall != null && pendingCall.tid == engine.currentTid()
+                && pendingCall.index == engine.currentIndex()) {
+            calleeHl = pendingCall.callee;
+            calleeLine = pendingCall.callLine;
+        }
         renderCodeLines(g, ix, iy, iw, ih, lines, spans, srcTop, srcHcol, line, hlBg,
-                sourceCursorLine(), searchQuery(), lineIndex.linesOf(LineIndex.fileKey(cls, file)));
+                sourceCursorLine(), searchQuery(), lineIndex.linesOf(LineIndex.fileKey(cls, file)), pins,
+                calleeHl, calleeLine);
+    }
+
+    private static final int[] NO_PINS = new int[0];
+
+    /**
+     * §28.2: the sticky definition lines to lock at the top of the Source body — the enclosing
+     * CLASS declaration (first) and enclosing METHOD/constructor declaration (second), each only
+     * when its line is scrolled above the viewport ({@code ≤ srcTop}, method {@code ≤ srcTop+1}
+     * once the class row is pinned) so nothing is pinned that could otherwise be seen. The
+     * declarations are found lexically, scanning UP from the frame's current line — so the
+     * nearest declaration wins (overload/constructor disambiguation), and a constructor pins its
+     * own definition line rather than any {@code <init>} rendering. Pinned rows keep their real
+     * line numbers; the rows they cover are simply revealed by scrolling up.
+     */
+    private int[] stickyPins(final List<String> lines, final Frame frame, final int currentLine) {
+        if (frame == null || !frame.recorded()) {
+            return NO_PINS;
+        }
+        String simple = simpleClass(frame.classBinary());
+        int classDecl = DeclLine.findTypeOrZero(lines, simple, currentLine);
+        boolean classPinned = classDecl >= 1 && classDecl <= srcTop;
+        int methodDecl = DeclLine.findOrZero(lines, frame.methodName(), simple, currentLine, Integer.MAX_VALUE);
+        boolean methodPinned = methodDecl >= 1 && methodDecl != classDecl
+                && (classDecl == 0 || methodDecl > classDecl)
+                && methodDecl <= srcTop + (classPinned ? 1 : 0);
+        if (classPinned && methodPinned) {
+            return new int[] {classDecl, methodDecl};
+        }
+        if (classPinned) {
+            return new int[] {classDecl};
+        }
+        if (methodPinned) {
+            return new int[] {methodDecl};
+        }
+        return NO_PINS;
     }
 
     private void renderBrowse(final TextGraphics g, final int ix, final int iy, final int iw, final int ih) {
@@ -787,7 +964,8 @@ public final class ViewerApp {
                 highlightCache.computeIfAbsent(browseKey, k -> highlighter.highlight(browseLines));
         // Browse marks the requested line with the dim (frame) highlight, never the exec highlight.
         renderCodeLines(g, ix, iy, iw, ih, browseLines, spans, srcTop, srcHcol, line,
-                Palette.FRAME_LINE_BG, sourceCursorLine(), searchQuery(), browseVisited);
+                Palette.FRAME_LINE_BG, sourceCursorLine(), searchQuery(), browseVisited, NO_PINS,
+                null, -1);
     }
 
     /** The §13.4 cursor line to render, or -1 — the cursor shows only while Source is focused. */
@@ -900,14 +1078,20 @@ public final class ViewerApp {
             final TextColor highlightBg,
             final int cursorLine,
             final String searchQuery,
-            final BitSet visitedLines) {
+            final BitSet visitedLines,
+            final int[] pins,
+            final String calleeName,
+            final int calleeLine) {
         int fileLines = lines.size();
         int gutterW = Integer.toString(Math.max(1, fileLines)).length() + 1;
         int numW = Math.max(1, gutterW - 1);
         int contentX = ix + gutterW;
         int contentW = iw - gutterW;
         for (int row = 0; row < ih; row++) {
-            int lineNo = top + row;
+            // §28.2: the first rows show the pinned definition lines (their REAL line numbers);
+            // the body keeps its normal top+row mapping, so the pins simply cover the lines that
+            // would have been at the very top (scrolling up reveals them again).
+            int lineNo = row < pins.length ? pins[row] : top + row;
             if (lineNo > fileLines) {
                 break;
             }
@@ -962,6 +1146,18 @@ public final class ViewerApp {
                     }
                 }
             }
+            // §28.10: the armed two-step call stop highlights the CALLEE's name on the call line.
+            if (calleeName != null && lineNo == calleeLine) {
+                for (int[] span : InFileSearch.matchColumns(lines.get(lineNo - 1), calleeName, TAB_WIDTH)) {
+                    int from = Math.max(span[0], hcol);
+                    int to = Math.min(span[1], hcol + contentW);
+                    for (int vc = from; vc < to; vc++) {
+                        char c = vc < cells.size() ? cells.get(vc).ch() : ' ';
+                        put(g, contentX + (vc - hcol), y, String.valueOf(c),
+                                Palette.SEARCH_MATCH_FG, Palette.SEARCH_MATCH_BG, false);
+                    }
+                }
+            }
         }
     }
 
@@ -981,7 +1177,7 @@ public final class ViewerApp {
         List<TextColor> rowFg = new ArrayList<>();
         for (int tid : tids) {
             // §18.3: threads with no LINE records at all render light green; '*' text unchanged.
-            rowFg.add(engine.threadHasLines(tid) ? Palette.FG : Palette.CALLS_ONLY_FG);
+            rowFg.add(engine.threadHasLineInfo(tid) ? Palette.FG : Palette.CALLS_ONLY_FG);
         }
         threadSel = clamp(threadSel, 0, Math.max(0, rows.size() - 1));
         threadScroll = ScrollMath.adjustScroll(threadScroll, threadSel, ih, rows.size());
@@ -1056,7 +1252,7 @@ public final class ViewerApp {
             boolean s = idx == stackSel;
             int frameIndex = frames.size() - 1 - idx; // rows are innermost-first
             TextColor fg = !frames.get(frameIndex).recorded() ? Palette.DIM
-                    : engine.frameHasLines(frameIndex) ? Palette.FG
+                    : engine.frameHasLineInfo(frameIndex) ? Palette.FG
                     : Palette.CALLS_ONLY_FG;
             // §20.6: a green (line-less) frame keeps CALLS_ONLY_FG when selected; others invert as usual.
             TextColor selFg = fg == Palette.CALLS_ONLY_FG ? Palette.CALLS_ONLY_FG : Palette.SELECTION_FG;
@@ -1832,7 +2028,9 @@ public final class ViewerApp {
         String[] lines = {
             "Hindsight Viewer — keys",
             "",
-            "F7 / Shift+F7         step into / reverse step",
+            "F7 / Shift+F7         step into / reverse step — two-step at a",
+            "                      method entry: 1st press stops on the call",
+            "                      line (callee highlighted), 2nd press enters",
             "F8 / Shift+F8         step over / reverse step over",
             "                      (Apple Terminal sends ⇧F7/⇧F8 as F15/F16)",
             "e / E                 exit current frame: forward / backward",
@@ -1852,6 +2050,8 @@ public final class ViewerApp {
             "< / >                 horizontal-scroll the focused window",
             "^F / ^B  Home End     page / jump to ends;  g / G  top/bottom",
             "^L ^T (in dialogs)    focus the filter / thread field (⇥ in .)",
+            "S                     Structure window (fields/methods/inner types)",
+            "Alt-L                 go to line (centres it, like o)",
             "v                     variable history for the cursor line",
             "V                     global variable-change list (field filter)",
             "Alt-F                 find in Source / the focused list window",
@@ -1959,9 +2159,220 @@ public final class ViewerApp {
         cursorPos = new TerminalPosition(Math.min(x + w - 2, x + 3 + prompt.length()), y + 1);
     }
 
+    /** §28.8: open (or re-open) the Structure window for the class at the current FILE line. */
+    private void openStructure() {
+        List<String> lines = shownSourceLines();
+        JavaStructure.ClassStructure data = JavaStructure.parse(lines, srcCursor);
+        if (data == null) {
+            status = "no type declaration in the shown file";
+            return;
+        }
+        String identity = (browseMode ? browseKey : String.valueOf(shownFileKey))
+                + "#" + data.className() + "@" + data.classLine();
+        if (!identity.equals(structure.identity)) {
+            // §28.8: a NEW class resets to the upper-left; the sort mode survives.
+            structure.identity = identity;
+            structure.activeList = 0;
+            java.util.Arrays.fill(structure.sel, 0);
+            java.util.Arrays.fill(structure.scroll, 0);
+        }
+        structure.data = data;
+        structureOpen = true;
+    }
+
+    /** §28.8: the three outlined lists, in the current appearance/alphabetical order. */
+    private List<JavaStructure.Member> structureList(final int which) {
+        JavaStructure.ClassStructure d = structure.data;
+        List<JavaStructure.Member> base = switch (which) {
+            case 0 -> d.fields();
+            case 1 -> {
+                List<JavaStructure.Member> merged = new ArrayList<>(d.constructors());
+                merged.addAll(d.methods());
+                merged.sort(java.util.Comparator.comparingInt(JavaStructure.Member::line));
+                yield merged;
+            }
+            default -> d.innerTypes();
+        };
+        if (!structure.alphabetical) {
+            return base;
+        }
+        List<JavaStructure.Member> sorted = new ArrayList<>(base);
+        sorted.sort(java.util.Comparator.comparing(
+                (JavaStructure.Member m) -> m.name().toLowerCase(Locale.ROOT))
+                .thenComparingInt(JavaStructure.Member::line));
+        return sorted;
+    }
+
+    /** §28.8: Structure keys — ←→/⇥ switch lists, ↑↓/pg/g/G move, a sorts, ↵ jumps, Esc closes. */
+    private void handleStructure(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (t == KeyType.Escape) {
+            structureOpen = false;
+            return;
+        }
+        if (t == KeyType.ArrowLeft || (t == KeyType.Tab && k.isShiftDown())) {
+            structure.activeList = (structure.activeList + 2) % 3;
+            return;
+        }
+        if (t == KeyType.ArrowRight || t == KeyType.Tab) {
+            structure.activeList = (structure.activeList + 1) % 3;
+            return;
+        }
+        if (isChar(k, 'a') && !k.isCtrlDown() && !k.isAltDown()) {
+            structure.alphabetical = !structure.alphabetical; // §28.8: applies to all three lists
+            return;
+        }
+        int which = structure.activeList;
+        List<JavaStructure.Member> list = structureList(which);
+        int last = Math.max(0, list.size() - 1);
+        int page = Math.max(1, structure.listViewH - 1);
+        if (t == KeyType.ArrowUp) {
+            structure.sel[which] = Math.max(0, structure.sel[which] - 1);
+        } else if (t == KeyType.ArrowDown) {
+            structure.sel[which] = Math.min(last, structure.sel[which] + 1);
+        } else if (t == KeyType.PageUp || (k.isCtrlDown() && isChar(k, 'b'))) {
+            structure.sel[which] = Math.max(0, structure.sel[which] - page);
+        } else if (t == KeyType.PageDown || (k.isCtrlDown() && isChar(k, 'f'))) {
+            structure.sel[which] = Math.min(last, structure.sel[which] + page);
+        } else if (t == KeyType.Home || isChar(k, 'g')) {
+            structure.sel[which] = 0;
+        } else if (t == KeyType.End || isChar(k, 'G')) {
+            structure.sel[which] = last;
+        } else if (t == KeyType.Enter && !list.isEmpty()) {
+            JavaStructure.Member m = list.get(clamp(structure.sel[which], 0, last));
+            structureOpen = false;
+            gotoShownFileLine(m.line());
+            status = m.name() + " — line " + m.line();
+        }
+    }
+
+    /** §28.7/§28.8: centre {@code line} of the shown file and put the cursor on it (like o). */
+    private void gotoShownFileLine(final int line) {
+        int target = clamp(line, 1, Math.max(1, srcFileLines));
+        srcCursor = target;
+        srcTop = ScrollMath.center(target, Math.max(1, srcViewH), Math.max(1, srcFileLines));
+    }
+
+    /** §28.8: the Structure window — three side-by-side lists over the enclosing class. */
+    private void drawStructure(final TextGraphics g, final int cols, final int rows) {
+        int w = clamp(cols * 3 / 4, 40, cols - 2);
+        int h = clamp(rows * 3 / 4, 10, rows - 2);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h),
+                "Structure [S] — " + structure.data.className()
+                        + (structure.alphabetical ? "  (a-z)" : "  (appearance)"),
+                Palette.DIALOG_BG, Palette.FOCUS, true);
+        int ix = x + 1;
+        int iy = y + 1;
+        int iw = w - 2;
+        int hintRow = y + h - 2;
+        int noteRow = hintRow - 1;
+        int listTop = iy + 1;
+        int listH = Math.max(1, noteRow - listTop);
+        structure.listViewH = listH;
+        int colW = (iw - 2) / 3; // two 1-column gaps between the lists
+        String[] headers = {"Fields", "Ctors & Methods", "Inner Types"};
+        for (int c = 0; c < 3; c++) {
+            int cx = ix + c * (colW + 1);
+            List<JavaStructure.Member> list = structureList(c);
+            boolean active = c == structure.activeList;
+            put(g, cx, iy, clipPad(headers[c] + " (" + list.size() + ")", colW),
+                    active ? Palette.FOCUS : Palette.DIM, Palette.DIALOG_BG, active);
+            if (list.isEmpty()) {
+                put(g, cx, listTop, clipPad("(none)", colW), Palette.DIM, Palette.DIALOG_BG, false);
+                continue;
+            }
+            structure.sel[c] = clamp(structure.sel[c], 0, list.size() - 1);
+            structure.scroll[c] = ScrollMath.adjustScroll(structure.scroll[c], structure.sel[c], listH, list.size());
+            for (int r = 0; r < listH; r++) {
+                int idx = structure.scroll[c] + r;
+                if (idx >= list.size()) {
+                    break;
+                }
+                JavaStructure.Member m = list.get(idx);
+                boolean sel = active && idx == structure.sel[c];
+                String row = m.name() + "  :" + m.line();
+                put(g, cx, listTop + r, clipPad(row, colW),
+                        sel ? Palette.SELECTION_FG : Palette.FG,
+                        sel ? Palette.SELECTION_BG : Palette.DIALOG_BG, false);
+            }
+        }
+        // The selected member's full declaration text on the note line (DIM), then the hint.
+        List<JavaStructure.Member> act = structureList(structure.activeList);
+        if (!act.isEmpty()) {
+            JavaStructure.Member m = act.get(clamp(structure.sel[structure.activeList], 0, act.size() - 1));
+            put(g, ix, noteRow, clipPad(m.text(), iw), Palette.DIM, Palette.DIALOG_BG, false);
+        }
+        put(g, ix, hintRow, clip("←→/⇥ list  ↑↓ move  a sort  ↵ go to definition  Esc close", iw),
+                Palette.DIM, Palette.DIALOG_BG, false);
+    }
+
+    /** §28.7: the Alt-L go-to-line modal — a line number, centered on submit like {@code o}. */
+    private void drawLineJump(final TextGraphics g, final int cols, final int rows) {
+        String prompt = "line: " + lineJump;
+        String range = "1.." + Math.max(1, srcFileLines) + " in the shown file";
+        String hint = "digits then ↵ go  Esc close";
+        int content = Math.max(prompt.length(), Math.max(range.length(), hint.length()));
+        int w = Math.min(cols - 2, Math.max(24, content + 6));
+        int h = Math.min(rows - 2, 6);
+        int x = Math.max(0, (cols - w) / 2);
+        int y = Math.max(0, (rows - h) / 2);
+        g.setForegroundColor(Palette.FG);
+        g.setBackgroundColor(Palette.DIALOG_BG);
+        g.disableModifiers(SGR.BOLD);
+        g.fillRectangle(new TerminalPosition(x, y), new TerminalSize(w, h), ' ');
+        drawBox(g, new Layout.Rect(x, y, w, h), "Go to line", Palette.DIALOG_BG, Palette.FOCUS, true);
+        put(g, x + 3, y + 1, clip(prompt, w - 6), Palette.FG, Palette.DIALOG_BG, false);
+        put(g, x + 3, y + 2, clip(range, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+        put(g, x + 3, y + h - 2, clip(hint, w - 6), Palette.DIM, Palette.DIALOG_BG, false);
+        cursorPos = new TerminalPosition(Math.min(x + w - 2, x + 3 + prompt.length()), y + 1);
+    }
+
+    /** §28.7: go-to-line keys — digits, Backspace, ↵ centers the line (like {@code o}), Esc. */
+    private void handleLineJump(final KeyStroke k) {
+        KeyType t = k.getKeyType();
+        if (t == KeyType.Escape) {
+            lineJump = null;
+            return;
+        }
+        if (t == KeyType.Backspace) {
+            if (lineJump.length() > 0) {
+                lineJump.deleteCharAt(lineJump.length() - 1);
+            }
+            return;
+        }
+        if (t == KeyType.Enter) {
+            if (lineJump.length() > 0) {
+                int line;
+                try {
+                    line = Integer.parseInt(lineJump.toString());
+                } catch (NumberFormatException e) {
+                    line = 1;
+                }
+                line = clamp(line, 1, Math.max(1, srcFileLines));
+                gotoShownFileLine(line);
+                status = "line " + line;
+            }
+            lineJump = null;
+            return;
+        }
+        if (t == KeyType.Character && !k.isCtrlDown() && !k.isAltDown()) {
+            Character ch = k.getCharacter();
+            if (ch != null && ch >= '0' && ch <= '9' && lineJump.length() < 9) {
+                lineJump.append(ch.charValue());
+            }
+        }
+    }
+
     // ---- key dispatch ----
 
     private void handleKey(final KeyStroke k) {
+        partialWin = null; // §28.3: only the scroll/move branches below re-arm it
         try {
             TerminalSize sz = screen.getTerminalSize();
             if (sz.getColumns() < MIN_COLS || sz.getRows() < MIN_ROWS) {
@@ -2013,6 +2424,14 @@ public final class ViewerApp {
                 handleRecordJump(k);
                 return;
             }
+            if (structureOpen) {
+                handleStructure(k); // §28.8
+                return;
+            }
+            if (lineJump != null) {
+                handleLineJump(k); // §28.7
+                return;
+            }
             if (sourceSearch.active) {
                 // §16.4: intercept BEFORE global/nav so typing does not trigger focus/step keys.
                 handleSourceSearch(k);
@@ -2059,7 +2478,12 @@ public final class ViewerApp {
         // Apple Terminal's legacy "+8" encodings decode to; the F9/F10 fallbacks are gone).
         switch (t) {
             case F7 -> {
-                doStepFromSelected(() -> k.isShiftDown() ? engine.reverseStep() : engine.stepInto());
+                // §28.10: F7/⇧F7 use the two-step method-entry paradigm (line and branch modes).
+                if (k.isShiftDown()) {
+                    reverseStepTwoStep();
+                } else {
+                    stepIntoTwoStep();
+                }
                 return true;
             }
             case F8 -> {
@@ -2067,7 +2491,7 @@ public final class ViewerApp {
                 return true;
             }
             case F15 -> {
-                doStepFromSelected(engine::reverseStep);
+                reverseStepTwoStep(); // Apple Terminal delivers ⇧F7 as F15
                 return true;
             }
             case F16 -> {
@@ -2165,6 +2589,12 @@ public final class ViewerApp {
             origin();
             return true;
         }
+        // §28.7: Alt-L opens the go-to-line modal for the shown file (terminals never deliver
+        // a Command chord, so Option/Alt carries the binding).
+        if (isChar(k, 'l') && k.isAltDown()) {
+            lineJump = new StringBuilder();
+            return true;
+        }
         // §16.4/§26.8: Alt-F opens find — the Source in-file search, or the focused list
         // window's row search (Threads/Stack/Locals/Records).
         if (isChar(k, 'f') && k.isAltDown()) {
@@ -2195,6 +2625,12 @@ public final class ViewerApp {
         }
         if (isChar(k, 'F') || (isChar(k, 'f') && k.isShiftDown())) {
             openFileDialog(); // §17.7: the persistent tree browser
+            return true;
+        }
+        // §28.8: `S` (shift-s) opens the Structure window for the class enclosing the current
+        // line in the FILE (browse mode included) — plain `s` still focuses the Stack window.
+        if (isChar(k, 'S') || (isChar(k, 's') && k.isShiftDown())) {
+            openStructure();
             return true;
         }
         // §20.9: `V` (or shift-v — mirroring the E/J shifted-letter detection) opens the global
@@ -2252,13 +2688,23 @@ public final class ViewerApp {
             case SOURCE -> navSource(k);
             case THREADS -> navThreads(k);
             case STACK -> navStack(k);
-            case LOCALS -> navTree(k, localsTree, localsViewH);
+            case LOCALS -> {
+                // §28.3: everything navTree does is Locals-local (+ the info line, which the
+                // partial render repaints) — EXCEPT Enter, which may be a §20.3 lambda jump.
+                if (k.getKeyType() != KeyType.Enter) {
+                    partialWin = Win.LOCALS;
+                }
+                navTree(k, localsTree, localsViewH);
+            }
             case RECORDS -> navRecords(k);
         }
     }
 
     /** Source-focused keys (§13.4): ↑/↓ etc. move the source-line cursor, not the plain scroll. */
     private void navSource(final KeyStroke k) {
+        if (isListMoveKey(k)) {
+            partialWin = Win.SOURCE; // §28.3: cursor/scroll moves repaint Source only
+        }
         KeyType t = k.getKeyType();
         Character ch = k.getCharacter();
         int page = Math.max(1, srcViewH - 1);
@@ -2301,6 +2747,9 @@ public final class ViewerApp {
     }
 
     private void navThreads(final KeyStroke k) {
+        if (isListMoveKey(k)) {
+            partialWin = Win.THREADS; // §28.3: selection/scroll moves repaint Threads only
+        }
         KeyType t = k.getKeyType();
         Character ch = k.getCharacter();
         int page = Math.max(1, threadsViewH - 1);
@@ -2332,10 +2781,12 @@ public final class ViewerApp {
         Character ch = k.getCharacter();
         if (t == KeyType.ArrowLeft) {
             stackHcol = Math.max(0, stackHcol - HSTEP);
+            partialWin = Win.STACK; // §28.3: hscroll only — ↑↓ select frames (full render)
             return;
         }
         if (t == KeyType.ArrowRight) {
             stackHcol += HSTEP;
+            partialWin = Win.STACK; // §28.3
             return;
         }
         int size = engine.stack().size();
@@ -2414,6 +2865,9 @@ public final class ViewerApp {
     }
 
     private void navRecords(final KeyStroke k) {
+        if (isListMoveKey(k)) {
+            partialWin = Win.RECORDS; // §28.3
+        }
         List<HistoryTrail.HistoryEntry> entries = history.entries();
         KeyType t = k.getKeyType();
         Character ch = k.getCharacter();
@@ -2767,10 +3221,8 @@ public final class ViewerApp {
             if (dialog.instancesMode) {
                 dialog.instanceTree.scrollBy(delta, Math.max(1, dialog.listViewH));
             } else {
-                dialog.scroll = clamp(dialog.scroll + delta,
-                        0, Math.max(0, dialog.rows.size() - dialog.listViewH));
-                dialog.sel = clamp(dialog.sel, dialog.scroll,
-                        dialog.scroll + Math.max(0, dialog.listViewH - 1));
+                dialog.scroll = dragScroll(dialog.scroll, delta, dialog.listViewH, dialog.rows.size());
+                dialog.sel = dragSel(dialog.sel, dialog.scroll, dialog.listViewH);
             }
             return;
         }
@@ -3079,12 +3531,20 @@ public final class ViewerApp {
 
     /** The object ids whose runtime class (simple or binary name) contains {@code needle} (§23.2). */
     private java.util.Set<Long> instanceIdsMatchingClass(final String needle) {
+        // §28.5: the §15.1 qualification rule — an unqualified needle (no '.' / '$') matches the
+        // SIMPLE class name only, so "buffer" no longer drags in every class whose PACKAGE has a
+        // .buffer. segment; a qualified needle matches the full binary name.
+        boolean qualified = needle.indexOf('.') >= 0 || needle.indexOf('$') >= 0;
         java.util.Set<Long> ids = new java.util.HashSet<>();
         for (ClassSite cs : engine.classSites()) {
             String cb = cs.classBinary();
-            if (cb != null
-                    && (Format.simpleName(cb).toLowerCase(Locale.ROOT).contains(needle)
-                            || cb.toLowerCase(Locale.ROOT).contains(needle))) {
+            if (cb == null) {
+                continue;
+            }
+            boolean match = qualified
+                    ? cb.toLowerCase(Locale.ROOT).contains(needle)
+                    : Format.simpleName(cb).toLowerCase(Locale.ROOT).contains(needle);
+            if (match) {
                 for (Instance inst : engine.instancesOf(cb, Integer.MAX_VALUE)) {
                     ids.add(inst.objectId());
                 }
@@ -3123,8 +3583,8 @@ public final class ViewerApp {
 
     // ---- §24.3: the `.` dialog's ' -> parent' accessibility chains ----
 
-    /** §24.3: how deep the parent search descends from the frame's accessible roots. */
-    private static final int CHAIN_DEPTH_MAX = 5;
+    /** §24.3/§28.5: how deep the parent search descends from the accessible roots. */
+    private static final int CHAIN_DEPTH_MAX = 6;
 
     /**
      * §24.3: how many objects the parent search may expand per row (keeps rendering snappy).
@@ -3132,7 +3592,7 @@ public final class ViewerApp {
      * container/field capture caps, so queue and parent-map stay small (measured ≤ a few hundred
      * entries on real recordings).
      */
-    private static final int CHAIN_NODE_BUDGET = 200;
+    private static final int CHAIN_NODE_BUDGET = 600;
 
     /**
      * §24.3: ensures the visible {@code .}-dialog rows {@code [from, to)} have their chain
@@ -3187,7 +3647,9 @@ public final class ViewerApp {
         if (objId == 0) {
             return "";
         }
-        engine.seek((int) target[0], target[1]);
+        // §28.5: reconstruct at the exec LANDING of the row's record — exactly where Enter puts
+        // the cursor — so the chain describes what the Locals window will actually show there.
+        landOnNearestExecAtOrBefore((int) target[0], target[1]);
         int top = engine.stack().size() - 1;
         if (top < 0) {
             return ""; // §26.1: no frame context at all — the row simply carries no chain
@@ -3195,16 +3657,20 @@ public final class ViewerApp {
         Map<Long, Long> parent = new HashMap<>(); // child object id -> parent object id (0 = a root)
         Map<Long, String> rootName = new HashMap<>(); // root object id -> local/arg/this name
         java.util.ArrayDeque<long[]> queue = new java.util.ArrayDeque<>(); // {objectId, depth}
-        for (Local l : engine.locals(top)) {
-            if (l.value() instanceof Value.Ref ref && ref.objectId() != 0) {
-                long id = ref.objectId();
-                if (id == objId) {
-                    return ""; // §24.3: directly accessible from the record's own frame
-                }
-                if (!parent.containsKey(id)) {
-                    parent.put(id, 0L);
-                    rootName.put(id, l.name());
-                    queue.add(new long[] {id, 0});
+        // §28.5: roots come from EVERY frame's locals/args/this (innermost first, so the nearest
+        // context names the path when an object is reachable from several frames).
+        for (int fi = top; fi >= 0; fi--) {
+            for (Local l : engine.locals(fi)) {
+                if (l.value() instanceof Value.Ref ref && ref.objectId() != 0) {
+                    long id = ref.objectId();
+                    if (id == objId) {
+                        return ""; // §24.3: directly accessible from an on-stack frame
+                    }
+                    if (!parent.containsKey(id)) {
+                        parent.put(id, 0L);
+                        rootName.put(id, l.name());
+                        queue.add(new long[] {id, 0});
+                    }
                 }
             }
         }
@@ -3334,7 +3800,7 @@ public final class ViewerApp {
     private void landOnNearestExecAfter(final int tid, final long index) {
         engine.seek(tid, index);
         if (!engine.stepInto().moved()
-                && !ExecRecords.isExec(rec(engine.currentTid(), engine.currentIndex()).type())) {
+                && !engine.isExecLanding(engine.currentTid(), engine.currentIndex())) {
             engine.reverseStep();
         }
     }
@@ -3498,7 +3964,7 @@ public final class ViewerApp {
         // on it — stepping would move OFF it (reverseStep from it goes to the previous exec
         // record, the §16.3 off-by-one). Only a non-exec target needs walking back to the exec
         // record it belongs to (falling forward only when none precedes).
-        if (ExecRecords.isExec(rec(tid, index).type())) {
+        if (engine.isExecLanding(tid, index)) {
             return;
         }
         if (!engine.reverseStep().moved()) {
@@ -4234,10 +4700,9 @@ public final class ViewerApp {
         // Ctrl-U/Ctrl-N scroll the viewport one line (selection dragged along the nearest edge
         // only when it would leave the view), Ctrl-K (and </> below, §27.2) scrolls horizontally.
         if (ctrl && (isChar(k, 'u') || isChar(k, 'n'))) {
-            fileDialog.scroll = clamp(fileDialog.scroll + (isChar(k, 'u') ? -1 : 1),
-                    0, Math.max(0, count - fileDialog.listViewH));
-            fileDialog.sel = clamp(fileDialog.sel, fileDialog.scroll,
-                    fileDialog.scroll + Math.max(0, fileDialog.listViewH - 1));
+            fileDialog.scroll = dragScroll(fileDialog.scroll, isChar(k, 'u') ? -1 : 1,
+                    fileDialog.listViewH, count);
+            fileDialog.sel = dragSel(fileDialog.sel, fileDialog.scroll, fileDialog.listViewH);
             return;
         }
         if (ctrl && isChar(k, 'k')) {
@@ -4289,22 +4754,35 @@ public final class ViewerApp {
         }
     }
 
-    /** →/↵ on a directory row: expand it, or step onto its first child when already open. */
+    /**
+     * →/↵ on a directory row: expand it — §28.6 recursively through single-directory chains —
+     * or step onto its first child when already open.
+     */
     private void expandOrDescendFileRow(final FileTree.Row row, final List<FileTree.Row> rows) {
         if (!row.directory()) {
             return;
         }
         if (!row.expanded()) {
-            fileDialog.tree.expand(row.path());
+            fileDialog.tree.expandChain(row.path());
         } else if (fileDialog.sel + 1 < rows.size()) {
             fileDialog.sel++; // a visible expanded dir always has a visible first child
         }
     }
 
-    /** ← on a row: collapse an expanded directory, else move the selection to its parent row. */
+    /**
+     * ← on a row: collapse an expanded directory — §28.6 together with every single-entry
+     * ancestor, landing the selection on the topmost collapsed row — else move to the parent.
+     */
     private void collapseOrParentFileRow(final FileTree.Row row, final List<FileTree.Row> rows) {
         if (row.directory() && row.expanded()) {
-            fileDialog.tree.collapse(row.path());
+            java.nio.file.Path top = fileDialog.tree.collapseChain(row.path());
+            List<FileTree.Row> after = fileDialog.tree.rows();
+            for (int i = 0; i < after.size(); i++) {
+                if (after.get(i).path().equals(top)) {
+                    fileDialog.sel = i;
+                    break;
+                }
+            }
             return;
         }
         for (int i = fileDialog.sel - 1; i >= 0; i--) {
@@ -4452,6 +4930,7 @@ public final class ViewerApp {
         browseKey = "browse:" + file.toAbsolutePath().normalize();
         Path name = file.getFileName();
         browseName = name != null ? name.toString() : file.toString();
+        browseFile = file;
         browseVisited = visitedLinesOfFile(file);
         browseLines = lines;
         int target = line >= 1 ? line : 1;
@@ -4516,6 +4995,110 @@ public final class ViewerApp {
     }
 
     /**
+     * §28.10 F7: when armed at exactly the current position, the second press ENTERS the callee;
+     * otherwise, after the §17.5 selected-frame seek, peek the next exec record — a METHOD_ENTER
+     * arms the call-site stop (no engine move; the callee's name highlights on the call line and
+     * from a METHOD_EXIT cursor the CALLER frame is shown, since the call line lives there);
+     * anything else is a plain step-into.
+     */
+    private void stepIntoTwoStep() {
+        if (pendingCall != null && pendingCall.tid == engine.currentTid()
+                && pendingCall.index == engine.currentIndex()) {
+            pendingCall = null;
+            doStep(engine.stepInto()); // the armed entry — the next exec record IS that ENTER
+            return;
+        }
+        pendingCall = null;
+        boolean seeked = seekToSelectedFrameAsOf();
+        Engine.ExecPeek p = engine.peekExec(true);
+        if (p.found() && p.type() == Format.METHOD_ENTER) {
+            if (seeked) {
+                afterMove(); // the §17.5 seek was itself a move (one history entry)
+                appendHistory();
+            }
+            if (rec(engine.currentTid(), engine.currentIndex()).type() == Format.METHOD_EXIT
+                    && engine.stack().size() > 1) {
+                // Chained calls (a().b()): between a's EXIT and b's ENTER the call line lives in
+                // the CALLER — show that frame while armed.
+                engine.selectFrame(engine.stack().size() - 2);
+                followPending = true;
+                srcCursorPending = true;
+            }
+            armPendingCall(p.location(), p.index());
+            return;
+        }
+        StepResult r = engine.stepInto();
+        if (seeked && !r.moved()) {
+            r = new StepResult(true, r.message());
+        }
+        doStep(r);
+    }
+
+    /**
+     * §28.10 ⇧F7: leaving a METHOD_ENTER backward arrives AT its call site (armed, callee
+     * highlighted — F7 re-enters symmetrically); a reverse step that would LAND on an ENTER
+     * lands at the call site before it instead, armed, in ONE logical step. Everything else is
+     * a plain reverse step. (⇧F8 keeps its classic behaviour.)
+     */
+    private void reverseStepTwoStep() {
+        pendingCall = null;
+        boolean seeked = seekToSelectedFrameAsOf();
+        Rec cur = rec(engine.currentTid(), engine.currentIndex());
+        if (cur.type() == Format.METHOD_ENTER) {
+            long enterIdx = engine.currentIndex();
+            int loc = cur.location();
+            StepResult r = engine.reverseStep();
+            if (seeked && !r.moved()) {
+                r = new StepResult(true, r.message());
+            }
+            doStep(r);
+            if (r.moved()) {
+                armPendingCall(loc, enterIdx);
+            }
+            return;
+        }
+        Engine.ExecPeek p = engine.peekExec(false);
+        if (p.found() && p.type() == Format.METHOD_ENTER) {
+            StepResult onto = engine.reverseStep(); // onto the ENTER…
+            if (!onto.moved()) {
+                doStep(onto);
+                return;
+            }
+            if (!engine.peekExec(false).found()) {
+                // …which is the recording's first exec record: land on it classically.
+                afterMove();
+                appendHistory();
+                status = onto.message();
+                return;
+            }
+            StepResult r = engine.reverseStep(); // …and through, to the call site
+            doStep(r); // ONE history entry for the logical step
+            if (r.moved()) {
+                armPendingCall(p.location(), p.index());
+            }
+            return;
+        }
+        StepResult r = engine.reverseStep();
+        if (seeked && !r.moved()) {
+            r = new StepResult(true, r.message());
+        }
+        doStep(r);
+    }
+
+    /** §28.10: arm the call-site stop for the METHOD_ENTER at {@code enterIndex}. */
+    private void armPendingCall(final int location, final long enterIndex) {
+        Site site = recording.site(location);
+        String name = site != null && site.memberSym() != 0 ? recording.symbolText(site.memberSym()) : null;
+        String cls = site != null ? simpleClass(recording.symbolText(site.classSym())) : "?";
+        String callee = name == null || "<init>".equals(name) ? cls : name;
+        Frame shown = selectedFrameOrNull();
+        pendingCall = new PendingCall(engine.currentTid(), engine.currentIndex(), enterIndex,
+                callee, cls + "." + (name == null ? "?" : name),
+                shown != null ? shown.currentLine() : 0);
+        status = "call → " + pendingCall.label + "   (F7 steps in, F8 steps over)";
+    }
+
+    /**
      * Runs a step/run/exit-frame command honouring the frame selection (§17.5): while a
      * non-innermost RECORDED frame is selected, the cursor is first seeked to that frame's
      * as-of record ({@link Engine#frameAsOf}) and the command applies from there — the cursor
@@ -4551,6 +5134,7 @@ public final class ViewerApp {
     }
 
     private void afterMove() {
+        pendingCall = null; // §28.10: any actual move disarms the two-step call stop
         // §20.8: any action that moves the execution cursor yields browse mode to the execution
         // source — clear the browsed file and force a re-centre on the new execution line
         // (srcCursorPending is reset below). Every step and jump routes through here, so this single
@@ -4606,27 +5190,50 @@ public final class ViewerApp {
     }
 
     /**
-     * §20.13/§21.9 {@code Ctrl-U}/{@code Ctrl-N} viewport scroll of the focused window by {@code delta}
-     * lines: Source moves {@code srcTop} (the render's {@code clampTop} keeps it in range); the list
-     * windows nudge their scroll offset without moving the selection ({@link ScrollMath#adjustScroll}
-     * / {@link TreeView#ensureVisible} still keep the selection on-screen at render, so the offset
-     * only sticks while the selection stays within the viewport).
+     * §28.4 {@code Ctrl-U}/{@code Ctrl-N} viewport scroll of the focused window by {@code delta}
+     * lines (supersedes §20.13's pinned-offset semantics): Source moves {@code srcTop}; the main
+     * list windows scroll like the dialogs — the viewport moves freely and the SELECTION is
+     * dragged along the nearest edge when it would fall outside, so scrolling never sticks and
+     * Records actually scrolls. The Stack drag moves the view selection only; it never selects a
+     * frame (↑/↓ and Enter still do).
      */
     private void scrollFocused(final int delta) {
+        partialWin = focus; // §28.3: viewport scroll repaints only this window
         switch (focus) {
             case SOURCE -> {
                 if (srcResolved) {
                     srcTop = Math.max(1, srcTop + delta);
                 }
             }
-            case THREADS -> threadScroll = Math.max(0, threadScroll + delta);
-            case STACK -> stackScroll = Math.max(0, stackScroll + delta);
-            case LOCALS -> localsTree.scrollBy(delta);
-            case RECORDS -> recordsScroll = Math.max(0, recordsScroll + delta);
+            case THREADS -> {
+                threadScroll = dragScroll(threadScroll, delta, threadsViewH, tids.size());
+                threadSel = dragSel(threadSel, threadScroll, threadsViewH);
+            }
+            case STACK -> {
+                int n = engine.stack().size();
+                stackScroll = dragScroll(stackScroll, delta, stackViewH, n);
+                stackSel = dragSel(stackSel, stackScroll, stackViewH);
+            }
+            case LOCALS -> localsTree.scrollBy(delta, Math.max(1, localsViewH));
+            case RECORDS -> {
+                recordsScroll = dragScroll(recordsScroll, delta, recordsViewH, history.size());
+                recordsSel = dragSel(recordsSel, recordsScroll, recordsViewH);
+            }
         }
     }
 
+    /** §28.4: the shared drag-scroll offset rule — clamp into {@code [0, count - viewH]}. */
+    private static int dragScroll(final int scroll, final int delta, final int viewH, final int count) {
+        return clamp(scroll + delta, 0, Math.max(0, count - Math.max(1, viewH)));
+    }
+
+    /** §28.4: the shared drag-scroll selection rule — pulled along the nearest viewport edge. */
+    private static int dragSel(final int sel, final int scroll, final int viewH) {
+        return clamp(sel, scroll, scroll + Math.max(1, viewH) - 1);
+    }
+
     private void hscrollFocused(final int delta) {
+        partialWin = focus; // §28.3
         switch (focus) {
             case SOURCE -> {
                 if (delta < 0) {

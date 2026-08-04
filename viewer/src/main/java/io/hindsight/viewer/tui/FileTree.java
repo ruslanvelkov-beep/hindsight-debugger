@@ -417,9 +417,105 @@ public final class FileTree {
         expandedDirs.add(dir);
     }
 
+    /**
+     * §28.6: expands {@code dir} and then recursively every DESCENDANT that is a directory's
+     * only entry — so a long single-directory chain (deep package paths) opens in one keystroke,
+     * stopping at the first directory with more than one entry or at a leaf.
+     */
+    public void expandChain(final Path dir) {
+        Node n = findNode(dir);
+        while (n != null && n.dir()) {
+            expandedDirs.add(n.path());
+            n = n.children().size() == 1 && n.children().get(0).dir() ? n.children().get(0) : null;
+        }
+    }
+
     /** Collapses the directory at {@code dir}. */
     public void collapse(final Path dir) {
         expandedDirs.remove(dir);
+    }
+
+    /**
+     * §28.6: collapses {@code dir} and then every ANCESTOR that holds it as its only entry —
+     * undoing an {@link #expandChain} in one keystroke — stopping below a root or at the first
+     * ancestor with more than one entry.
+     *
+     * @return the topmost collapsed directory (the row the selection should land on)
+     */
+    public Path collapseChain(final Path dir) {
+        expandedDirs.remove(dir);
+        Path top = dir;
+        Node parent = parentOf(top);
+        while (parent != null && parent.children().size() == 1 && !isRoot(parent.path())) {
+            expandedDirs.remove(parent.path());
+            top = parent.path();
+            parent = parentOf(top);
+        }
+        return top;
+    }
+
+    /** The indexed node at {@code path}, or {@code null}. */
+    private Node findNode(final Path path) {
+        for (Node r : roots) {
+            Node hit = findNode(r, path);
+            if (hit != null) {
+                return hit;
+            }
+        }
+        return null;
+    }
+
+    private static Node findNode(final Node n, final Path path) {
+        if (n.path().equals(path)) {
+            return n;
+        }
+        if (!n.dir() || !path.startsWith(n.path())) {
+            return null;
+        }
+        for (Node c : n.children()) {
+            Node hit = findNode(c, path);
+            if (hit != null) {
+                return hit;
+            }
+        }
+        return null;
+    }
+
+    /** The parent NODE of the entry at {@code path}, or {@code null} for roots/unknown paths. */
+    private Node parentOf(final Path path) {
+        for (Node r : roots) {
+            Node hit = parentOf(r, path);
+            if (hit != null) {
+                return hit;
+            }
+        }
+        return null;
+    }
+
+    private static Node parentOf(final Node n, final Path path) {
+        if (!n.dir() || !path.startsWith(n.path()) || n.path().equals(path)) {
+            return null;
+        }
+        for (Node c : n.children()) {
+            if (c.path().equals(path)) {
+                return n;
+            }
+            Node hit = parentOf(c, path);
+            if (hit != null) {
+                return hit;
+            }
+        }
+        return null;
+    }
+
+    /** Whether {@code path} is one of the top-level tree roots. */
+    private boolean isRoot(final Path path) {
+        for (Node r : roots) {
+            if (r.path().equals(path)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Whether the directory at {@code dir} is currently expanded. */
