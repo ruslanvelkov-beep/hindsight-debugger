@@ -86,6 +86,10 @@ final class SyntheticRecording {
         return site("LINE", classSym, fileSym, line, 0, "", -1);
     }
 
+    int branchSite(final int classSym, final int fileSym, final int line, final int opcode) {
+        return site("BRANCH", classSym, fileSym, line, 0, "", opcode);
+    }
+
     private int site(final String kind, final int classSym, final int fileSym, final int line,
             final int memberSym, final String desc, final int slot) {
         int id = nextSite++;

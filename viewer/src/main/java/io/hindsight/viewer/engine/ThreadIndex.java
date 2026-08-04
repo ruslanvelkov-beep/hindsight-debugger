@@ -20,9 +20,11 @@ package io.hindsight.viewer.engine;
  * {@code execIndices} is the sorted list of <em>execution</em>-record indices — the
  * {@code LINE}/{@code METHOD_ENTER}/{@code METHOD_EXIT} exec set of VIEWER.md §17.1
  * that all stepping walks; metadata and value records never appear in it.
- * {@code lineIndices} is the sorted list of {@code LINE} record indices, kept beside
- * it for the line-oriented commands (run-to-line, exit-frame); it is empty when the
- * recording had {@code lines=false}. {@code timeSyncIndices}/{@code timeSyncMillis} let
+ * {@code lineIndices} is the sorted list of {@code LINE} record indices (empty when the
+ * recording had {@code lines=false}); {@code lineInfoIndices} (§28.9) additionally folds in
+ * the {@code BRANCH} records of LINE-less frames — branch-mode methods' only line-bearing
+ * records — and is what the line-oriented commands (run-to-line, exit-frame, line-trace)
+ * walk, so they work identically over line-mode and branch-mode frames. {@code timeSyncIndices}/{@code timeSyncMillis} let
  * {@link #timeAt} answer "wall-clock at record i" from the nearest preceding
  * {@code TIME_SYNC} without a linear scan. {@code stackSnapshotIndices} is the
  * ascending list of {@code STACK_SNAPSHOT} record indices (schema 4, VIEWER.md
@@ -42,6 +44,7 @@ final class ThreadIndex {
     final int[] parentEnter;
     final long[] execIndices;
     final long[] lineIndices;
+    final long[] lineInfoIndices;
     final long[] timeSyncIndices;
     final long[] timeSyncMillis;
     final long[] stackSnapshotIndices;
@@ -56,6 +59,7 @@ final class ThreadIndex {
             final int[] parentEnter,
             final long[] execIndices,
             final long[] lineIndices,
+            final long[] lineInfoIndices,
             final long[] timeSyncIndices,
             final long[] timeSyncMillis,
             final long[] stackSnapshotIndices,
@@ -68,15 +72,21 @@ final class ThreadIndex {
         this.parentEnter = parentEnter;
         this.execIndices = execIndices;
         this.lineIndices = lineIndices;
+        this.lineInfoIndices = lineInfoIndices;
         this.timeSyncIndices = timeSyncIndices;
         this.timeSyncMillis = timeSyncMillis;
         this.stackSnapshotIndices = stackSnapshotIndices;
         this.threadName = threadName;
     }
 
-    /** Whether this thread carries any {@code LINE} records (the line-oriented commands need one). */
+    /** Whether this thread carries any {@code LINE} records (the §18.4 thread-kind cache key). */
     boolean hasLines() {
         return lineIndices.length > 0;
+    }
+
+    /** §28.9: whether this thread carries any line-bearing record (LINE, or branch-mode BRANCH). */
+    boolean hasLineInfo() {
+        return lineInfoIndices.length > 0;
     }
 
     /** Wall-clock millis of the nearest {@code TIME_SYNC} at or before {@code index}, else 0. */

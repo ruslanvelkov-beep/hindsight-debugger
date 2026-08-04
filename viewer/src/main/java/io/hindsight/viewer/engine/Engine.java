@@ -266,9 +266,11 @@ public final class Engine implements AutoCloseable {
         int top = -1;
         LongList execList = new LongList();
         LongList lineList = new LongList();
+        LongList branchList = new LongList();
         LongList tsIdx = new LongList();
         LongList tsMs = new LongList();
         LongList capIdx = new LongList();
+        boolean[] enterHasLine = new boolean[count]; // indexed by a frame's ENTER record index
         String threadName = null;
 
         for (int i = 0; i < count; i++) {
@@ -306,6 +308,11 @@ public final class Engine implements AutoCloseable {
                     if (type == Format.LINE) {
                         execList.add((long) i);
                         lineList.add((long) i);
+                        if (frameEnter[i] >= 0) {
+                            enterHasLine[frameEnter[i]] = true;
+                        }
+                    } else if (type == Format.BRANCH) {
+                        branchList.add((long) i); // §28.9: kept only for LINE-less frames (below)
                     } else if (type == Format.THREAD_START && threadName == null) {
                         threadName = recording.symbolText(r.location());
                     } else if (type == Format.TIME_SYNC) {
@@ -319,9 +326,49 @@ public final class Engine implements AutoCloseable {
             indexObjectEvent(r, tid, i);
         }
 
+        // §28.9 second phase: a BRANCH record joins the exec set — and the line-info index —
+        // ONLY when its frame executed no LINE record (branch-mode methods). Line-mode frames,
+        // where every BRANCH immediately follows its LINE, therefore never double-stop.
+        long[] lines = lineList.toArray();
+        long[] branches = branchList.toArray();
+        LongList keptBranches = new LongList();
+        for (int b = 0; b < branches.length; b++) {
+            int idx = (int) branches[b];
+            int enter = frameEnter[idx];
+            if (enter >= 0 && !enterHasLine[enter]) {
+                keptBranches.add(branches[b]);
+            }
+        }
+        long[] kept = keptBranches.toArray();
+        long[] exec = mergeSorted(execList.toArray(), kept);
+        long[] lineInfo = mergeSorted(lines, kept);
         return new ThreadIndex(tid, count, depth, frameEnter, matchingExit, parentEnter,
-                execList.toArray(), lineList.toArray(), tsIdx.toArray(), tsMs.toArray(),
+                exec, lines, lineInfo, tsIdx.toArray(), tsMs.toArray(),
                 capIdx.toArray(), threadName);
+    }
+
+    /** Merges two sorted long arrays (both strictly increasing, disjoint) into one. */
+    private static long[] mergeSorted(final long[] a, final long[] b) {
+        if (b.length == 0) {
+            return a;
+        }
+        if (a.length == 0) {
+            return b;
+        }
+        long[] out = new long[a.length + b.length];
+        int i = 0;
+        int j = 0;
+        int o = 0;
+        while (i < a.length && j < b.length) {
+            out[o++] = a[i] <= b[j] ? a[i++] : b[j++];
+        }
+        while (i < a.length) {
+            out[o++] = a[i++];
+        }
+        while (j < b.length) {
+            out[o++] = b[j++];
+        }
+        return out;
     }
 
     private void indexObjectEvent(final Rec r, final int tid, final int index) {
@@ -440,9 +487,47 @@ public final class Engine implements AutoCloseable {
     // ---- navigation (§2.6, exec-record stepping §17.1) ----
 
     /**
+     * §28.9: one exec record peeked WITHOUT moving the cursor — the two-step method-entry UX
+     * asks "is the next step a METHOD_ENTER?" before stepping.
+     *
+     * @param found whether an exec record exists in that direction
+     * @param type the record's FORMAT §2.1 type
+     * @param location the record's site id
+     * @param index the record's index within the current thread
+     */
+    public record ExecPeek(boolean found, int type, int location, long index) {}
+
+    /**
+     * §28.9: the next ({@code forward}) / previous exec record from the cursor, without moving —
+     * a pure binary-search lookup over the current thread's exec set.
+     */
+    public ExecPeek peekExec(final boolean forward) {
+        ThreadIndex ti = index(cursorTid);
+        int at = forward ? execForwardStart(ti) : execBackwardStart(ti);
+        if (at < 0 || at >= ti.execIndices.length) {
+            return new ExecPeek(false, 0, 0, -1);
+        }
+        long j = ti.execIndices[at];
+        Rec r = rec(cursorTid, j);
+        return new ExecPeek(true, r.type(), r.location(), j);
+    }
+
+    /**
+     * §28.9: whether {@code (tid, index)} is a legal cursor landing — a member of that thread's
+     * exec set. Replaces the old record-TYPE test: with branch mode, a {@code BRANCH} record is
+     * a landing exactly when its frame has no {@code LINE} records, which only the per-thread
+     * index (not the type alone) can answer.
+     */
+    public boolean isExecLanding(final int tid, final long index) {
+        ThreadIndex ti = indices.get(tid);
+        return ti != null && Arrays.binarySearch(ti.execIndices, index) >= 0;
+    }
+
+    /**
      * Step to the next execution record — {@code LINE}, {@code METHOD_ENTER} or
-     * {@code METHOD_EXIT} — in this thread, any frame (F7, §17.1). Descends into callees:
-     * from a call-site line the next exec record is the callee's ENTER.
+     * {@code METHOD_EXIT} (§28.9: plus a branch-mode frame's {@code BRANCH}) — in this thread,
+     * any frame (F7, §17.1). Descends into callees: from a call-site line the next exec record
+     * is the callee's ENTER.
      */
     public StepResult stepInto() {
         ThreadIndex ti = index(cursorTid);
@@ -526,7 +611,7 @@ public final class Engine implements AutoCloseable {
      */
     public StepResult runToCurrentLine(final boolean forward) {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
+        if (!ti.hasLineInfo()) {
             return new StepResult(false, NO_LINE_RECORDS);
         }
         final int location;
@@ -540,20 +625,20 @@ public final class Engine implements AutoCloseable {
             }
             location = rec(cursorTid, frameLine).location();
         }
-        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+        int idx = Arrays.binarySearch(ti.lineInfoIndices, cursorIndex);
         if (forward) {
             int start = idx >= 0 ? idx + 1 : -idx - 1;
-            for (int t = start; t < ti.lineIndices.length; t++) {
-                if (rec(cursorTid, ti.lineIndices[t]).location() == location) {
-                    return moveTo(cursorTid, ti.lineIndices[t]);
+            for (int t = start; t < ti.lineInfoIndices.length; t++) {
+                if (rec(cursorTid, ti.lineInfoIndices[t]).location() == location) {
+                    return moveTo(cursorTid, ti.lineInfoIndices[t]);
                 }
             }
             return new StepResult(false, NO_NEXT_APPEARANCE);
         }
         int start = idx >= 0 ? idx - 1 : -idx - 2;
         for (int t = start; t >= 0; t--) {
-            if (rec(cursorTid, ti.lineIndices[t]).location() == location) {
-                return moveTo(cursorTid, ti.lineIndices[t]);
+            if (rec(cursorTid, ti.lineInfoIndices[t]).location() == location) {
+                return moveTo(cursorTid, ti.lineInfoIndices[t]);
             }
         }
         return new StepResult(false, NO_PREV_APPEARANCE);
@@ -601,18 +686,18 @@ public final class Engine implements AutoCloseable {
     /** §21.7 thread-preserving run-to-line: the current thread's LINEs after/before the cursor. */
     private StepResult runToLineSameThread(final int[] siteIds, final boolean forward) {
         ThreadIndex ti = index(cursorTid);
-        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+        int idx = Arrays.binarySearch(ti.lineInfoIndices, cursorIndex);
         if (forward) {
-            for (int t = idx >= 0 ? idx + 1 : -idx - 1; t < ti.lineIndices.length; t++) {
-                if (matchesAny(siteIds, rec(cursorTid, ti.lineIndices[t]).location())) {
-                    return moveTo(cursorTid, ti.lineIndices[t]);
+            for (int t = idx >= 0 ? idx + 1 : -idx - 1; t < ti.lineInfoIndices.length; t++) {
+                if (matchesAny(siteIds, rec(cursorTid, ti.lineInfoIndices[t]).location())) {
+                    return moveTo(cursorTid, ti.lineInfoIndices[t]);
                 }
             }
             return new StepResult(false, NO_LATER_PASS);
         }
         for (int t = idx >= 0 ? idx - 1 : -idx - 2; t >= 0; t--) {
-            if (matchesAny(siteIds, rec(cursorTid, ti.lineIndices[t]).location())) {
-                return moveTo(cursorTid, ti.lineIndices[t]);
+            if (matchesAny(siteIds, rec(cursorTid, ti.lineInfoIndices[t]).location())) {
+                return moveTo(cursorTid, ti.lineInfoIndices[t]);
             }
         }
         return new StepResult(false, NO_EARLIER_PASS);
@@ -631,7 +716,7 @@ public final class Engine implements AutoCloseable {
         long bestIndex = -1;
         long bestSeq = forward ? Long.MAX_VALUE : Long.MIN_VALUE;
         for (int tid : recording.threadIds()) {
-            long[] lines = index(tid).lineIndices;
+            long[] lines = index(tid).lineInfoIndices;
             int boundary = firstLineAtOrAfterSeq(tid, lines, cursorSeq);
             if (forward) {
                 for (int t = boundary; t < lines.length; t++) {
@@ -734,7 +819,7 @@ public final class Engine implements AutoCloseable {
         }
         Set<Integer> siteIds = new HashSet<>();
         for (int tid : recording.threadIds()) {
-            for (long li : index(tid).lineIndices) {
+            for (long li : index(tid).lineInfoIndices) {
                 siteIds.add(rec(tid, li).location());
             }
         }
@@ -778,16 +863,16 @@ public final class Engine implements AutoCloseable {
      */
     public StepResult toLineTrace(final boolean forward) {
         ThreadIndex ti = index(cursorTid);
-        int idx = Arrays.binarySearch(ti.lineIndices, cursorIndex);
+        int idx = Arrays.binarySearch(ti.lineInfoIndices, cursorIndex);
         if (forward) {
             int start = idx >= 0 ? idx + 1 : -idx - 1;
-            if (start < ti.lineIndices.length) {
-                return moveTo(cursorTid, ti.lineIndices[start]);
+            if (start < ti.lineInfoIndices.length) {
+                return moveTo(cursorTid, ti.lineInfoIndices[start]);
             }
         } else {
             int start = idx >= 0 ? idx - 1 : -idx - 2;
             if (start >= 0) {
-                return moveTo(cursorTid, ti.lineIndices[start]);
+                return moveTo(cursorTid, ti.lineInfoIndices[start]);
             }
         }
         return new StepResult(false, NO_FURTHER_LINE_TRACE);
@@ -1029,15 +1114,15 @@ public final class Engine implements AutoCloseable {
      */
     public StepResult exitFrameForward() {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
+        if (!ti.hasLineInfo()) {
             return new StepResult(false, ALREADY_AT_FRAME_RETURN);
         }
         int ci = (int) cursorIndex;
         int enter = ci >= 0 && ci < ti.frameEnter.length ? ti.frameEnter[ci] : -1;
         long bound = enter >= 0 ? ti.matchingExit[enter] : ti.count - 1;
         long target = -1;
-        for (int t = ti.lineIndices.length - 1; t >= 0; t--) {
-            long j = ti.lineIndices[t];
+        for (int t = ti.lineInfoIndices.length - 1; t >= 0; t--) {
+            long j = ti.lineInfoIndices[t];
             if (j > bound) {
                 continue;
             }
@@ -1061,15 +1146,15 @@ public final class Engine implements AutoCloseable {
      */
     public StepResult exitFrameBackward() {
         ThreadIndex ti = index(cursorTid);
-        if (!ti.hasLines()) {
+        if (!ti.hasLineInfo()) {
             return new StepResult(false, ALREADY_AT_FRAME_ENTRY);
         }
         int ci = (int) cursorIndex;
         int enter = ci >= 0 && ci < ti.frameEnter.length ? ti.frameEnter[ci] : -1;
         long lowerBound = enter >= 0 ? enter : 0;
         long target = -1;
-        for (int t = 0; t < ti.lineIndices.length; t++) {
-            long j = ti.lineIndices[t];
+        for (int t = 0; t < ti.lineInfoIndices.length; t++) {
+            long j = ti.lineInfoIndices[t];
             if (j < lowerBound) {
                 continue;
             }
@@ -1151,6 +1236,36 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
+     * §28.9: whether the frame executed any LINE-BEARING record of its own — a {@code LINE}, or
+     * (for a branch-mode method) a {@code BRANCH}. This is what the §18.3/§19 green treatment
+     * keys on now: a branch-mode frame HAS line info (its branches carry lines), so it renders
+     * like a line-traced frame; only true enter/exit-only frames stay green.
+     */
+    public boolean frameHasLineInfo(final int frameIndex) {
+        int unrecorded = publicFrames.size() - ctx.size();
+        if (frameIndex < unrecorded || frameIndex >= publicFrames.size()) {
+            return false;
+        }
+        ThreadIndex ti = index(cursorTid);
+        int enter = ctx.get(frameIndex - unrecorded).frame().enterIndex();
+        long exit = ti.matchingExit[enter];
+        int t = Arrays.binarySearch(ti.lineInfoIndices, enter);
+        if (t < 0) {
+            t = -t - 1;
+        }
+        for (; t < ti.lineInfoIndices.length; t++) {
+            long j = ti.lineInfoIndices[t];
+            if (j > exit) {
+                return false;
+            }
+            if (ti.frameEnter[(int) j] == enter) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Whether stack frame {@code frameIndex} executed any {@code LINE} record within its span
      * (§18.3): {@code true} iff the frame is a recorded {@link #stack()} frame and at least one
      * {@code LINE} record with {@code frameEnter} equal to its ENTER index exists in
@@ -1197,7 +1312,10 @@ public final class Engine implements AutoCloseable {
         }
         Collections.reverse(enters); // outermost first
         int m = enters.size();
-        int cursorLine = ci >= 0 && rec(cursorTid, ci).type() == Format.LINE ? lineNumberAt(cursorTid, ci) : -1;
+        // §28.9: a BRANCH cursor (branch-mode landing) supplies the line exactly like a LINE one.
+        int cursorType = ci >= 0 ? rec(cursorTid, ci).type() : -1;
+        int cursorLine = cursorType == Format.LINE || cursorType == Format.BRANCH
+                ? lineNumberAt(cursorTid, ci) : -1;
 
         List<Frame> unrecorded = unrecordedFrames(ti, ci, enters);
         int u = unrecorded.size();
@@ -1260,12 +1378,14 @@ public final class Engine implements AutoCloseable {
      * their own enters and are skipped by the {@code frameEnter} test).
      */
     private long lastFrameLineAtOrBefore(final ThreadIndex ti, final int enterK, final long bound) {
-        int t = Arrays.binarySearch(ti.lineIndices, bound);
+        // §28.9: line info = LINE records plus the BRANCH records of LINE-less (branch-mode)
+        // frames, so a branch-mode frame's shown line follows its last decided branch.
+        int t = Arrays.binarySearch(ti.lineInfoIndices, bound);
         if (t < 0) {
             t = -t - 2;
         }
         for (; t >= 0; t--) {
-            long j = ti.lineIndices[t];
+            long j = ti.lineInfoIndices[t];
             if (j < enterK) {
                 return -1;
             }
@@ -1818,6 +1938,12 @@ public final class Engine implements AutoCloseable {
     public boolean threadHasLines(final int tid) {
         ThreadIndex ti = indices.get(tid);
         return ti != null && ti.hasLines();
+    }
+
+    /** §28.9: whether the thread carries any line-bearing record (LINE, or branch-mode BRANCH). */
+    public boolean threadHasLineInfo(final int tid) {
+        ThreadIndex ti = indices.get(tid);
+        return ti != null && ti.hasLineInfo();
     }
 
     // ---- method-call browse (§11.7) ----
