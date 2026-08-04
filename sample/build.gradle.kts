@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Deterministic sample workload recorded by the end-to-end test: a small
 // multi-threaded bank-transfer simulation exercising every v1 event type

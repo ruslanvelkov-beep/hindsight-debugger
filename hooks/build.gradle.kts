@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The `hooks` jar is loaded onto the bootstrap classloader at agent premain
 // via Instrumentation.appendToBootstrapClassLoaderSearch, so instrumented

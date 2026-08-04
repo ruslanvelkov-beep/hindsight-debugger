@@ -60,3 +60,8 @@ Build order (planned):
 5. Periodic snapshot sampler.
 
 Each step is independently usable.
+
+## License
+
+GPL-3.0-or-later. See [`LICENSE`](LICENSE). Every source file carries an
+`SPDX-License-Identifier: GPL-3.0-or-later` header.

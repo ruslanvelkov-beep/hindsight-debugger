@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 package io.hindsight.viewer.highlight;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;

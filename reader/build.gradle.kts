@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Offline reader for hindsight recordings: parses the recording directory
 // (FORMAT.md), merges per-thread streams by seq, and provides the dump/stats/verify

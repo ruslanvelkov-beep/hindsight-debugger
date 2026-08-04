@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The `viewer` module: an interactive, read-only, terminal "inspect-time" debugger over a
 // Hindsight recording (VIEWER.md). It depends on `reader` for parsing/reconstruction inputs

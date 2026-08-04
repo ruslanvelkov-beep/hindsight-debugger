@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 package io.hindsight.viewer.tui;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
