@@ -40,6 +40,12 @@ public final class AgentConfig {
         NONE,
         /** Method brackets + args only (§11 callsOnly). */
         CALLS_ONLY,
+        /**
+         * Brackets + args + locals + fields + BRANCH records, but no LINE records (§11
+         * branchOnly) — branch-resolution mode: which way every condition went, with all the
+         * variable transitions, at a fraction of full line tracing's record volume.
+         */
+        BRANCH,
         /** Brackets + args + locals + fields (§11 include). */
         FULL
     }
@@ -80,6 +86,9 @@ public final class AgentConfig {
 
     /** Binary-name prefixes receiving brackets + args only. */
     public final List<String> callsOnly;
+
+    /** Binary-name prefixes receiving branch-resolution instrumentation (§11 branchOnly). */
+    public final List<String> branchOnly;
 
     /** Binary-name prefixes excluded entirely; wins over the other lists. */
     public final List<String> exclude;
@@ -153,6 +162,7 @@ public final class AgentConfig {
             String sourceCommit,
             List<String> include,
             List<String> callsOnly,
+            List<String> branchOnly,
             List<String> exclude,
             List<String> snapshotOpen,
             List<String> snapshotAlways,
@@ -176,6 +186,7 @@ public final class AgentConfig {
         this.sourceCommit = sourceCommit;
         this.include = include;
         this.callsOnly = callsOnly;
+        this.branchOnly = branchOnly;
         this.exclude = exclude;
         this.snapshotOpen = snapshotOpen;
         this.snapshotAlways = snapshotAlways;
@@ -238,6 +249,7 @@ public final class AgentConfig {
             throw bad("missing required key 'include' (at least one class-name prefix)");
         }
         final List<String> callsOnly = parseList(pairs.remove("callsOnly"), "callsOnly");
+        final List<String> branchOnly = parseList(pairs.remove("branchOnly"), "branchOnly");
         final List<String> exclude = parseList(pairs.remove("exclude"), "exclude");
         final List<String> snapshotOpen = parseList(pairs.remove("snapshotOpen"), "snapshotOpen");
         final List<String> snapshotAlways = parseList(pairs.remove("snapshotAlways"), "snapshotAlways");
@@ -281,6 +293,7 @@ public final class AgentConfig {
                 sourceCommit,
                 include,
                 callsOnly,
+                branchOnly,
                 exclude,
                 snapshotOpen,
                 snapshotAlways,
@@ -303,8 +316,9 @@ public final class AgentConfig {
 
     /**
      * Decides the instrumentation scope for a class binary name: hard ignores first, then
-     * longest-prefix-wins among the three scope lists (ties broken toward the more restrictive
-     * scope). Called on every class-load, so it must stay allocation-free on the hot path.
+     * longest-prefix-wins among the four scope lists (ties broken toward the more restrictive
+     * scope: exclude over callsOnly over branchOnly over include). Called on every class-load,
+     * so it must stay allocation-free on the hot path.
      */
     public Scope scopeFor(String binaryName) {
         if (binaryName == null || binaryName.isEmpty() || binaryName.charAt(0) == '[') {
@@ -320,15 +334,16 @@ public final class AgentConfig {
             excluded = Math.max(excluded, SOFT_IGNORED_PREFIX.length());
         }
         final int calls = longestMatch(callsOnly, binaryName);
+        final int branch = longestMatch(branchOnly, binaryName);
         final int included = longestMatch(include, binaryName);
-        final int best = Math.max(excluded, Math.max(calls, included));
-        if (best == 0) {
+        final int best = Math.max(Math.max(excluded, branch), Math.max(calls, included));
+        if (best == 0 || excluded == best) {
             return Scope.NONE;
         }
-        if (excluded == best) {
-            return Scope.NONE;
+        if (calls == best) {
+            return Scope.CALLS_ONLY;
         }
-        return calls == best ? Scope.CALLS_ONLY : Scope.FULL;
+        return branch == best ? Scope.BRANCH : Scope.FULL;
     }
 
     /** Echo of the effective configuration for agent.log (the manifest echoes it too). */
@@ -338,6 +353,7 @@ public final class AgentConfig {
                 + ", sourceCommit=" + sourceCommit
                 + ", include=" + include
                 + ", callsOnly=" + callsOnly
+                + ", branchOnly=" + branchOnly
                 + ", exclude=" + exclude
                 + ", snapshotOpen=" + snapshotOpen
                 + ", snapshotAlways=" + snapshotAlways

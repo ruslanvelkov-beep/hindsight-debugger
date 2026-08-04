@@ -86,6 +86,79 @@ final class EndToEndRecordingTest {
         }
     }
 
+    @Test
+    void branchModeRecordingHasBranchesAndWritesButNoLines() throws Exception {
+        Path agentJar = propPath("hindsight.agentJar");
+        Path hooksJar = propPath("hindsight.hooksJar");
+        Path sampleJar = propPath("hindsight.sampleJar");
+        Path javaHome = propPath("hindsight.javaHome");
+        assumeTrue(agentJar != null && hooksJar != null && sampleJar != null && javaHome != null,
+                "agent/hooks/sample jar system properties not set — skipping end-to-end test");
+        assumeTrue(Files.exists(agentJar) && Files.exists(hooksJar) && Files.exists(sampleJar),
+                "agent/hooks/sample jars not built yet — skipping end-to-end test");
+        Path javaBin = javaHome.resolve("bin").resolve("java");
+        assumeTrue(Files.exists(javaBin), "no java launcher under " + javaHome);
+
+        Path outDir = tmp.resolve("rec-branch");
+        Path outLog = tmp.resolve("branch-stdout.log");
+        Path errLog = tmp.resolve("branch-stderr.log");
+        // §10/§11 branchOnly: the include list must still exist (grammar), but the sample scope
+        // is claimed by the longer-tie-winning branchOnly prefix — branch-resolution mode.
+        Process p = new ProcessBuilder(
+                        javaBin.toString(),
+                        "-javaagent:" + agentJar + "=hooks=" + hooksJar + ",outDir=" + outDir
+                                + ",include=io.hindsight.sample.,branchOnly=io.hindsight.sample."
+                                + ",autostart=true,snapshotEvery=64,debug=true",
+                        "-jar",
+                        sampleJar.toString())
+                .redirectOutput(outLog.toFile())
+                .redirectError(errLog.toFile())
+                .start();
+        boolean finished = p.waitFor(180, TimeUnit.SECONDS);
+        if (!finished) {
+            p.destroyForcibly();
+            p.waitFor(10, TimeUnit.SECONDS);
+        }
+        String stdout = Files.exists(outLog) ? Files.readString(outLog, StandardCharsets.UTF_8) : "";
+        String stderr = Files.exists(errLog) ? Files.readString(errLog, StandardCharsets.UTF_8) : "";
+        String diag = "\n--- sample stdout ---\n" + stdout + "\n--- sample stderr ---\n" + stderr;
+        assertTrue(finished, "sample JVM did not finish in time" + diag);
+        assertEquals(0, p.exitValue(), "sample JVM failed" + diag);
+
+        TestCli.Result verify = TestCli.run("verify", "--dir", outDir.toString());
+        assertEquals(0, verify.code(), "a branch-mode recording must still verify:" + verify.out() + diag);
+
+        long lines = 0;
+        long branches = 0;
+        long localWrites = 0;
+        long fieldWrites = 0;
+        long enters = 0;
+        try (Recording rec = Recording.open(outDir)) {
+            RecordCursor cur = rec.cursor();
+            while (cur.hasNext()) {
+                Rec r = cur.next();
+                switch (r.type()) {
+                    case Format.LINE -> lines++;
+                    case Format.BRANCH -> branches++;
+                    case Format.LOCAL_WRITE -> localWrites++;
+                    case Format.FIELD_WRITE -> fieldWrites++;
+                    case Format.METHOD_ENTER -> enters++;
+                    default -> { }
+                }
+                if (r.type() == Format.BRANCH) {
+                    Site site = rec.site(r.location());
+                    assertTrue(site != null && site.line() > 0,
+                            "a BRANCH site keeps its source line in branch mode");
+                }
+            }
+        }
+        assertEquals(0, lines, "branch mode records NO LINE records" + diag);
+        assertTrue(branches > 0, "branch decisions are recorded" + diag);
+        assertTrue(localWrites > 0, "local transitions are recorded" + diag);
+        assertTrue(fieldWrites > 0, "field transitions are recorded" + diag);
+        assertTrue(enters > 0, "method brackets are recorded" + diag);
+    }
+
     private void assertSemantics(final Recording rec, final String diag) throws IOException {
         long enters = 0;
         long snapshots = 0;

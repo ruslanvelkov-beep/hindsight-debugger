@@ -48,6 +48,7 @@ public final class HindsightTransformer implements AgentBuilder.Transformer {
     private final AsmVisitorWrapper methodAdvice;
     private final AsmVisitorWrapper ctorAdvice;
     private final AsmVisitorWrapper fieldLocal; // null when the ASM bridge is unavailable
+    private final AsmVisitorWrapper fieldLocalBranch; // §11 branchOnly variant (no LINE splices)
     private final AsmVisitorWrapper prescan; // null when the ASM bridge is unavailable
 
     /**
@@ -65,10 +66,14 @@ public final class HindsightTransformer implements AgentBuilder.Transformer {
         this.ctorAdvice = mapping.to(CtorBracketAdvice.class).on(isConstructor());
 
         AsmVisitorWrapper fieldLocalWrapper = null;
+        AsmVisitorWrapper fieldLocalBranchWrapper = null;
         AsmVisitorWrapper prescanWrapper = null;
         try {
             AsmBridge.factory(); // fail here, once, not per class
             fieldLocalWrapper = new FieldLocalVisitor(registry, config.lines, config.branches);
+            // §11 branchOnly: the SAME pass with LINE splicing suppressed — locals, fields and
+            // BRANCH records keep their correct source lines (the line bookkeeping stays live).
+            fieldLocalBranchWrapper = new FieldLocalVisitor(registry, false, config.branches);
             prescanWrapper = new MethodLinePrescan(registry);
         } catch (Throwable t) {
             if (log != null) {
@@ -76,6 +81,7 @@ public final class HindsightTransformer implements AgentBuilder.Transformer {
             }
         }
         this.fieldLocal = fieldLocalWrapper;
+        this.fieldLocalBranch = fieldLocalBranchWrapper;
         this.prescan = prescanWrapper;
     }
 
@@ -102,6 +108,8 @@ public final class HindsightTransformer implements AgentBuilder.Transformer {
         builder = builder.visit(methodAdvice).visit(ctorAdvice);
         if (scope == AgentConfig.Scope.FULL && fieldLocal != null) {
             builder = builder.visit(fieldLocal);
+        } else if (scope == AgentConfig.Scope.BRANCH && fieldLocalBranch != null) {
+            builder = builder.visit(fieldLocalBranch); // §11 branchOnly: everything but LINE
         }
         if (prescan != null) {
             builder = builder.visit(prescan);

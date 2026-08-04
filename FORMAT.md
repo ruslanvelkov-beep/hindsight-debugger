@@ -393,6 +393,7 @@ list-valued keys use `|` between elements. Keys:
 | `hooks` | required | path to hooks jar (appended to bootstrap search) |
 | `outDir` | `.hindsight` | recording directory (§1) |
 | `include` | required | package/class binary-name prefixes → FULL instrumentation (brackets + args + locals + fields) |
+| `branchOnly` | empty | prefixes → brackets + args + locals + fields + BRANCH records, **no LINE records** — branch-resolution mode (§11) |
 | `callsOnly` | empty | prefixes → brackets + args only (no locals/fields) |
 | `exclude` | empty | prefixes excluded entirely; wins over include/callsOnly |
 | `snapshotOpen` | empty | prefixes whose packages are opened to the hooks module for reflective §7 snapshots WITHOUT instrumentation — for data/model classes (e.g. PBJ records, `java.time`) outside the instrumentation scope whose contents dumps must read. Recorder ≥ v1.5: matching packages of every boot-layer module (incl. `java.base`) are opened EAGERLY at premain — classes there may load before any transform event — and later-defined modules keep being handled lazily on class load |
@@ -412,7 +413,7 @@ list-valued keys use `|` between elements. Keys:
 | `sweepMillis` | `500` | background sweeper flushes every worker's partial chunks at this interval, bounding SIGKILL data loss; `0` = off |
 | `debug` | `false` | verbose agent logging to `agent.log` + stderr |
 
-Matching: longest-prefix wins among {include, callsOnly, exclude}; non-matching classes
+Matching: longest-prefix wins among {include, branchOnly, callsOnly, exclude} (ties toward the more restrictive: exclude > callsOnly > branchOnly > include); non-matching classes
 untouched. Hard ignores regardless of config: `io.hindsight.`, `java.`, `javax.`,
 `jdk.`, `sun.`, `com.sun.`, `net.bytebuddy.`, and array/hidden/synthetic-loader classes.
 

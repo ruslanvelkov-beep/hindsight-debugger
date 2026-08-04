@@ -42,6 +42,10 @@ READER_BIN="$HINDSIGHT_DIR/reader/build/install/reader/bin/reader"
 INCLUDE='com.hedera.node.app.|com.swirlds.state.|org.hiero.consensus.transaction.'
 CALLS_ONLY='org.hiero.consensus.|org.hiero.base.crypto.|org.hiero.base.concurrent.|com.swirlds.component.framework.|com.swirlds.platform.|com.swirlds.virtualmap.|com.swirlds.merkledb.|com.hedera.node.app.hints.|com.hedera.node.app.history.|com.hedera.node.app.tss.'
 EXCLUDE='com.hedera.node.app.metrics.|com.hedera.node.app.blocks.impl.streaming.|com.hedera.node.app.grpc.impl.usage.'
+# Optional branch-resolution scope (FORMAT.md §10/§11 branchOnly): classes here record method
+# brackets + args + locals + fields + BRANCH records but NO LINE records — every condition's
+# outcome at a fraction of full line tracing's size. Empty = feature unused.
+BRANCH_ONLY="${BRANCH_ONLY:-}"
 # PBJ model/state classes (AccountID, Account, TransactionBody, ...) are data, not code —
 # instrumenting them would drown the recording, but their packages must be OPEN to the
 # hooks module or their reflective snapshots silently come out empty (FORMAT.md §10).
@@ -83,6 +87,7 @@ fi
 # (FORMAT.md §7).
 AGENT_OPTS="hooks=$HOOKS_JAR,outDir=$OUT_DIR,include=$INCLUDE,callsOnly=$CALLS_ONLY,exclude=$EXCLUDE,snapshotOpen=$SNAPSHOT_OPEN,snapshotAlways=$SNAPSHOT_ALWAYS,trigger=$TRIGGER,maxString=512,snapshotEvery=256,snapshotDepth=3,maxTotalMB=$MAX_TOTAL_MB,debug=true"
 [[ -n "$SOURCE_COMMIT" ]] && AGENT_OPTS="$AGENT_OPTS,sourceCommit=$SOURCE_COMMIT"
+[[ -n "$BRANCH_ONLY" ]] && AGENT_OPTS="$AGENT_OPTS,branchOnly=$BRANCH_ONLY"
 
 echo "==> Writing node0 jvmargs seam file"
 mkdir -p "$TEST_CLIENTS_DIR/build/hindsight"

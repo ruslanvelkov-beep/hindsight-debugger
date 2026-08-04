@@ -110,6 +110,27 @@ final class FlowInstrumentationTest {
     }
 
     @Test
+    void branchScopeRecordsBranchesLocalsAndFieldsButNoLines() throws Exception {
+        // §11 branchOnly: branch-resolution mode — everything FULL records except LINE.
+        final Recorded rec;
+        try (TestBed bed = TestBed.start(tmp, AgentConfig.Scope.BRANCH, FIXTURE)) {
+            bed.invokeStatic(FIXTURE, "recurse", 2);
+            bed.invokeStatic(FIXTURE, "locals");
+            rec = bed.stopAndParse();
+        }
+        assertTrue(rec.ofType(Wire.TYPE_LINE).isEmpty(), "branch scope emits NO LINE records");
+        assertFalse(rec.ofType(Wire.TYPE_BRANCH).isEmpty(), "branches stay recorded");
+        assertFalse(rec.ofType(Wire.TYPE_LOCAL_WRITE).isEmpty(), "local transitions stay recorded");
+        assertFalse(rec.ofType(Wire.TYPE_METHOD_ENTER).isEmpty(), "brackets stay recorded");
+        // The BRANCH sites keep their correct source lines (the line bookkeeping stays live
+        // even though LINE splicing is suppressed).
+        for (final Recorded.Rec b : rec.ofType(Wire.TYPE_BRANCH)) {
+            final Recorded.Site site = rec.sites.get(b.location());
+            assertTrue(site != null && site.line() > 0, "BRANCH site carries its source line");
+        }
+    }
+
+    @Test
     void branchesDisabledEmitsNoBranchRecords() throws Exception {
         final Recorded rec;
         try (TestBed bed = TestBed.startWithConfig(

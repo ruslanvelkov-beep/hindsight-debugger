@@ -140,6 +140,28 @@ class AgentConfigTest {
     }
 
     @Test
+    void branchOnlyScopesByLongestPrefixAndRestrictiveTies() {
+        // §10/§11 branchOnly: between include (FULL) and callsOnly in restrictiveness.
+        final AgentConfig c = AgentConfig.parse(
+                "hooks=h.jar,include=com.app.,branchOnly=com.app.engine.,callsOnly=com.app.engine.gossip.");
+        assertEquals(Scope.FULL, c.scopeFor("com.app.Workflow"));
+        assertEquals(Scope.BRANCH, c.scopeFor("com.app.engine.Round"), "longer branchOnly beats include");
+        assertEquals(Scope.CALLS_ONLY, c.scopeFor("com.app.engine.gossip.Peer"),
+                "longer callsOnly beats branchOnly");
+
+        final AgentConfig tie = AgentConfig.parse("hooks=h.jar,include=com.a.,branchOnly=com.a.");
+        assertEquals(Scope.BRANCH, tie.scopeFor("com.a.X"), "branchOnly wins an equal-length tie with include");
+
+        final AgentConfig callsTie = AgentConfig.parse(
+                "hooks=h.jar,include=com.a.,branchOnly=com.a.,callsOnly=com.a.");
+        assertEquals(Scope.CALLS_ONLY, callsTie.scopeFor("com.a.X"),
+                "callsOnly wins an equal-length tie with branchOnly");
+
+        final AgentConfig excl = AgentConfig.parse("hooks=h.jar,include=x.,branchOnly=com.b.,exclude=com.b.");
+        assertEquals(Scope.NONE, excl.scopeFor("com.b.X"), "exclude wins over branchOnly");
+    }
+
+    @Test
     void hardIgnoresBeatAnyConfiguration() {
         final AgentConfig c = AgentConfig.parse(
                 "hooks=h.jar,include=java.|io.hindsight.|net.bytebuddy.|jdk.|sun.|com.sun.|javax.");
