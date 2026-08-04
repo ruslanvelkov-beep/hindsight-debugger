@@ -161,10 +161,10 @@ final class InstanceBrowseTest {
     // ---- §15.1 simple-name-by-default matching ----
 
     private static final ClassSite VMS =
-            new ClassSite("com.swirlds.state.merkle.VirtualMapStateImpl", 1);
+            new ClassSite("com.example.state.merkle.VirtualMapStateImpl", 1);
     private static final ClassSite VMS_INNER =
-            new ClassSite("com.swirlds.state.merkle.VirtualMapStateImpl$MerkleReadableStates", 1);
-    private static final ClassSite BYTES = new ClassSite("com.hedera.pbj.runtime.io.buffer.Bytes", 2);
+            new ClassSite("com.example.state.merkle.VirtualMapStateImpl$MerkleReadableStates", 1);
+    private static final ClassSite BYTES = new ClassSite("com.example.proto.runtime.io.buffer.Bytes", 2);
     // Simple name "Thing": reachable only through its PACKAGE text "com.bytes", never via "Bytes".
     private static final ClassSite DECOY = new ClassSite("com.bytes.pool.Thing", 1);
     private static final List<ClassSite> V15_SITES = List.of(VMS, VMS_INNER, BYTES, DECOY);
@@ -191,7 +191,7 @@ final class InstanceBrowseTest {
     void isQualifiedAndMatchTarget() {
         assertFalse(InstanceBrowse.isQualified("VirtualMapStateImpl"));
         assertFalse(InstanceBrowse.isQualified(""));
-        assertTrue(InstanceBrowse.isQualified("com.swirlds"));
+        assertTrue(InstanceBrowse.isQualified("com.example.platform"));
         assertTrue(InstanceBrowse.isQualified("VirtualMapStateImpl$"));
         assertEquals("MerkleReadableStates", InstanceBrowse.matchTarget(VMS_INNER, false));
         assertEquals(VMS_INNER.classBinary(), InstanceBrowse.matchTarget(VMS_INNER, true));
@@ -241,7 +241,7 @@ final class InstanceBrowseTest {
     @Test
     void dottedQueryMatchesFullBinaryName() {
         InstanceBrowse.Result res =
-                InstanceBrowse.filter(V15_SITES, v15Instances(), "com.swirlds", InstanceBrowse.CAP);
+                InstanceBrowse.filter(V15_SITES, v15Instances(), "com.example.state", InstanceBrowse.CAP);
         assertEquals(2, res.rows().size());
         assertEquals(VMS.classBinary(), res.rows().get(0).classBinary());
         assertEquals(VMS_INNER.classBinary(), res.rows().get(1).classBinary());
@@ -303,7 +303,7 @@ final class InstanceBrowseTest {
         assertEquals(1, res.totalMatches());
         // A qualified class part composes with the id form the same way.
         InstanceBrowse.Result qualified =
-                InstanceBrowse.filter(V15_SITES, v15Instances(), "com.hedera.*#241", InstanceBrowse.CAP);
+                InstanceBrowse.filter(V15_SITES, v15Instances(), "com.example.*#241", InstanceBrowse.CAP);
         assertEquals(1, qualified.rows().size());
         assertEquals(241, qualified.rows().get(0).objectId());
     }

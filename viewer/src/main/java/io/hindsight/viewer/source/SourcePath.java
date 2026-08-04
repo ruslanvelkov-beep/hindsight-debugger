@@ -300,7 +300,7 @@ public final class SourcePath {
     /**
      * Best-effort owning source-project directory for {@code classBinary}: the path segment
      * immediately preceding {@code src/main/java} or {@code src/test/java} in the resolved file's
-     * path (e.g. {@code hedera-app}), or empty when the class does not resolve or its path carries
+     * path (e.g. {@code example-module}), or empty when the class does not resolve or its path carries
      * no such marker (§11.5/§11.8).
      */
     public Optional<String> module(final String classBinary, final String fileName) {

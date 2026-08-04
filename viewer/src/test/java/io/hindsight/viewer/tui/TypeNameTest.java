@@ -12,12 +12,12 @@ import org.junit.jupiter.api.Test;
 final class TypeNameTest {
 
     private static final LongFunction<String> KNOWN =
-            id -> id == 240 ? "com.hedera.pbj.runtime.io.buffer.Bytes" : null;
+            id -> id == 240 ? "com.example.proto.runtime.io.buffer.Bytes" : null;
 
     @Test
     void refUsesRecordedClassBinaryPlusId() {
         assertEquals(
-                "com.hedera.pbj.runtime.io.buffer.Bytes#240",
+                "com.example.proto.runtime.io.buffer.Bytes#240",
                 TypeName.of(new Value.Ref(240, "Bytes#240"), null, KNOWN));
     }
 

@@ -452,7 +452,7 @@ on the status row, §8, so no detail is lost.)
 - Render one line each: `seq <N> · t<tid> · line <L> · <Class.method> · <module> · <pkg>` where
   `pkg` = the class's package (binary name up to the last dot, or `(default)`), `module` =
   `SourcePath.module(classBinary,fileName)` best-effort (the owning source-project dir, e.g.
-  `hedera-app`) or `?` when the source is unresolved. Lines horizontally scrollable (§11.4).
+  `example-module`) or `?` when the source is unresolved. Lines horizontally scrollable (§11.4).
 - Navigate: Up/Down select; Enter = `engine.seek(entry.tid, entry.index)` to jump the cursor
   back to that record (this does NOT append a new entry). Selection defaults to the newest.
 
@@ -710,7 +710,7 @@ The status row's position part becomes focus-sensitive:
 - Source Code focused (or any other window not listed below): unchanged — the compact
   record info (`seq · t · site`).
 - Locals focused: the FULL type of the selected row's value, e.g.
-  `com.hedera.pbj.runtime.io.buffer.Bytes#240` for refs (runtime class binary name via
+  `com.example.proto.runtime.io.buffer.Bytes#240` for refs (runtime class binary name via
   the recording's first-seen class, `?#id` when unknown), `java.lang.String` for
   strings, the primitive tag name (`int`, `boolean`, ...) for inline values, `null` /
   `void` / `<absent>` otherwise. Unrecorded-frame placeholder rows show nothing special.
@@ -1369,7 +1369,7 @@ The field prompt is `[ Search ↓: <query> ]` / `[ Search ↑: <query> ]` — on
 `Search` and the direction arrow.
 
 ### 22.7 Timestamp always preserved (recorder/script)
-The recording script adds `com.hedera.hapi.node.base.Timestamp` to `snapshotAlways` so
+The recording script adds `com.example.model.node.base.Timestamp` to `snapshotAlways` so
 Timestamp instances are baseline-dumped at any depth (their `seconds`/`nanos` never come
 out `<No info available>`). Needs a fresh recording.
 
@@ -1517,7 +1517,7 @@ viewer then read it back for free):
 - Trees start at the PROJECT roots: every source root under a `--repo` dir is shown from
   that dir — one top-level tree per repo (named by its absolute path), with every
   directory between the repo root and the package roots visible as ordinary expandable
-  levels, source roots sharing a prefix merged (`hedera-node/…/src/main/java/com/…`).
+  levels, source roots sharing a prefix merged (`app-modules/…/src/main/java/com/…`).
   A source root under no repo keeps its own top-level tree (old shape). FLAT-filter rows
   show the path relative to the top-level tree, so the whole project-relative path is
   visible (and horizontally scrollable).

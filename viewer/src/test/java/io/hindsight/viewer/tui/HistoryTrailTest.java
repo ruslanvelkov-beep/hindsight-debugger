@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 final class HistoryTrailTest {
 
     private static HistoryEntry entry(final int tid, final long index, final long seq) {
-        return new HistoryEntry(tid, index, seq, (int) seq, "com.foo.Bar", "run", "hedera-app", "com.foo");
+        return new HistoryEntry(tid, index, seq, (int) seq, "com.foo.Bar", "run", "example-module", "com.foo");
     }
 
     @Test
@@ -51,10 +51,10 @@ final class HistoryTrailTest {
 
     @Test
     void rendersWithMiddleDotAndSimpleClass() {
-        HistoryEntry e = new HistoryEntry(3, 42, 777, 88, "com.hedera.node.app.Ingest", "submit",
-                "hedera-app", "com.hedera.node.app");
+        HistoryEntry e = new HistoryEntry(3, 42, 777, 88, "com.example.app.Ingest", "submit",
+                "example-module", "com.example.app");
         assertEquals(
-                "seq 777 · t3 · line 88 · Ingest.submit · hedera-app · com.hedera.node.app",
+                "seq 777 · t3 · line 88 · Ingest.submit · example-module · com.example.app",
                 HistoryTrail.render(e));
     }
 

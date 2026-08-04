@@ -12,7 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Opens the packages of §10 {@code snapshotOpen}-matched classes to the hooks module WITHOUT
  * instrumenting them. The §7 snapshot dumps read fields reflectively from the
- * bootstrap-unnamed hooks module; data/model classes (PBJ records and the like) are
+ * bootstrap-unnamed hooks module; data/model classes (generated data records and the like) are
  * deliberately kept out of the instrumentation scope — bracketing them would drown the
  * recording in noise — yet their contents are exactly the account IDs and state entities a
  * recording is inspected for. Without an open, {@code trySetAccessible} fails for every
@@ -63,7 +63,7 @@ final class SnapshotOpenTransformer implements ClassFileTransformer {
      * ({@code (pkg + ".").startsWith(prefix)} — so {@code java.time.} covers both
      * {@code java.time} itself and {@code java.time.format}), or the prefix names a class or
      * subpackage inside it ({@code prefix.startsWith(pkg + ".")} — so a class prefix like
-     * {@code com.hedera.pbj.runtime.OneOf} covers {@code com.hedera.pbj.runtime}).
+     * {@code com.example.proto.runtime.OneOf} covers {@code com.example.proto.runtime}).
      */
     static boolean packageMatches(List<String> prefixes, String pkg) {
         final String pkgDot = pkg + ".";

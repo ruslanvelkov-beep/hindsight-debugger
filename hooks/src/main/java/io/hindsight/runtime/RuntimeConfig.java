@@ -47,7 +47,7 @@ public final class RuntimeConfig {
     /**
      * Class binary-name prefixes always baseline-dumped at first sight regardless of
      * {@link #snapshotDepth} (§7 always-dump rules) — for small value-carrier classes (like
-     * PBJ's {@code OneOf}) that appear arbitrarily deep in object graphs but whose contents
+     * the generated-data {@code OneOf}) that appear arbitrarily deep in object graphs but whose contents
      * are the whole point of inspecting them. The {@code java.base} single-value wrappers
      * (Atomic*, StringBuilder/StringBuffer) are always-dumped unconditionally and need no
      * entry here.

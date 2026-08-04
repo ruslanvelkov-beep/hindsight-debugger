@@ -29,23 +29,23 @@ class SnapshotOpenTransformerTest {
     @Test
     void classNamePrefixCoversItsOwnPackage() {
         assertTrue(SnapshotOpenTransformer.packageMatches(
-                        List.of("com.hedera.pbj.runtime.OneOf"), "com.hedera.pbj.runtime"),
+                        List.of("com.example.proto.runtime.OneOf"), "com.example.proto.runtime"),
                 "a class prefix covers the package the class lives in");
     }
 
     @Test
     void broadPrefixCoversNestedPackages() {
-        assertTrue(SnapshotOpenTransformer.packageMatches(List.of("com.swirlds."), "com.swirlds.state.merkle"));
+        assertTrue(SnapshotOpenTransformer.packageMatches(List.of("com.example."), "com.example.state.merkle"));
     }
 
     @Test
     void unrelatedPackagesStayOut() {
-        final List<String> prefixes = List.of("java.time.", "com.hedera.pbj.runtime.OneOf", "com.swirlds.");
+        final List<String> prefixes = List.of("java.time.", "com.example.proto.runtime.OneOf", "com.example.platform.");
         assertFalse(SnapshotOpenTransformer.packageMatches(prefixes, "java.util"));
         assertFalse(SnapshotOpenTransformer.packageMatches(prefixes, "java.timezone"),
                 "a sibling package sharing a name prefix is NOT covered");
-        assertFalse(SnapshotOpenTransformer.packageMatches(prefixes, "com.hedera.hapi.node"));
-        assertFalse(SnapshotOpenTransformer.packageMatches(prefixes, "com.swirldsx"));
+        assertFalse(SnapshotOpenTransformer.packageMatches(prefixes, "com.example.model.node"));
+        assertFalse(SnapshotOpenTransformer.packageMatches(prefixes, "com.example.platformx"));
         assertFalse(SnapshotOpenTransformer.packageMatches(List.of(), "java.time"),
                 "an empty prefix list matches nothing");
     }

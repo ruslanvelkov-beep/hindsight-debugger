@@ -37,7 +37,7 @@ import org.objectweb.asm.tree.VarInsnNode;
  * stores and {@code FieldWriteHook} calls (with old-value capture) before field writes.
  *
  * <p>Everything about this pass is shaped by one constraint: the classes it instruments
- * belong to a production consensus node whose classfiles (v69) carry precomputed stack-map
+ * belong to a production application whose classfiles (v69) carry precomputed stack-map
  * frames, and recomputing frames at transform time ({@code COMPUTE_FRAMES}) would trigger
  * class loading inside the transformer — the classic agent deadlock. So:
  *

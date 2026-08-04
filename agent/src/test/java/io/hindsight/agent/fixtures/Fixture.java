@@ -58,7 +58,7 @@ public final class Fixture {
      * offset, with the line marker sitting directly on the {@code NEW}. Splicing a LINE
      * hook between the {@code NEW}'s label and the {@code NEW} re-points those frame
      * entries and the class fails to DEFINE ("bad offset for Uninitialized") — the exact
-     * shape that killed {@code Hedera.initializeDagger} on the consensus node.
+     * shape that killed a real application's dependency-injection bootstrap at class-define time.
      */
     public static String conditionalCtorArg(boolean flag) {
         return new StringBuilder(flag ? "yes" : "no").toString();

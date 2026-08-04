@@ -198,7 +198,7 @@ UTF-8 text, one record per line: `id<TAB>kind<TAB>text`. Text has `\` → `\\`, 
 `\t`, newline → `\n` escaped. Writers flush eagerly (a crashed run must still parse).
 
 - `symbols.tsv` (agent-side, ids dense from 1): kinds `CLASS` (binary name, e.g.
-  `com.hedera.node.app.workflows.ingest.IngestWorkflow`), `METHOD` (bare name), `FIELD`
+  `com.example.app.workflows.ingest.IngestWorkflow`), `METHOD` (bare name), `FIELD`
   (bare name), `VAR` (bare name), `FILE` (source file name).
 - `rt-symbols.tsv` (runtime-side, ids = `0x4000_0000 | n`, n dense from 1): kinds
   `THREAD`, `RTCLASS` (runtime class binary name), `FIELDNAME`, and (schema 4)
@@ -240,7 +240,7 @@ LineNumberTable.
 Known v1 limitation: sites (and CLASS symbols) are keyed by binary name with no
 classloader dimension — two same-named classes in different loaders share one site id
 and the first loader's file/line info. Acceptable for single-boot-layer JPMS targets
-like the consensus node; revisit if plugin-style loaders enter scope.
+like a typical modular application; revisit if plugin-style loaders enter scope.
 
 ## 6. Object identity
 
@@ -396,7 +396,7 @@ list-valued keys use `|` between elements. Keys:
 | `branchOnly` | empty | prefixes → brackets + args + locals + fields + BRANCH records, **no LINE records** — branch-resolution mode (§11) |
 | `callsOnly` | empty | prefixes → brackets + args only (no locals/fields) |
 | `exclude` | empty | prefixes excluded entirely; wins over include/callsOnly |
-| `snapshotOpen` | empty | prefixes whose packages are opened to the hooks module for reflective §7 snapshots WITHOUT instrumentation — for data/model classes (e.g. PBJ records, `java.time`) outside the instrumentation scope whose contents dumps must read. Recorder ≥ v1.5: matching packages of every boot-layer module (incl. `java.base`) are opened EAGERLY at premain — classes there may load before any transform event — and later-defined modules keep being handled lazily on class load |
+| `snapshotOpen` | empty | prefixes whose packages are opened to the hooks module for reflective §7 snapshots WITHOUT instrumentation — for data/model classes (e.g. generated data records, `java.time`) outside the instrumentation scope whose contents dumps must read. Recorder ≥ v1.5: matching packages of every boot-layer module (incl. `java.base`) are opened EAGERLY at premain — classes there may load before any transform event — and later-defined modules keep being handled lazily on class load |
 | `autostart` | `true` | start recording at premain |
 | `trigger` | none | `binary.class.Name#methodName` — first entry starts recording (implies `autostart=false` unless given) |
 | `maxString` | `512` | max recorded string length (chars) |

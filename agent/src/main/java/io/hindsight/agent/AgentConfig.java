@@ -96,15 +96,15 @@ public final class AgentConfig {
     /**
      * Binary-name prefixes whose packages are OPENED to the hooks module for reflective
      * snapshots without being instrumented (§10 {@code snapshotOpen}) — data/model classes
-     * (PBJ records and the like) that are deliberately outside the instrumentation scope but
+     * (generated data records and the like) that are deliberately outside the instrumentation scope but
      * whose field contents the §7 dumps must be able to read.
      */
     public final List<String> snapshotOpen;
 
     /**
      * Binary-name prefixes always baseline-dumped at first sight regardless of
-     * {@code snapshotDepth} (§7/§10 {@code snapshotAlways}) — small value carriers (PBJ's
-     * {@code OneOf}) that appear arbitrarily deep in object graphs.
+     * {@code snapshotDepth} (§7/§10 {@code snapshotAlways}) — small value carriers (a
+     * generated-data {@code OneOf}, say) that appear arbitrarily deep in object graphs.
      */
     public final List<String> snapshotAlways;
 

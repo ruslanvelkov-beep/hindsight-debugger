@@ -24,7 +24,7 @@ import java.util.regex.PatternSyntaxException;
  *
  * <p>§24.6: when project roots ({@code --repo} dirs) are supplied, every source root under
  * one is shown from THAT root — the tree includes each directory between the project root
- * and the package roots ({@code hedera-node/…/src/main/java/com/…}), source roots sharing a
+ * and the package roots ({@code app-modules/…/src/main/java/com/…}), source roots sharing a
  * prefix merged into one subtree; a source root under no base keeps its own top-level tree.
  * Each entry also carries a {@code covered} flag — whether the recording touched the file
  * (FORMAT.md §12.1 keys, resolved against each file's path relative to its owning SOURCE

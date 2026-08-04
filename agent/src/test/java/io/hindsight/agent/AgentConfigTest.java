@@ -17,22 +17,22 @@ class AgentConfigTest {
     @Test
     void parsesFullGrammar() {
         final AgentConfig c = AgentConfig.parse(
-                "hooks=/tmp/hooks.jar,outDir=/tmp/rec,include=com.hedera.|com.swirlds.merkle.,"
-                        + "callsOnly=com.swirlds.,exclude=com.hedera.internal.,"
-                        + "snapshotOpen=com.hedera.hapi.|com.hedera.pbj.,"
-                        + "snapshotAlways=com.hedera.pbj.runtime.OneOf,autostart=false,"
-                        + "trigger=com.hedera.node.App#main,maxString=64,snapshotEvery=0,snapshotDepth=3,"
+                "hooks=/tmp/hooks.jar,outDir=/tmp/rec,include=com.example.|com.example.merkle.,"
+                        + "callsOnly=com.example.platform.,exclude=com.example.internal.,"
+                        + "snapshotOpen=com.example.model.|com.example.proto.,"
+                        + "snapshotAlways=com.example.proto.runtime.OneOf,autostart=false,"
+                        + "trigger=com.example.node.App#main,maxString=64,snapshotEvery=0,snapshotDepth=3,"
                         + "stackEvery=256,recordBufKB=8,blobBufKB=4,maxTotalMB=100,debug=true,"
                         + "sourceCommit=216551e1f8da95d50548c9a1448f367eb00697b2");
         assertEquals("/tmp/hooks.jar", c.hooksJar);
         assertEquals("/tmp/rec", c.outDir);
-        assertEquals(List.of("com.hedera.", "com.swirlds.merkle."), c.include);
-        assertEquals(List.of("com.swirlds."), c.callsOnly);
-        assertEquals(List.of("com.hedera.internal."), c.exclude);
-        assertEquals(List.of("com.hedera.hapi.", "com.hedera.pbj."), c.snapshotOpen);
-        assertEquals(List.of("com.hedera.pbj.runtime.OneOf"), c.snapshotAlways);
+        assertEquals(List.of("com.example.", "com.example.merkle."), c.include);
+        assertEquals(List.of("com.example.platform."), c.callsOnly);
+        assertEquals(List.of("com.example.internal."), c.exclude);
+        assertEquals(List.of("com.example.model.", "com.example.proto."), c.snapshotOpen);
+        assertEquals(List.of("com.example.proto.runtime.OneOf"), c.snapshotAlways);
         assertFalse(c.autostart);
-        assertEquals("com.hedera.node.App", c.triggerClass);
+        assertEquals("com.example.node.App", c.triggerClass);
         assertEquals("main", c.triggerMethod);
         assertEquals(64, c.maxString);
         assertEquals(0, c.snapshotEvery);
@@ -77,11 +77,11 @@ class AgentConfigTest {
 
     @Test
     void snapshotOpenPrefixMatchingIsPlainStartsWith() {
-        final List<String> prefixes = List.of("com.hedera.hapi.", "com.hedera.pbj.");
-        assertTrue(SnapshotOpenTransformer.matches(prefixes, "com.hedera.hapi.node.base.AccountID"));
-        assertTrue(SnapshotOpenTransformer.matches(prefixes, "com.hedera.pbj.runtime.OneOf"));
-        assertFalse(SnapshotOpenTransformer.matches(prefixes, "com.hedera.node.app.workflows.IngestWorkflow"));
-        assertFalse(SnapshotOpenTransformer.matches(List.of(), "com.hedera.hapi.node.base.AccountID"));
+        final List<String> prefixes = List.of("com.example.model.", "com.example.proto.");
+        assertTrue(SnapshotOpenTransformer.matches(prefixes, "com.example.model.node.base.AccountID"));
+        assertTrue(SnapshotOpenTransformer.matches(prefixes, "com.example.proto.runtime.OneOf"));
+        assertFalse(SnapshotOpenTransformer.matches(prefixes, "com.example.app.workflows.IngestWorkflow"));
+        assertFalse(SnapshotOpenTransformer.matches(List.of(), "com.example.model.node.base.AccountID"));
     }
 
     @Test
@@ -121,12 +121,12 @@ class AgentConfigTest {
     @Test
     void longestPrefixWinsAcrossTheThreeLists() {
         final AgentConfig c = AgentConfig.parse(
-                "hooks=h.jar,include=com.hedera.|com.swirlds.merkle.,callsOnly=com.swirlds.,"
-                        + "exclude=com.hedera.internal.");
-        assertEquals(Scope.FULL, c.scopeFor("com.hedera.node.app.Workflow"));
-        assertEquals(Scope.NONE, c.scopeFor("com.hedera.internal.Secret"), "longer exclude beats include");
-        assertEquals(Scope.CALLS_ONLY, c.scopeFor("com.swirlds.platform.Gossip"));
-        assertEquals(Scope.FULL, c.scopeFor("com.swirlds.merkle.MerkleNode"), "longer include beats callsOnly");
+                "hooks=h.jar,include=com.example.|com.example.merkle.,callsOnly=com.example.platform.,"
+                        + "exclude=com.example.internal.");
+        assertEquals(Scope.FULL, c.scopeFor("com.example.app.Workflow"));
+        assertEquals(Scope.NONE, c.scopeFor("com.example.internal.Secret"), "longer exclude beats include");
+        assertEquals(Scope.CALLS_ONLY, c.scopeFor("com.example.platform.Gossip"));
+        assertEquals(Scope.FULL, c.scopeFor("com.example.merkle.MerkleNode"), "longer include beats callsOnly");
         assertEquals(Scope.NONE, c.scopeFor("org.example.Other"), "no match means untouched");
     }
 

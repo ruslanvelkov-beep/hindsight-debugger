@@ -102,7 +102,7 @@ final class ChunkWriter implements Runnable {
      *
      * <p>Two hard-won properties: (1) a caller's <em>pending interrupt</em> must not discard
      * recorded data — {@code ArrayBlockingQueue.offer} throws immediately when the interrupt
-     * flag is already set (Hedera threads carry it routinely), so the wait is uninterruptible
+     * flag is already set (application threads carry it routinely), so the wait is uninterruptible
      * with the flag restored on exit; (2) a dropped chunk permanently corrupts the thread's
      * stream (offsets already assume the bytes exist), so on a real timeout the whole
      * recording is stopped loudly (TRUNCATED marker) instead of silently continuing.

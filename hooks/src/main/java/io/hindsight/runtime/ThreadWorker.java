@@ -644,7 +644,7 @@ public final class ThreadWorker {
      * {@code java.base} wrappers and the {@link #isUnfoldedContainer unfolded containers}
      * ({@code java.base} maps/collections and all arrays — recorder ≥ v1.7 always-dump
      * containers, §7) unconditionally, plus any class matching a configured
-     * {@code snapshotAlways} prefix (small value carriers like PBJ's {@code OneOf} that appear
+     * {@code snapshotAlways} prefix (small value carriers like the generated-data {@code OneOf} that appear
      * arbitrarily deep). Container contents drift inside uninstrumented {@code java.base}
      * code, so a container first sighted beyond {@code snapshotDepth} would otherwise never
      * be inspectable at all; its dump is the usual bounded unfolding (64-entry cap). Called

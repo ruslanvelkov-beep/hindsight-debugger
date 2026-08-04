@@ -23,3 +23,6 @@ Thumbs.db
 # Logs / agent diagnostics
 *.log
 hs_err_pid*.log
+
+# Author-private recording recipe against a specific target project (not part of the public tool)
+scripts/record-crypto-transfer.sh
