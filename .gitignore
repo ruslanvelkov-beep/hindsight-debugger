@@ -26,3 +26,6 @@ hs_err_pid*.log
 
 # Author-private recording recipe against a specific target project (not part of the public tool)
 scripts/record-crypto-transfer.sh
+
+# Personal Notion quickstart draft (not part of the public tool)
+NOTION-hindsight.md
