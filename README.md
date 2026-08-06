@@ -83,9 +83,12 @@ viewer --dir <rec> --repo . --seq 481207   # open on record (seq) 481207
 ```
 
 - **Step through time** — step into / over (`F7` / `F8`) and **reverse** step into /
-  over (`Shift+F7` / `Shift+F8`); run to the current line forward (`Ctrl+R`) or
-  backward (`Alt+R`); `o` snaps back to the executing line. (At a call, `F7` stops on
-  the call line first; press again to enter.)
+  over (`Shift+F7` / `Shift+F8`); `o` snaps back to the executing line. (At a call,
+  `F7` stops on the call line first; press again to enter.)
+- **Run to a line** — reach the next / previous time execution hits the **selected**
+  source line: `Ctrl+R` (forward) / `Ctrl+Q` (backward) stay in the current thread
+  (bound per-thread), while `Ctrl+T` (forward) / `Ctrl+W` (backward) do the same
+  across **any** thread, in global record order.
 - **Visit an exact record** — launch with `--seq N` (or `--last`), or focus the Records
   window (`r`) and press `j` to jump to any record number.
 - **Follow method calls** — `/` browses every method the run entered (regex) and jumps
