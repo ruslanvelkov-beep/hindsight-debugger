@@ -475,7 +475,7 @@ public final class ViewerApp {
             final Path recordingDir,
             final OptionalInt initialTid) {
         this(screen, engine, recording, sourcePath, recordingDir, initialTid,
-                LineIndex.openOrBuildUnchecked(recording), OptionalLong.empty(), false);
+                LineIndex.openOrBuildUnchecked(recording), OptionalLong.empty(), false, List.of());
     }
 
     /**
@@ -486,7 +486,9 @@ public final class ViewerApp {
      * on the recording's LAST line-traced record; by default the viewer opens on the FIRST
      * line-traced record of the initial thread ({@code --tid}, else thread 1) so the Source
      * window shows a project file immediately — falling back to the engine's default position
-     * when the thread has no line records.
+     * when the thread has no line records. A non-empty {@code initialSeqs} ({@code --seqs},
+     * §29.1) instead pre-fills the Records trail with those records, lands on the first and
+     * opens focused on the Records window.
      */
     public ViewerApp(
             final Screen screen,
@@ -497,7 +499,8 @@ public final class ViewerApp {
             final OptionalInt initialTid,
             final LineIndex lineIndex,
             final OptionalLong initialSeq,
-            final boolean startAtLast) {
+            final boolean startAtLast,
+            final List<Long> initialSeqs) {
         this.screen = screen;
         this.engine = engine;
         this.recording = recording;
@@ -518,10 +521,15 @@ public final class ViewerApp {
             }
         }
         openAtInitialPosition(initialTid.isPresent() && tidOk, initialSeq, startAtLast);
+        if (!initialSeqs.isEmpty()) {
+            seedRecordsFromSeqs(initialSeqs); // §29.1: lands on the first one and focuses Records
+        }
         threadSel = Math.max(0, tids.indexOf(engine.currentTid()));
         stackSel = 0;
         lastShownTid = engine.currentTid(); // §16.2: seed so the first in-thread step never collapses
-        appendHistory(); // seed the trail with the initial landing so Records is never empty (§11.5)
+        if (history.isEmpty()) {
+            appendHistory(); // seed the trail with the initial landing so Records is never empty (§11.5)
+        }
     }
 
     /** §26.7: position the engine on the requested opening record (see the constructor javadoc). */
@@ -584,6 +592,40 @@ public final class ViewerApp {
                         + ": seq " + engine.currentSeq();
             }
         }
+    }
+
+    /**
+     * §29.1 {@code --seqs}: pre-populate the Records trail with the given record numbers, in the
+     * order given, each landed by the {@code --seq} rule (§26.7/§17.2: the nearest exec record
+     * at/before the seq — real recordings have seq holes). Consecutive duplicates collapse (§11.5).
+     * Then land on the FIRST entry, select it and focus the Records window, so the user starts on
+     * the first of their chosen moments and walks the list with ↑/↓ (§29.2). A seq preceding the
+     * whole recording is skipped and counted in the status line; if none resolves the trail is left
+     * empty for the normal §11.5 seed and the flag is reported as ineffective.
+     */
+    private void seedRecordsFromSeqs(final List<Long> seqs) {
+        int skipped = 0;
+        for (long seq : seqs) {
+            SeqLocation loc = engine.findSeqAtOrBefore(seq);
+            if (!loc.found()) {
+                skipped++;
+                continue;
+            }
+            landOnNearestExecAtOrBefore(loc.tid(), loc.index());
+            history.add(currentEntry());
+        }
+        if (history.isEmpty()) {
+            status = "--seqs: none of the " + seqs.size()
+                    + " record(s) exist — opened at the default position";
+            return;
+        }
+        HistoryTrail.HistoryEntry first = history.entries().get(0);
+        engine.seek(first.tid(), first.index());
+        recordsSel = 0;
+        focus = Win.RECORDS;
+        status = "Records pre-filled with " + history.size() + " of " + seqs.size() + " record(s)"
+                + (skipped > 0 ? " (" + skipped + " not found)" : "")
+                + " — on the first; ↑/↓ jump";
     }
 
     /**
@@ -2041,6 +2083,7 @@ public final class ViewerApp {
             "Ctrl+D                show the recording directory's full path",
             "c t s l r             focus Source/Threads/Stack/Locals/Records",
             "r (in Records)        jump to a record by seq  (l fills the last)",
+            "↑/↓ (in Records)      select = jump there (no Enter needed)",
             "+/= -/_ (in Records)  next / prev record with line info or",
             "                      method enter/exit — ANY thread (unlike F7)",
             "Tab / Shift+Tab       cycle focus forward / backward",
@@ -2890,6 +2933,7 @@ public final class ViewerApp {
             doStep(engine.toExecAnyThread(false));
             return;
         }
+        int before = recordsSel;
         if (t == KeyType.ArrowLeft) {
             recordsHcol = Math.max(0, recordsHcol - HSTEP);
         } else if (t == KeyType.ArrowRight) {
@@ -2906,15 +2950,35 @@ public final class ViewerApp {
             recordsSel = 0;
         } else if (t == KeyType.End || (ch != null && ch == 'G')) {
             recordsSel = last;
-        } else if (t == KeyType.Enter && recordsSel >= 0 && recordsSel < entries.size()) {
-            HistoryTrail.HistoryEntry e = entries.get(recordsSel);
-            int keep = recordsSel;
-            StepResult r = engine.seek(e.tid(), e.index());
-            status = r.message();
-            if (r.moved()) {
-                afterMove();          // selecting from the list does NOT append (§11.5)
-                recordsSel = clamp(keep, 0, Math.max(0, history.size() - 1));
-            }
+        } else if (t == KeyType.Enter) {
+            seekToSelectedRecord(); // §29.2: still accepted, though the selection already jumped
+            return;
+        }
+        if (recordsSel != before) {
+            seekToSelectedRecord(); // §29.2: selecting a record IS the jump — no Enter needed
+        }
+    }
+
+    /**
+     * §29.2: move the execution cursor to the selected Records entry — formerly the Enter action
+     * of §11.5, now performed on every selection change (and still on Enter). Selecting from the
+     * list does NOT append a history entry (§11.5) and the selection survives the seek. A move
+     * repaints every window: the §28.3 one-window partial redraw is only right for a pure scroll
+     * that left the selection where it was.
+     */
+    private void seekToSelectedRecord() {
+        List<HistoryTrail.HistoryEntry> entries = history.entries();
+        if (recordsSel < 0 || recordsSel >= entries.size()) {
+            return;
+        }
+        HistoryTrail.HistoryEntry e = entries.get(recordsSel);
+        int keep = recordsSel;
+        StepResult r = engine.seek(e.tid(), e.index());
+        status = r.message();
+        if (r.moved()) {
+            afterMove();
+            recordsSel = clamp(keep, 0, Math.max(0, history.size() - 1));
+            partialWin = null; // the cursor moved — Source/Stack/Locals changed too
         }
     }
 

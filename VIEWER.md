@@ -18,7 +18,7 @@ Module: `io.hindsight.viewer`, depends on `:reader` (parsing + `Recording`/`Rec`
 
 ## 1. CLI
 
-`viewer --dir <recordingDir> [--source <root1:root2:...>]... [--repo <dir>]... [--tid N] [--seq N | --last]`
+`viewer --dir <recordingDir> [--source <root1:root2:...>]... [--repo <dir>]... [--tid N] [--seq N | --last | --seqs N,N,...]`
 
 - `--dir` (required): a recording directory (`Recording.open`).
 - `--source`: colon-separated source roots (each a directory that is the package root, i.e.
@@ -29,6 +29,8 @@ Module: `io.hindsight.viewer`, depends on `:reader` (parsing + `Recording`/`Rec`
   §26.7 then lands on the first line-traced record of the chosen thread — an accepted
   `--tid`, else thread 1 — when it has line records).
 - `--seq` / `--last`: the opening record (§26.7). Mutually exclusive.
+- `--seqs N,N,...`: pre-populate the Records window with exactly those records and open FOCUSED
+  on it, positioned on the first (§29.1). Mutually exclusive with `--seq`/`--last`.
 - Missing source roots are non-fatal — the Source window shows a placeholder (§7.1).
 - On a terminal smaller than 80×24, the UI shows a "terminal too small (need ≥80×24)"
   message and waits for resize or `q`.
@@ -1767,3 +1769,31 @@ F7 re-enters), and a reverse step that would land ON an ENTER lands at the call 
 it instead — one logical step, one history entry. Any actual move disarms the stop. F8/⇧F8
 keep their classic frame-sticky behaviour, and the engine peek (`peekExec`) never moves the
 cursor, so no additional records are needed.
+
+## 29. v2.9 additions & changes
+
+### 29.1 Pre-populated Records — `--seqs N,N,...`
+`viewer --dir <rec> --seqs 9986854,10373437,10414976` opens with the Records window
+pre-filled with exactly those records, in the order given, and FOCUSED, with the FIRST entry
+selected and the execution cursor landed on it — so a curated list of "moments" (e.g. the
+key points of one transaction's lifecycle, as produced by the reader) can be walked from the
+top with ↑/↓ (§29.2). Each seq is resolved like `--seq` (§26.7: the nearest exec record
+at/before it, so seq holes are tolerated); a seq preceding the whole recording is skipped
+and counted in the status line (`Records pre-filled with N of M record(s) (K not found) —
+on the first; ↑/↓ jump`). Consecutive duplicates collapse per §11.5. The §11.5 default seed
+(the opening position) is NOT added — the trail is the user's list. If no seq resolves, the
+status reads `--seqs: none of the M record(s) exist — opened at the default position` and
+the viewer opens as if the flag were absent. `--seqs` is repeatable (values accumulate) and
+mutually exclusive with `--seq` and `--last`; blank items (a stray or trailing comma) are
+ignored; a non-integer item is a usage error. Parsing: `CliArgs.parseSeqList`.
+
+### 29.2 Records: selecting a record IS the jump (no Enter)
+In the Records window every selection change made with the navigation keys — ↑/↓,
+PgUp/PgDn (^B/^F), Home/End (g/G) — immediately moves the execution cursor to the selected
+entry (`engine.seek(entry.tid, entry.index)` + `afterMove`), exactly what Enter did in
+§11.5. Enter is still accepted (a harmless re-seek). As before, selecting from the list never
+appends a history entry (§11.5) and the selection is preserved across the seek. Because the
+cursor moved, the whole screen repaints — the §28.3 one-window partial redraw applies only
+to a pure scroll that left the selection unchanged. The §26.8 find-in-window landing still
+only moves the selection (incremental typing must not drag the cursor around); Enter — or
+any ↑/↓ — then jumps. This applies to the trail in general, not only to a `--seqs` list.

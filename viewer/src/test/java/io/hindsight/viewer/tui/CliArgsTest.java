@@ -44,6 +44,7 @@ final class CliArgsTest {
         assertTrue(a.tid().isEmpty());
         assertTrue(a.seq().isEmpty());
         assertTrue(!a.last());
+        assertTrue(a.seqs().isEmpty());
     }
 
     // ---- §26.7 opening-record flags ----
@@ -98,5 +99,44 @@ final class CliArgsTest {
         CliArgs.CliException e = assertThrows(CliArgs.CliException.class,
                 () -> CliArgs.parse(new String[] {"--dir"}));
         assertTrue(e.getMessage().contains("--dir"));
+    }
+
+    // ---- §29.1 pre-populated Records (--seqs) ----
+
+    @Test
+    void seqsParseInOrderAndAccumulate() {
+        CliArgs a = CliArgs.parse(new String[] {"--dir", "/rec", "--seqs", "40,12, 981", "--seqs", "7"});
+        assertEquals(List.of(40L, 12L, 981L, 7L), a.seqs());
+        assertTrue(a.seq().isEmpty());
+        assertTrue(!a.last());
+    }
+
+    @Test
+    void seqsSkipBlankItems() {
+        assertEquals(List.of(3L, 4L), CliArgs.parseSeqList("3,,4,"));
+    }
+
+    @Test
+    void seqsWithNoNumbersFails() {
+        CliArgs.CliException e = assertThrows(CliArgs.CliException.class, () -> CliArgs.parseSeqList(","));
+        assertTrue(e.getMessage().contains("--seqs"));
+    }
+
+    @Test
+    void nonIntegerSeqsFails() {
+        CliArgs.CliException e = assertThrows(CliArgs.CliException.class,
+                () -> CliArgs.parse(new String[] {"--dir", "/rec", "--seqs", "5,abc"}));
+        assertTrue(e.getMessage().contains("--seqs"));
+        assertTrue(e.getMessage().contains("abc"));
+    }
+
+    @Test
+    void seqsExclusiveWithSeqAndLast() {
+        CliArgs.CliException e1 = assertThrows(CliArgs.CliException.class,
+                () -> CliArgs.parse(new String[] {"--dir", "/rec", "--seqs", "5", "--seq", "9"}));
+        assertTrue(e1.getMessage().contains("mutually exclusive"));
+        CliArgs.CliException e2 = assertThrows(CliArgs.CliException.class,
+                () -> CliArgs.parse(new String[] {"--dir", "/rec", "--last", "--seqs", "5"}));
+        assertTrue(e2.getMessage().contains("mutually exclusive"));
     }
 }

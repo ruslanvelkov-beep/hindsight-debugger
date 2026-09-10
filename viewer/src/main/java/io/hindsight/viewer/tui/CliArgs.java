@@ -8,7 +8,7 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 
 /**
- * Parsed command-line arguments for the viewer (VIEWER.md §1, §26.7).
+ * Parsed command-line arguments for the viewer (VIEWER.md §1, §26.7, §29.1).
  *
  * <p>Kept as a small immutable value object with a pure {@link #parse(String[])}
  * factory so the argument grammar can be unit-tested without constructing a
@@ -25,14 +25,22 @@ import java.util.OptionalLong;
  * @param tid the initial thread to focus ({@code --tid}), or empty for the engine default
  * @param seq the record (global seq) to open on ({@code --seq}, §26.7), or empty
  * @param last open on the last line-traced record ({@code --last}, §26.7)
+ * @param seqs records to pre-populate the Records window with ({@code --seqs}, §29.1), in the
+ *     order given; empty when the flag is absent
  */
 public record CliArgs(
-        Path dir, List<Path> sources, List<Path> repos, OptionalInt tid, OptionalLong seq, boolean last) {
+        Path dir,
+        List<Path> sources,
+        List<Path> repos,
+        OptionalInt tid,
+        OptionalLong seq,
+        boolean last,
+        List<Long> seqs) {
 
     /** Usage string printed on a parse error or {@code --help}. */
     public static final String USAGE =
             "usage: viewer --dir <recordingDir> [--source <root1:root2:...>]... "
-                    + "[--repo <dir>]... [--tid N] [--seq N | --last]";
+                    + "[--repo <dir>]... [--tid N] [--seq N | --last | --seqs N,N,...]";
 
     /** Thrown when the argument vector does not conform to §1; message is user-facing. */
     public static final class CliException extends RuntimeException {
@@ -46,8 +54,8 @@ public record CliArgs(
 
     /**
      * Parses an argument vector into a {@link CliArgs}, throwing {@link CliException} with a
-     * user-facing message on any structural violation ({@code --seq} and {@code --last} are
-     * mutually exclusive, §26.7).
+     * user-facing message on any structural violation ({@code --seq}, {@code --last} and
+     * {@code --seqs} are mutually exclusive, §26.7/§29.1).
      *
      * @param argv the raw program arguments
      * @return the parsed arguments
@@ -60,6 +68,7 @@ public record CliArgs(
         OptionalInt tid = OptionalInt.empty();
         OptionalLong seq = OptionalLong.empty();
         boolean last = false;
+        List<Long> seqs = new ArrayList<>();
 
         for (int i = 0; i < argv.length; i++) {
             String a = argv[i];
@@ -90,6 +99,7 @@ public record CliArgs(
                     }
                 }
                 case "--last" -> last = true;
+                case "--seqs" -> seqs.addAll(parseSeqList(value(argv, ++i, a)));
                 default -> throw new CliException("unknown argument: " + a);
             }
         }
@@ -99,7 +109,38 @@ public record CliArgs(
         if (seq.isPresent() && last) {
             throw new CliException("--seq and --last are mutually exclusive");
         }
-        return new CliArgs(dir, List.copyOf(sources), List.copyOf(repos), tid, seq, last);
+        if (!seqs.isEmpty() && (seq.isPresent() || last)) {
+            throw new CliException("--seqs is mutually exclusive with --seq and --last");
+        }
+        return new CliArgs(dir, List.copyOf(sources), List.copyOf(repos), tid, seq, last, List.copyOf(seqs));
+    }
+
+    /**
+     * Parses one {@code --seqs} value — a comma-separated list of record numbers (§29.1). Blank
+     * items (a stray or trailing comma) are skipped; any non-integer item fails the whole parse.
+     *
+     * @param csv the raw flag value, e.g. {@code "12,40,981"}
+     * @return the record numbers in the order given (never empty)
+     * @throws CliException if an item is not an integer or the list holds no numbers at all
+     */
+    public static List<Long> parseSeqList(final String csv) {
+        List<Long> out = new ArrayList<>();
+        for (String item : csv.split(",", -1)) {
+            String s = item.trim();
+            if (s.isEmpty()) {
+                continue;
+            }
+            try {
+                out.add(Long.parseLong(s));
+            } catch (NumberFormatException e) {
+                throw new CliException(
+                        "--seqs must be a comma-separated list of integer record numbers, got: " + s);
+            }
+        }
+        if (out.isEmpty()) {
+            throw new CliException("--seqs needs at least one record number");
+        }
+        return out;
     }
 
     /** Reads the value token at {@code i}, or fails with a message naming the {@code flag}. */

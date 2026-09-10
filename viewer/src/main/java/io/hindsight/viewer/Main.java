@@ -106,7 +106,7 @@ public final class Main {
             // AFTER lanterna's own raw-mode stty so it sticks; restore it in the finally. Best-effort.
             setFlowControl(false);
             new ViewerApp(screen, engine, recording, sourcePath, parsed.dir(), parsed.tid(), lineIndex,
-                    parsed.seq(), parsed.last()).run();
+                    parsed.seq(), parsed.last(), parsed.seqs()).run();
         } catch (IOException e) {
             code = 1;
             System.err.println("viewer: " + e.getMessage());

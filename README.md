@@ -80,6 +80,7 @@ recording, optionally opening straight on a record:
 ```bash
 viewer --dir <rec> --repo .                # open at the start
 viewer --dir <rec> --repo . --seq 481207   # open on record (seq) 481207
+viewer --dir <rec> --repo . --seqs 9986854,10373437,10414976   # Records pre-filled with these, focused on the first
 ```
 
 - **Step through time** — step into / over (`F7` / `F8`) and **reverse** step into /
@@ -90,7 +91,9 @@ viewer --dir <rec> --repo . --seq 481207   # open on record (seq) 481207
   (bound per-thread), while `Ctrl+T` (forward) / `Ctrl+W` (backward) do the same
   across **any** thread, in global record order.
 - **Visit an exact record** — launch with `--seq N` (or `--last`), or focus the Records
-  window (`r`) and press `j` to jump to any record number.
+  window (`r`) and press `r` again to jump to any record number. `--seqs N,N,…` opens
+  focused on a Records list pre-filled with your chosen records, positioned on the first;
+  in the Records window, moving the selection (`↑`/`↓`) jumps there — no Enter needed.
 - **Follow method calls** — `/` browses every method the run entered (regex) and jumps
   to any single invocation; `e` / `E` exit the current frame forward / backward.
 - **Inspect locals & fields** — the Locals window (`l`) shows the live locals and object
