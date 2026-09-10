@@ -35,3 +35,4 @@ scripts/target-harness-seam.patch
 
 # Author-private viewer launcher for a specific target recording (not part of the public tool)
 fungible-token-transfer.sh
+smart-contract-call.sh
