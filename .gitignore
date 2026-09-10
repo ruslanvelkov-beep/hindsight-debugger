@@ -29,3 +29,9 @@ scripts/record-crypto-transfer.sh
 
 # Personal Notion quickstart draft (not part of the public tool)
 NOTION-hindsight.md
+
+# Author-private patch for a specific target project's test runner (not part of the public tool)
+scripts/target-harness-seam.patch
+
+# Author-private viewer launcher for a specific target recording (not part of the public tool)
+fungible-token-transfer.sh
