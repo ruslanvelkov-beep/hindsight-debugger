@@ -198,6 +198,11 @@ public final class HindsightRuntime {
         }
     }
 
+    /** The booted instance, for tests that inspect the worker registry. */
+    static Instance instanceForTests() {
+        return instance;
+    }
+
     // =====================================================================================
     // The booted state
     // =====================================================================================
@@ -303,6 +308,17 @@ public final class HindsightRuntime {
                 workerTL.set(denied);
                 return denied;
             }
+            // An empty ThreadLocal does not mean a new thread: ForkJoinPool.commonPool()
+            // workers erase ALL their ThreadLocals after every top-level task (any pool may
+            // do the same), so the same live Thread comes back here again and again. It must
+            // get its registered worker back — registering a second one would orphan the
+            // first one's partial chunks (never flushed, silently lost) and split one
+            // thread's stream across many tids.
+            final ThreadWorker existing = workers.get(t);
+            if (existing != null) {
+                workerTL.set(existing);
+                return existing;
+            }
             if (workers.size() >= MAX_WORKERS) {
                 logOnce("worker-cap", "worker cap of " + MAX_WORKERS
                         + " threads reached; further threads are not recorded");
@@ -312,7 +328,12 @@ public final class HindsightRuntime {
             }
             final ThreadWorker w = new ThreadWorker(this, nextTid.getAndIncrement(), t.getName(), t.threadId());
             workerTL.set(w);
-            workers.put(t, w);
+            final ThreadWorker displaced = workers.put(t, w);
+            if (displaced != null) {
+                // Unreachable after the lookup above (only the thread itself registers a
+                // worker), but a displaced worker must never take unflushed chunks with it.
+                displaced.stealBuffers();
+            }
             return w;
         }
 
