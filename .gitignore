@@ -36,3 +36,9 @@ scripts/target-harness-seam.patch
 # Author-private viewer launcher for a specific target recording (not part of the public tool)
 fungible-token-transfer.sh
 smart-contract-call.sh
+
+# Per-machine recording defaults for scripts/record-init.gradle
+scripts/record-init.local.properties
+
+# Recordings are large binary artifacts — never in the repo
+recordings/

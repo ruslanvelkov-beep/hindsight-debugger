@@ -56,6 +56,47 @@ Fastest end-to-end demo — record the bundled sample and print how to open it:
 scripts/record-sample.sh
 ```
 
+### Recording a Gradle test run
+
+To record a test of a Gradle-built project without editing it, attach the agent from an init
+script — Gradle takes an absolute `--init-script` path, so one copy serves every checkout and
+worktree of that project:
+
+```bash
+cd <project checkout>
+./gradlew :<module>:test --tests 'SomeTest' \
+    --init-script <hindsight>/scripts/record-init.gradle \
+    -Dhindsight.rec=/tmp/rec-1 -Dhindsight.include=your.package.
+```
+
+`scripts/record-init.gradle` does nothing unless `-Dhindsight.rec` is set, so it can be installed
+permanently (`ln -s <hindsight>/scripts/record-init.gradle ~/.gradle/init.d/`) without affecting
+normal builds. `-Dhindsight.include`, `.open`, `.always`, `.trigger`, `.depth`, `.every` and
+`.stackEvery` map to the agent options; per-machine defaults can go in an untracked
+`scripts/record-init.local.properties`.
+
+**`snapshotOpen` is the setting to get right.** It opens the matching packages to the hooks
+module, and it is what makes object fields readable *at all*: leave it empty and every reflective
+dump fails silently, so the viewer shows `<No info available>` for every object. The init script
+therefore defaults it to your instrumented scope plus `java.time.`. Note it is orthogonal to
+`snapshotAlways`, which only exempts classes from `snapshotDepth` and opens nothing — a value
+carrier such as `java.time.Instant` usually belongs in both.
+
+### Recording the Hiero/Hedera consensus node
+
+That project needs wider scopes than the default (its objects reach across the application
+layer, generated HAPI/PBJ records, the platform, and `java.time`), so `scripts/record-hedera.sh`
+supplies them and runs the Gradle test you name:
+
+```bash
+cd <consensus-node checkout>
+<hindsight>/scripts/record-hedera.sh :hedera-app:test --tests 'DispatchProcessorTest'
+```
+
+It works from any clone or worktree (it records into that checkout's `build/`), and
+`INCLUDE`/`OPEN`/`ALWAYS`/`TRIGGER`/`DEPTH`/`REC_DIR` override its defaults. This profile is
+specific to that project; for anything else use `record-init.gradle` directly, as above.
+
 ## Inspect from the CLI
 
 The `reader` reconstructs a finished recording without re-running anything:

@@ -1,0 +1,114 @@
+// Hindsight recording init script for Gradle test runs.
+//
+// Attaches the Hindsight agent to every Test task's JVM, so you can record a run of any
+// Gradle-built project without editing it. Gradle accepts an ABSOLUTE --init-script path, so
+// one copy of this file serves every checkout/worktree of the project you are recording:
+//
+//   cd <project checkout>
+//   ./gradlew :<module>:test --tests 'SomeTest' \
+//       --init-script <hindsight>/scripts/record-init.gradle \
+//       -Dhindsight.rec=/tmp/rec-1 \
+//       -Dhindsight.include=your.package.
+//
+// It is INERT unless -Dhindsight.rec=<outDir> is set, so it is safe to install permanently:
+//   mkdir -p ~/.gradle/init.d && ln -s <hindsight>/scripts/record-init.gradle ~/.gradle/init.d/
+// (Everything under ~/.gradle/init.d applies to EVERY Gradle build on the machine; because this
+// script does nothing without -Dhindsight.rec, normal builds are unaffected.)
+//
+// Properties (all optional except hindsight.rec):
+//   hindsight.rec         output directory — REQUIRED; absent = do nothing
+//   hindsight.home        the hindsight checkout (default: derived from this script's location,
+//                         else $HINDSIGHT_HOME)
+//   hindsight.include     instrumentation scope prefix        (default: none — the agent records nothing!)
+//   hindsight.open        snapshotOpen prefixes               (default: hindsight.include + java.time.)
+//   hindsight.always      snapshotAlways prefixes             (default: java.time.)
+//   hindsight.trigger     Class#method gating recording start (default: record from premain)
+//   hindsight.depth       snapshotDepth                       (default 3)
+//   hindsight.every       snapshotEvery                       (default 256)
+//   hindsight.stackEvery  stackEvery                          (default 32)
+//   hindsight.extra       raw extra agent options, comma-separated
+//
+// Defaults for any of these may be set per-machine in an optional, untracked
+// scripts/record-init.local.properties (same keys, without the "hindsight." prefix) — the place
+// for project-specific package prefixes you do not want in this repository.
+
+def recDir = System.getProperty('hindsight.rec')
+if (recDir) {
+
+    // ---- locate the hindsight checkout (property > env > this script's own location) ----
+    def home = System.getProperty('hindsight.home') ?: System.getenv('HINDSIGHT_HOME')
+    if (!home) {
+        for (f in gradle.startParameter.allInitScripts) {
+            // canonicalFile resolves a ~/.gradle/init.d symlink back to scripts/record-init.gradle
+            def candidate = f.canonicalFile.parentFile?.parentFile
+            if (candidate && new File(candidate, 'agent/build/libs').isDirectory()) {
+                home = candidate.absolutePath
+                break
+            }
+        }
+    }
+    if (!home) {
+        throw new GradleException('hindsight: cannot locate the hindsight checkout — '
+                + 'pass -Dhindsight.home=<dir> or set $HINDSIGHT_HOME')
+    }
+
+    // ---- optional per-machine defaults (untracked) ----
+    def local = new Properties()
+    def localFile = new File(home, 'scripts/record-init.local.properties')
+    if (localFile.isFile()) {
+        localFile.withInputStream { local.load(it) }
+    }
+    def opt = { String key, String fallback ->
+        System.getProperty("hindsight.${key}") ?: local.getProperty(key) ?: fallback
+    }
+
+    def pick = { String dir, String pattern ->
+        def jars = new File(dir).listFiles()?.findAll { it.name ==~ pattern }?.sort { it.name }
+        if (!jars) {
+            throw new GradleException("hindsight: no jar matching ${pattern} in ${dir} — "
+                    + 'build them with ./gradlew :agent:jar :hooks:jar')
+        }
+        jars[-1].absolutePath
+    }
+    def agentJar = pick("${home}/agent/build/libs", /hindsight-agent.*\.jar/)
+    def hooksJar = pick("${home}/hooks/build/libs", /hooks.*\.jar/)
+
+    def include = opt('include', '')
+    if (!include) {
+        logger.warn('hindsight: WARNING no -Dhindsight.include=<prefix> — nothing will be instrumented')
+    }
+
+    // snapshotOpen decides whether object fields can be READ AT ALL: it opens the matching
+    // packages to the hooks module. Leave it empty and the opener is never registered, every
+    // reflective dump fails silently (FORMAT.md §7), and the viewer shows "<No info available>"
+    // for every object. Defaulting it to the instrumented scope (plus java.time, which carries
+    // timestamps almost every program inspects) makes the common case correct by construction.
+    // NOTE: snapshotOpen is ORTHOGONAL to snapshotAlways — the latter only exempts classes from
+    // snapshotDepth, it does NOT open anything. A value carrier usually wants to be in both.
+    def open = opt('open', (include ? include + '|' : '') + 'java.time.')
+    def always = opt('always', 'java.time.')
+
+    def options = [
+            "hooks=${hooksJar}",
+            "outDir=${recDir}",
+            "snapshotOpen=${open}",
+            "snapshotAlways=${always}",
+            "snapshotDepth=" + opt('depth', '3'),
+            "snapshotEvery=" + opt('every', '256'),
+            "stackEvery=" + opt('stackEvery', '32'),
+    ]
+    if (include) options << "include=${include}"
+    def trigger = opt('trigger', '')
+    if (trigger) options << "trigger=${trigger}"
+    def extra = opt('extra', '')
+
+    def agentArg = "-javaagent:${agentJar}=" + options.join(',') + (extra ? ",${extra}" : '')
+    logger.lifecycle("hindsight: recording -> ${recDir}")
+    logger.lifecycle("hindsight: include=${include ?: '(none)'}  snapshotOpen=${open}")
+
+    gradle.lifecycle.beforeProject { proj ->
+        proj.tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
+            jvmArgs agentArg, "-Dnet.bytebuddy.experimental=true"
+        }
+    }
+}
