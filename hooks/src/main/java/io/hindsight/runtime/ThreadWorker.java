@@ -56,6 +56,13 @@ public final class ThreadWorker {
     private long xorshiftState;
     private long snapshotCountdown;
 
+    // ---- deterministic refresh for same-thread container mutations (§7 fix for short-lived) ----
+    // Containers snapshotted on this thread; next touch forces refresh to catch uninstrumented mutations.
+    // We use a simple array-based approach: when full, we stop tracking (rare for short recordings).
+    private static final int MAX_TRACKED_CONTAINERS = 1024;
+    private final long[] snapshotedContainerIds = new long[MAX_TRACKED_CONTAINERS];
+    private int snapshotedContainerCount;
+
     // ---- §2.1 STACK_SNAPSHOT cadence state (schema 4), mirroring the TIME_SYNC counter:
     // ---- the hot path pays one predictable countdown branch per record, and a due capture
     // ---- is deferred to the next record that a capture may legally follow.
@@ -522,6 +529,10 @@ public final class ThreadWorker {
      * {@code snapshotEvery} also emits a shallow SNAPSHOT of the object — a level-1 refresh
      * dump, followed by the recorder-≥v1.3 container-field re-dumps and by baseline dumps of
      * any objects the refresh discovered within the depth limit.
+     *
+     * <p>Additionally (FORMAT.md §7 same-thread deterministic refresh): if this container
+     * was previously snapshotted on this thread, force a refresh dump to catch uninstrumented
+     * mutations (add/put/remove in java.base collections), bypassing the probabilistic countdown.
      */
     private long resolveObjectId(Object o) {
         final long id = ObjectIdRegistry.idFor(o, this);
@@ -538,8 +549,11 @@ public final class ThreadWorker {
         } else {
             justBaselined = false;
         }
-        if (id != 0 && rt.snapshotEvery > 0 && dumpLevel == 0 && --snapshotCountdown <= 0) {
-            rearmSnapshotCountdown();
+        final boolean isDeterministicRefresh = id != 0 && dumpLevel == 0 && isSnapshotedContainer(id);
+        if (id != 0 && rt.snapshotEvery > 0 && dumpLevel == 0 && (isDeterministicRefresh || --snapshotCountdown <= 0)) {
+            if (!isDeterministicRefresh) {
+                rearmSnapshotCountdown();
+            }
             if (!justBaselined) {
                 try {
                     dumpLevel = 1; // nested resolutions inside the dump must not snapshot again
@@ -551,6 +565,9 @@ public final class ThreadWorker {
                     dumpLevel = 0;
                 }
                 runPendingDumps(); // §7 depth rules: baselines of objects the refresh discovered
+                if (isDeterministicRefresh) {
+                    removeSnapshotedContainer(id);
+                }
             }
         }
         return id;
@@ -579,6 +596,43 @@ public final class ThreadWorker {
         snapshotCountdown = every <= 0 ? Long.MAX_VALUE : 1 + ((x >>> 1) % (2 * every));
     }
 
+    /**
+     * Tracks that a container was snapshotted on this thread. Next same-thread touch forces
+     * a deterministic refresh to catch uninstrumented mutations in java.base code.
+     */
+    private void noteSnapshotedContainer(long id) {
+        if (snapshotedContainerCount < MAX_TRACKED_CONTAINERS) {
+            snapshotedContainerIds[snapshotedContainerCount++] = id;
+        }
+    }
+
+    /**
+     * Returns true if this container ID was snapshotted on this thread and is awaiting
+     * deterministic refresh. Checked at object-id resolution to force a refresh dump.
+     */
+    private boolean isSnapshotedContainer(long id) {
+        for (int i = 0; i < snapshotedContainerCount; i++) {
+            if (snapshotedContainerIds[i] == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Removes a container from tracking after its deterministic refresh has fired. Prevents
+     * duplicate refreshes on subsequent touches on the same thread.
+     */
+    private void removeSnapshotedContainer(long id) {
+        for (int i = 0; i < snapshotedContainerCount; i++) {
+            if (snapshotedContainerIds[i] == id) {
+                snapshotedContainerIds[i] = snapshotedContainerIds[snapshotedContainerCount - 1];
+                snapshotedContainerCount--;
+                return;
+            }
+        }
+    }
+
     // =====================================================================================
     // Snapshots (§3 payload, §7 policy)
     // =====================================================================================
@@ -591,25 +645,35 @@ public final class ThreadWorker {
      * e.g. VirtualMap) that must never fire from inside a recording hook. Enums get no
      * snapshot at all: their identity is the constant name already carried by their
      * OBJECT_FIRST_SEEN record.
+     *
+     * <p>After emitting a snapshot for a container or wrapper, track it for deterministic
+     * same-thread refresh to catch uninstrumented mutations (add/put/remove/assign in java.base).
      */
     private void emitSnapshot(Object o, long id) {
         final Class<?> cls = o.getClass();
         if (o instanceof Enum<?>) {
             return;
         }
+        final boolean isDriftableContainer;
         if (isJavaBaseWrapper(o)) {
             emitWrapperSnapshot(o, id, cls);
-            return;
-        }
-        if (cls.isArray()) {
+            isDriftableContainer = true;
+        } else if (cls.isArray()) {
             emitUnfoldedSnapshot(o, id, cls, Wire.SNAPSHOT_FORM_ARRAY);
+            isDriftableContainer = true;
         } else if (o instanceof java.util.Map && isJavaBase(cls)) {
             emitUnfoldedSnapshot(o, id, cls, Wire.SNAPSHOT_FORM_MAP);
+            isDriftableContainer = true;
         } else if (o instanceof java.util.Collection && isJavaBase(cls)) {
             emitUnfoldedSnapshot(o, id, cls,
                     o instanceof java.util.Set ? Wire.SNAPSHOT_FORM_SET : Wire.SNAPSHOT_FORM_LIST);
+            isDriftableContainer = true;
         } else {
             emitFieldSnapshot(o, id, cls);
+            isDriftableContainer = false;
+        }
+        if (isDriftableContainer) {
+            noteSnapshotedContainer(id);
         }
     }
 
